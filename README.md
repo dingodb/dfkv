@@ -60,8 +60,15 @@ docs/       DEPLOY.md (standalone rollout) · INTEGRATION.md (fuse into dingo-ca
 - **Metrics**: server counters + Prometheus text (`dfkvctl stat <node>` / `kStats` op).
 - **Dynamic membership**: `SetMembers()` hot-swaps the ring (no client restart).
 - **CLI tools**: `dfkv_smoke` (roundtrip check), `dfkvctl` (put/get/exist/stat).
-- **RDMA transport** (gated `-DDFKV_WITH_RDMA=ON`, RC two-sided via librdmacm) with
-  **automatic TCP fallback** (env `DFKV_RDMA=1`); runtime verification pending hardware.
+- **RDMA transport** (gated `-DDFKV_WITH_RDMA=ON`, native libibverbs RC): device
+  selected **by name** (`DFKV_RDMA_DEV=ib7s400p0`, comma-list = multi-rail), QP
+  bootstrapped over a tiny TCP channel so the 400G data fabric needs no IP and may
+  be separate from the IP network. **Automatic TCP fallback** (`DFKV_RDMA=1`);
+  `DFKV_RDMA_CM=1` selects the librdmacm/IP-routed fallback. Validated on hd03 400G.
+- **Zero-copy GET both ends**: the server reads the block straight into the send
+  buffer; the client scatters the payload directly into the caller's buffer (e.g.
+  a SGLang HiCache registered host page) — no intermediate copies.
+- **Optional pipelining** (`DFKV_RDMA_DEPTH=K`): K requests in flight per connection.
 - **HiCache v2** (PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
 
