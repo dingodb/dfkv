@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build & test (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    env:
+      CXX: ${{ matrix.compiler }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build & test deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ clang python3 python3-numpy git ca-certificates
+
+      - name: Cache FetchContent (googletest)
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ matrix.compiler }}-gtest-1.12.1
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test (C++ gtests + Python plugin)
+        run: ctest --test-dir build --output-on-failure -j
+
+  portable-static-build:
+    name: portable static artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ git ca-certificates
+      - name: Build static-libstdc++ artifacts (no tests)
+        run: |
+          cmake -S . -B build-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DDFKV_BUILD_TESTS=OFF -DDFKV_STATIC_LIBSTDCXX=ON
+          cmake --build build-static -j
+      - name: Show artifact deps
+        run: |
+          ldd build-static/dfkv_server || true
+          ls -la build-static/dfkv_server build-static/libdfkv.so
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfkv-linux-x86_64
+          path: |
+            build-static/dfkv_server
+            build-static/libdfkv.so
