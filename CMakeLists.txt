@@ -1,6 +1,6 @@
 # dfkv — standalone distributed KV cache for SGLang HiCache (no brpc/MDS/S3 deps).
 cmake_minimum_required(VERSION 3.20)
-project(dfkv CXX)
+project(dfkv VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -98,3 +98,15 @@ if(DFKV_BUILD_TESTS)
   add_test(NAME tool_smoke
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/tool_smoke.sh ${CMAKE_BINARY_DIR})
 endif()
+
+# --- packaging (deb/rpm via CPack) ---
+set(CPACK_PACKAGE_NAME "dfkv")
+set(CPACK_PACKAGE_VENDOR "ketor")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Distributed KV cache for SGLang HiCache")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_CONTACT "d.ketor@gmail.com")
+set(CPACK_GENERATOR "TGZ")  # default; deb/rpm chosen explicitly via `cpack -G DEB|RPM`
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libc6")
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
+include(CPack)
