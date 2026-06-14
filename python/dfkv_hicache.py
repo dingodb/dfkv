@@ -71,16 +71,18 @@ class DfkvHiCache(HiCacheStorage):
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Optional[dict] = None):
         cfg = (kwargs or {}) or (getattr(storage_config, "extra_config", None) or {})
         self.cfg = cfg
-        # dfkv is zero-copy only. SGLang's cache_controller only selects the
-        # zero-copy v1 path (batch_set_v1/batch_get_v1) for a 'dynamic' backend
-        # when extra_config.interface_v1 is truthy; otherwise it uses the generic
-        # set/get path, whose get/batch_get here are stubs (return None) -> writes
-        # succeed but L3 reads silently fail. Fail fast at startup instead.
+        # Enforce the zero-copy deploy contract. SGLang's cache_controller only
+        # selects the zero-copy v1 path (batch_set_v1/batch_get_v1) for a
+        # 'dynamic' backend when extra_config.interface_v1 is truthy; otherwise it
+        # uses the generic set/get copy path. The generic path is implemented and
+        # correct, but slower (extra host copies) and for MLA every TP rank writes
+        # the page redundantly. Fail fast so a launch-config omission can't quietly
+        # degrade to the copy path.
         if not cfg.get("interface_v1"):
             raise ValueError(
-                "dfkv requires extra_config interface_v1=1 (zero-copy only). "
-                "Without it SGLang uses the generic get path, which dfkv does not "
-                "implement, causing silent L3 read failures."
+                "dfkv requires extra_config interface_v1=1 to select the zero-copy "
+                "v1 RDMA path. Omitting it falls back to the generic copy path "
+                "(slower; MLA writes redundant per-rank copies)."
             )
         self.model = (storage_config.model_name or "").replace("/", "-")
         self.tp_rank = int(storage_config.tp_rank)
@@ -282,7 +284,19 @@ class DfkvHiCache(HiCacheStorage):
                                   ctypes.c_uint64(len(mv))) == 0
 
     def get(self, key, target_location=None, target_sizes=None):
-        return None  # non zero-copy reads go through batch_get_v1
+        # Generic (non zero-copy) read: dfkv_get reads the page bytes straight
+        # into target_location's buffer (a host flat-page tensor). Symmetric with
+        # set() (whole page under _keys[0]). Returns target_location on hit, None
+        # on miss. SGLang's prod path uses batch_get_v1; this serves the generic
+        # path + direct/test callers.
+        if target_location is None:
+            return None
+        sk = self._keys(key)[0]
+        nbytes = target_location.numel() * target_location.element_size()
+        rc = self._lib.dfkv_get(self._h, sk.encode(),
+                                ctypes.c_void_p(target_location.data_ptr()),
+                                ctypes.c_uint64(nbytes))
+        return target_location if rc == 1 else None
 
     def batch_set(self, keys, values=None, target_locations=None, target_sizes=None) -> bool:
         if values is None:
@@ -290,4 +304,6 @@ class DfkvHiCache(HiCacheStorage):
         return all(self.set(k, v) for k, v in zip(keys, values))
 
     def batch_get(self, keys, target_locations=None, target_sizes=None):
-        return [None] * len(keys)
+        if target_locations is None:
+            return [None] * len(keys)
+        return [self.get(k, t) for k, t in zip(keys, target_locations)]

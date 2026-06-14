@@ -60,6 +60,26 @@ class FakeMlaPool:
         self.buf[:] = 0
 
 
+class FlatBuf:
+    """Mimics a torch flat host page tensor (data_ptr/numel/element_size) over a
+    numpy buffer, for exercising the generic get/batch_get path without torch."""
+
+    def __init__(self, nbytes):
+        self.arr = np.zeros(nbytes, dtype=np.uint8)
+
+    def data_ptr(self):
+        return self.arr.ctypes.data
+
+    def numel(self):
+        return int(self.arr.size)
+
+    def element_size(self):
+        return int(self.arr.itemsize)
+
+    def tobytes(self):
+        return bytes(self.arr)
+
+
 def _spawn_node(tag):
     d = tempfile.mkdtemp(prefix=f"dfkv_py_{tag}_")
     p = subprocess.Popen([SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30)],
@@ -122,11 +142,37 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertTrue(hasattr(st, "get") and hasattr(st, "set"))
 
     def test_requires_interface_v1(self):
-        # Missing interface_v1 must fail fast (generic get path is unimplemented).
+        # Missing interface_v1 must fail fast (enforces the zero-copy deploy
+        # contract; otherwise SGLang silently uses the slower generic copy path).
         cfg = self._cfg("n=127.0.0.1:1")
         cfg.extra_config.pop("interface_v1")
         with self.assertRaises(ValueError):
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+
+    def test_generic_get_roundtrip(self):
+        # Generic (non zero-copy) set/get round-trips a page through dfkv.
+        members, _, _ = self._node("gget")
+        cfg = self._cfg(members)
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        payload = bytes((i * 7) & 0xFF for i in range(self.PAGE_BYTES))
+        self.assertTrue(st.set("g0", payload))
+        tgt = FlatBuf(self.PAGE_BYTES)
+        self.assertIs(st.get("g0", tgt), tgt)        # hit returns the buffer
+        self.assertEqual(tgt.tobytes(), payload)     # bytes round-trip
+        self.assertIsNone(st.get("g_missing", FlatBuf(self.PAGE_BYTES)))  # miss
+
+    def test_generic_batch_get(self):
+        members, _, _ = self._node("gbget")
+        cfg = self._cfg(members)
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        p0, p1 = bytes([1]) * self.PAGE_BYTES, bytes([2]) * self.PAGE_BYTES
+        self.assertTrue(st.set("b0", p0))
+        self.assertTrue(st.set("b1", p1))
+        bufs = [FlatBuf(self.PAGE_BYTES) for _ in range(3)]
+        res = st.batch_get(["b0", "b1", "b_miss"], bufs)
+        self.assertIs(res[0], bufs[0]); self.assertEqual(bufs[0].tobytes(), p0)
+        self.assertIs(res[1], bufs[1]); self.assertEqual(bufs[1].tobytes(), p1)
+        self.assertIsNone(res[2])
 
     def test_batch_set_get_v1_roundtrip(self):
         members, _, _ = self._node("rt")
