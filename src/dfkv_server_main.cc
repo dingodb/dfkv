@@ -14,6 +14,7 @@
 
 #include "kv_node_server.h"
 #include "log.h"
+#include "mds_registrar.h"
 #ifdef DFKV_WITH_RDMA
 #include "rdma_server.h"
 #endif
@@ -26,7 +27,8 @@ static void OnSig(int) { g_stop = 1; }
 
 int main(int argc, char** argv) {
   std::string dir = "/tmp/dfkv_node";
-  std::string rdma_dev, members;
+  std::string rdma_dev, mds, group = "default", node_id, advertise;
+  int weight = 1;
   int port = 0, rdma_port = -1;
   unsigned long long cap = 1ull << 30;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -35,7 +37,11 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--cap")) cap = std::strtoull(argv[i + 1], nullptr, 10);
     else if (!std::strcmp(argv[i], "--rdma-port")) rdma_port = std::atoi(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--rdma-dev")) rdma_dev = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--members")) members = argv[i + 1];  // advertised for discovery
+    else if (!std::strcmp(argv[i], "--mds")) mds = argv[i + 1];
+    else if (!std::strcmp(argv[i], "--group")) group = argv[i + 1];
+    else if (!std::strcmp(argv[i], "--id")) node_id = argv[i + 1];
+    else if (!std::strcmp(argv[i], "--advertise")) advertise = argv[i + 1];
+    else if (!std::strcmp(argv[i], "--weight")) weight = std::atoi(argv[i + 1]);
   }
   (void)rdma_port;
   std::signal(SIGINT, OnSig);
@@ -51,7 +57,6 @@ int main(int argc, char** argv) {
   if (dirs.empty()) dirs.push_back(dir);
 
   KvNodeServer srv(dirs, cap);
-  srv.set_members(members);  // advertised via kMembers for client discovery
   if (srv.Start(port) != Status::kOk) {
     std::fprintf(stderr, "failed to start on port %d\n", port);
     return 1;
@@ -83,8 +88,33 @@ int main(int argc, char** argv) {
   }
 #endif
 
+  std::unique_ptr<dfkv::MdsRegistrar> registrar;
+  if (!mds.empty()) {
+    if (node_id.empty() || advertise.empty()) {
+      std::fprintf(stderr, "--mds requires --id and --advertise <ip:port>\n");
+      srv.Stop();
+      return 1;
+    }
+    size_t colon = advertise.rfind(':');
+    std::string aip = advertise.substr(0, colon);
+    uint32_t aport = static_cast<uint32_t>(std::atoi(advertise.c_str() + colon + 1));
+    std::vector<std::string> eps;
+    for (size_t i = 0, j; i <= mds.size(); i = j + 1) {
+      j = mds.find(',', i);
+      if (j == std::string::npos) j = mds.size();
+      if (j > i) eps.push_back(mds.substr(i, j - i));
+    }
+    dfkv::MemberInfo self{node_id, aip, aport,
+                          static_cast<uint32_t>(weight < 1 ? 1 : weight)};
+    registrar = std::make_unique<dfkv::MdsRegistrar>(std::move(eps), group, self);
+    registrar->Start();
+    DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group + " id=" + node_id +
+                  " advertise=" + advertise);
+  }
+
   while (!g_stop) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
   DFKV_LOG_INFO("dfkv_server shutting down");
+  if (registrar) registrar->Stop();
 #ifdef DFKV_WITH_RDMA
   if (rsrv) rsrv->Stop();
 #endif
