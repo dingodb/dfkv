@@ -93,21 +93,32 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
 
 Status KVStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
                       std::string* out) {
-  std::lock_guard<std::mutex> lk(mu_);
-  const std::string fname = key.Filename();
-  auto it = index_.find(fname);
-  if (it == index_.end()) return Status::kNotFound;  // cache-only: clean miss
-  std::ifstream ifs(it->second.path, std::ios::binary);
-  if (!ifs) return Status::kIOError;
-  if (offset > it->second.size) return Status::kInvalid;
+  // The mutex protects the in-memory index/LRU, NOT the bulk file read. Holding
+  // it across the whole read serializes all reads to this disk (the GET hot path
+  // for KVCache). Instead: look up + open the file + touch LRU under the lock —
+  // the open fd pins the inode, so a concurrent eviction (fs::remove) can't pull
+  // the bytes out from under us (POSIX unlink keeps the inode alive until close)
+  // — then release the lock and do the 2.74 MiB read concurrently.
+  std::ifstream ifs;
+  uint64_t fsize = 0;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::string fname = key.Filename();
+    auto it = index_.find(fname);
+    if (it == index_.end()) return Status::kNotFound;  // cache-only: clean miss
+    ifs.open(it->second.path, std::ios::binary);
+    if (!ifs) return Status::kIOError;
+    fsize = it->second.size;
+    TouchLocked(fname);
+  }
+  if (offset > fsize) return Status::kInvalid;
   uint64_t end = offset + length;
-  if (end > it->second.size) end = it->second.size;
+  if (end > fsize) end = fsize;
   uint64_t n = end - offset;
   out->resize(n);
   ifs.seekg(static_cast<std::streamoff>(offset));
   if (n) ifs.read(&(*out)[0], static_cast<std::streamsize>(n));
   if (!ifs && n) return Status::kIOError;
-  TouchLocked(fname);
   return Status::kOk;
 }
 
