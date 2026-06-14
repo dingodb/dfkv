@@ -1,0 +1,136 @@
+#include "mds_server.h"
+
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "mds_proto.h"
+#include "net_util.h"
+#include "wire.h"
+
+namespace dfkv {
+
+MdsServer::~MdsServer() { Stop(); }
+
+std::string MdsServer::MemberKey(const std::string& group, const std::string& id) {
+  return "/dfkv/v1/groups/" + group + "/members/" + id;
+}
+
+Status MdsServer::Start(int port) {
+  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd_ < 0) return Status::kIOError;
+  int one = 1;
+  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(INADDR_ANY);
+  sa.sin_port = htons(static_cast<uint16_t>(port));
+  if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+    ::close(listen_fd_); listen_fd_ = -1; return Status::kIOError;
+  }
+  if (::listen(listen_fd_, 128) != 0) {
+    ::close(listen_fd_); listen_fd_ = -1; return Status::kIOError;
+  }
+  socklen_t sl = sizeof(sa);
+  ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&sa), &sl);
+  port_ = ntohs(sa.sin_port);
+  running_ = true;
+  accept_thread_ = std::thread([this] { AcceptLoop(); });
+  return Status::kOk;
+}
+
+void MdsServer::Stop() {
+  if (!running_.exchange(false)) return;
+  if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);
+  if (accept_thread_.joinable()) accept_thread_.join();
+  if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
+  std::vector<int> fds;
+  std::vector<std::thread> threads;
+  {
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    fds.assign(conn_fds_.begin(), conn_fds_.end());
+    threads.swap(conn_threads_);
+  }
+  for (int fd : fds) ::shutdown(fd, SHUT_RDWR);
+  for (auto& t : threads) if (t.joinable()) t.join();
+}
+
+void MdsServer::AcceptLoop() {
+  while (running_) {
+    int fd = ::accept(listen_fd_, nullptr, nullptr);
+    if (fd < 0) { if (!running_) break; continue; }
+    int one = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    conn_fds_.push_back(fd);
+    conn_threads_.emplace_back([this, fd] {
+      Handle(fd);
+      {
+        std::lock_guard<std::mutex> lk(conn_mu_);
+        for (auto it = conn_fds_.begin(); it != conn_fds_.end(); ++it)
+          if (*it == fd) { conn_fds_.erase(it); break; }
+      }
+      ::close(fd);
+    });
+  }
+}
+
+Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
+  std::string key = MemberKey(group, m.id);
+  std::string val = EncodeMembers({m}, 0);
+  std::lock_guard<std::mutex> lk(lease_mu_);
+  auto it = leases_.find(key);
+  if (it != leases_.end() && etcd_.LeaseKeepAlive(it->second)) return Status::kOk;
+  auto lid = etcd_.LeaseGrant(kTtlSeconds);
+  if (!lid) return Status::kIOError;
+  if (!etcd_.Put(key, val, *lid)) return Status::kIOError;
+  leases_[key] = *lid;
+  return Status::kOk;
+}
+
+Status MdsServer::ListMembers(const std::string& group, std::string* out) {
+  std::string prefix = "/dfkv/v1/groups/" + group + "/members/";
+  auto r = etcd_.RangePrefix(prefix);
+  if (!r) return Status::kIOError;
+  std::vector<MemberInfo> members;
+  for (const auto& kv : r->kvs) {
+    std::vector<MemberInfo> one;
+    uint64_t e = 0;
+    if (DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) && one.size() == 1)
+      members.push_back(one[0]);
+  }
+  *out = EncodeMembers(members, static_cast<uint64_t>(r->revision));
+  return Status::kOk;
+}
+
+void MdsServer::Handle(int fd) {
+  while (running_) {
+    char prefix[kReqPrefix];
+    if (!net::ReadAll(fd, prefix, kReqPrefix)) return;
+    ReqFields rq;
+    if (!DecodeReq(prefix, &rq)) return;
+    std::vector<char> payload(rq.payload_len);
+    if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
+
+    std::string data;
+    Status st = Status::kInvalid;
+    WireOp op = static_cast<WireOp>(rq.op);
+    if (op == WireOp::kRegister || op == WireOp::kHeartbeat) {
+      std::string group;
+      MemberInfo m;
+      if (DecodeMemberReq(payload.data(), rq.payload_len, &group, &m))
+        st = Upsert(group, m);
+    } else if (op == WireOp::kListMembers) {
+      std::string group(payload.data(), rq.payload_len);
+      st = ListMembers(group, &data);
+    }
+
+    char rp[kRespPrefix];
+    EncodeResp(rp, st, data.size());
+    if (!net::WriteAll(fd, rp, kRespPrefix)) return;
+    if (!data.empty() && !net::WriteAll(fd, data.data(), data.size())) return;
+  }
+}
+
+}  // namespace dfkv

@@ -24,6 +24,7 @@ list(REMOVE_ITEM DFKV_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_smoke_main.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkvctl_main.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_bench_main.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_mds_main.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_verbs.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_transport.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_server.cc)
@@ -55,6 +56,8 @@ endif()
 # standalone cache-node daemon + CLI tools
 add_executable(dfkv_server ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_server_main.cc)
 target_link_libraries(dfkv_server PRIVATE dfkv_core)
+add_executable(dfkv_mds ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_mds_main.cc)
+target_link_libraries(dfkv_mds PRIVATE dfkv_core)
 add_executable(dfkv_smoke ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_smoke_main.cc)
 target_link_libraries(dfkv_smoke PRIVATE dfkv_core)
 add_executable(dfkvctl ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkvctl_main.cc)
@@ -63,7 +66,7 @@ add_executable(dfkv_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_bench_main.cc)
 target_link_libraries(dfkv_bench PRIVATE dfkv_core)
 
 include(GNUInstallDirs)
-install(TARGETS dfkv dfkv_server dfkv_smoke dfkvctl dfkv_bench dfkv_core
+install(TARGETS dfkv dfkv_server dfkv_mds dfkv_smoke dfkvctl dfkv_bench dfkv_core
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
