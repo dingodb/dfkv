@@ -61,11 +61,17 @@ bool RdmaTransport::Available() {
 }
 
 RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
-    : max_msg_(max_msg), depth_(1), dev_name_(dev_name) {
-  if (dev_name_.empty()) {
-    const char* e = std::getenv("DFKV_RDMA_DEV");
-    if (e && *e) dev_name_ = e;
+    : max_msg_(max_msg), depth_(1) {
+  std::string list = dev_name;
+  if (list.empty()) { const char* e = std::getenv("DFKV_RDMA_DEV"); if (e) list = e; }
+  for (size_t i = 0; i <= list.size();) {  // split on commas (multi-rail)
+    size_t c = list.find(',', i);
+    if (c == std::string::npos) c = list.size();
+    std::string d = list.substr(i, c - i);
+    if (!d.empty()) devs_.push_back(d);
+    i = c + 1;
   }
+  if (devs_.empty()) devs_.push_back("");  // first available device
   const char* d = std::getenv("DFKV_RDMA_DEPTH");  // pipeline depth (must be <= server's)
   if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
 }
@@ -93,14 +99,21 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   int fd = net::Dial(node, /*connect_ms=*/3000, /*io_ms=*/10000);
   if (fd < 0) return nullptr;
 
+  // Round-robin a device for this connection (multi-rail spreads load over ports).
+  const std::string& dev = devs_[rr_.fetch_add(1, std::memory_order_relaxed) % devs_.size()];
+
   auto* c = new Conn();
-  if (!c->ep.Open(dev_name_.empty() ? nullptr : dev_name_.c_str(), max_msg_, depth_)) {
+  if (!c->ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, depth_)) {
     ::close(fd); delete c; return nullptr;
   }
+  // Bootstrap: tell the server which device to open (same rail), then exchange QP.
+  char devbuf[rdma::kDevNameBytes];
+  std::memset(devbuf, 0, sizeof(devbuf));
+  std::memcpy(devbuf, dev.data(), std::min(dev.size(), sizeof(devbuf) - 1));
   char mine[rdma::kQpInfoBytes], peer[rdma::kQpInfoBytes];
   rdma::SerializeQpInfo(c->ep.Local(), mine);
-  // client sends its Qp info, then reads the server's; symmetric to the server.
-  if (!net::WriteAll(fd, mine, rdma::kQpInfoBytes) ||
+  if (!net::WriteAll(fd, devbuf, rdma::kDevNameBytes) ||
+      !net::WriteAll(fd, mine, rdma::kQpInfoBytes) ||
       !net::ReadAll(fd, peer, rdma::kQpInfoBytes)) {
     ::close(fd); delete c; return nullptr;
   }

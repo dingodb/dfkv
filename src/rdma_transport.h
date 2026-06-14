@@ -10,6 +10,7 @@
 #ifndef DFKV_RDMA_TRANSPORT_H_
 #define DFKV_RDMA_TRANSPORT_H_
 
+#include <atomic>
 #include <cstddef>
 #include <mutex>
 #include <string>
@@ -24,7 +25,8 @@ class RdmaTransport : public Transport {
  public:
   static bool Available();  // true if at least one RDMA device is present
 
-  // dev_name empty => env DFKV_RDMA_DEV, else first device.
+  // dev_name empty => env DFKV_RDMA_DEV (comma-separated list = multi-rail; each
+  // new connection round-robins across the devices), else first device.
   explicit RdmaTransport(size_t max_msg = (8u << 20), const std::string& dev_name = "");
   ~RdmaTransport() override;
 
@@ -57,7 +59,8 @@ class RdmaTransport : public Transport {
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
   size_t max_msg_;
   size_t depth_;
-  std::string dev_name_;
+  std::vector<std::string> devs_;     // RDMA devices (multi-rail); "" = first
+  std::atomic<size_t> rr_{0};         // round-robin selector across devs_
 };
 
 }  // namespace dfkv

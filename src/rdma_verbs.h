@@ -38,6 +38,10 @@ constexpr size_t kQpInfoBytes = 32;
 void SerializeQpInfo(const QpInfo& in, char out[kQpInfoBytes]);
 QpInfo ParseQpInfo(const char in[kQpInfoBytes]);
 
+// Fixed-size device-name field the client sends first in the bootstrap so the
+// server opens its QP on the matching device (same rail) for multi-rail setups.
+constexpr size_t kDevNameBytes = 32;
+
 // One RC connection: device context + PD + CQ(+channel) + QP + a ring of
 // `depth` send and recv buffers (each `cap` bytes, registered once).
 class RcEndpoint {
