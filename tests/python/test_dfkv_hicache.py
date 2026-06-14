@@ -107,6 +107,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 "members": members, "model_hash": 0x51,
                 "dtype_tag": 0x46384534, "page_size": page_size,
                 "layer_num": 78, "head_num": 1, "head_dim": 576,
+                "interface_v1": 1,
             })
 
     def _plugin(self, cfg, pool):
@@ -119,6 +120,13 @@ class DingoFSHiCacheTest(unittest.TestCase):
         pool = FakeMlaPool(4, self.PAGE_BYTES, self.PAGE_SIZE)
         st = self._plugin(self._cfg(members), pool)
         self.assertTrue(hasattr(st, "get") and hasattr(st, "set"))
+
+    def test_requires_interface_v1(self):
+        # Missing interface_v1 must fail fast (generic get path is unimplemented).
+        cfg = self._cfg("n=127.0.0.1:1")
+        cfg.extra_config.pop("interface_v1")
+        with self.assertRaises(ValueError):
+            dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
 
     def test_batch_set_get_v1_roundtrip(self):
         members, _, _ = self._node("rt")

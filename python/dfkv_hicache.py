@@ -71,6 +71,17 @@ class DfkvHiCache(HiCacheStorage):
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Optional[dict] = None):
         cfg = (kwargs or {}) or (getattr(storage_config, "extra_config", None) or {})
         self.cfg = cfg
+        # dfkv is zero-copy only. SGLang's cache_controller only selects the
+        # zero-copy v1 path (batch_set_v1/batch_get_v1) for a 'dynamic' backend
+        # when extra_config.interface_v1 is truthy; otherwise it uses the generic
+        # set/get path, whose get/batch_get here are stubs (return None) -> writes
+        # succeed but L3 reads silently fail. Fail fast at startup instead.
+        if not cfg.get("interface_v1"):
+            raise ValueError(
+                "dfkv requires extra_config interface_v1=1 (zero-copy only). "
+                "Without it SGLang uses the generic get path, which dfkv does not "
+                "implement, causing silent L3 read failures."
+            )
         self.model = (storage_config.model_name or "").replace("/", "-")
         self.tp_rank = int(storage_config.tp_rank)
         self.tp_size = int(storage_config.tp_size)
@@ -254,8 +265,18 @@ class DfkvHiCache(HiCacheStorage):
     def set(self, key, value=None, target_location=None, target_sizes=None) -> bool:
         if value is None:
             return False
-        mv = memoryview(value).cast("B")
         sk = self._keys(key)[0]
+        # SGLang's L3 backup path (_generic_page_set -> batch_set) passes torch
+        # Tensors, not bytes. Take the raw tensor bytes via data_ptr (dtype-
+        # agnostic, works for fp8 which numpy can't represent). Tensor must stay
+        # alive across the call (local `t`).
+        if hasattr(value, "data_ptr"):
+            t = value.detach().cpu().contiguous()
+            nbytes = t.numel() * t.element_size()
+            return self._lib.dfkv_put(self._h, sk.encode(),
+                                      ctypes.c_void_p(t.data_ptr()),
+                                      ctypes.c_uint64(nbytes)) == 0
+        mv = memoryview(value).cast("B")
         buf = (ctypes.c_char * len(mv)).from_buffer_copy(mv)
         return self._lib.dfkv_put(self._h, sk.encode(), ctypes.cast(buf, ctypes.c_void_p),
                                   ctypes.c_uint64(len(mv))) == 0

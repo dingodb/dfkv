@@ -182,6 +182,7 @@ sglang serve ... \
     "model_hash": 81, "page_size":64, "dtype_tag":1178092852,
     "layer_num":78, "head_num":1, "head_dim":576 }'
 ```
+> **`interface_v1:1` 是必填项**，插件 `__init__` 强校验：缺失即 `raise ValueError` 启动失败。原因——对 `dynamic` 后端，SGLang 仅在 `interface_v1` 为真时才走零拷贝 `batch_set_v1/get_v1`；否则退回 generic `set/get` 路径，而 dfkv 的 generic `get/batch_get` 是未实现的桩，会导致**写成功、L3 读静默失败**（线上踩过：launch 脚本漏配此项，14GB 写入但 prefetch 全部 miss）。
 > `interface_v1:1` 触发零拷贝 `batch_set_v1/get_v1` —— GET payload 经 RDMA 散射**直落 HiCache 宿主页**（client 端零拷贝），server 端直读入发送缓冲（server 端零拷贝），两端零拷贝。
 > MLA 下插件自动单对象、无 rank 后缀、`backup_skip`（仅 tp_rank0 写）。decode 共享前缀配同 members。
 > 多池模型（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
