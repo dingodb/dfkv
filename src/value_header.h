@@ -22,15 +22,22 @@
 
 namespace dfkv {
 
-// CRC32 (IEEE 802.3, poly 0xEDB88320) — same polynomial as zlib's crc32.
-// Table built once via a thread-safe function-local static (C++11 magic static)
-// so concurrent callers (batch fan-out) don't race on initialization.
-inline uint32_t Crc32(const void* data, size_t len) {
+// Integrity checksum = CRC32C (Castagnoli, reflected poly 0x82F63B78, init/xorout
+// 0xFFFFFFFF) — chosen over IEEE 0xEDB88320 because x86-64 has a hardware crc32c
+// instruction (SSE4.2) that runs ~10-20 GB/s vs ~0.3 GB/s for the byte-at-a-time
+// table. At the GLM-5.1 MLA page size (2.74 MiB) the table CRC was the dominant
+// per-op cost (~7 ms); hardware crc32c removes it. We runtime-dispatch on
+// __builtin_cpu_supports so the binary stays portable; the scalar table is the
+// fallback and the two must agree bit-for-bit (see value_header_test).
+namespace detail {
+
+// Scalar Castagnoli table (thread-safe magic static; no init race in batch fan-out).
+inline uint32_t Crc32cScalar(const void* data, size_t len) {
   static const std::array<uint32_t, 256> table = [] {
     std::array<uint32_t, 256> t{};
     for (uint32_t i = 0; i < 256; ++i) {
       uint32_t c = i;
-      for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      for (int k = 0; k < 8; ++k) c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
       t[i] = c;
     }
     return t;
@@ -41,11 +48,33 @@ inline uint32_t Crc32(const void* data, size_t len) {
   return c ^ 0xFFFFFFFFu;
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+// Hardware crc32c via SSE4.2; target attribute lets the rest of the TU compile
+// without -msse4.2 while this function uses the instruction (runtime-gated below).
+__attribute__((target("sse4.2"))) inline uint32_t Crc32cHw(const void* data, size_t len) {
+  const auto* p = static_cast<const uint8_t*>(data);
+  uint64_t c = 0xFFFFFFFFu;
+  while (len >= 8) { uint64_t v; std::memcpy(&v, p, 8); c = __builtin_ia32_crc32di(c, v); p += 8; len -= 8; }
+  while (len) { c = __builtin_ia32_crc32qi(static_cast<uint32_t>(c), *p++); --len; }
+  return static_cast<uint32_t>(c) ^ 0xFFFFFFFFu;
+}
+#endif
+
+}  // namespace detail
+
+inline uint32_t Crc32(const void* data, size_t len) {
+#if defined(__x86_64__) || defined(__i386__)
+  static const bool kHw = __builtin_cpu_supports("sse4.2");
+  if (kHw) return detail::Crc32cHw(data, len);
+#endif
+  return detail::Crc32cScalar(data, len);
+}
+
 #pragma pack(push, 1)
 struct ValueHeader {
   static constexpr size_t kSize = 48;
   static constexpr uint32_t kMagic = 0x444F4B56u;  // 'DFKV'
-  static constexpr uint16_t kVersion = 1;
+  static constexpr uint16_t kVersion = 2;  // v2: integrity checksum is CRC32C (was IEEE crc32 in v1)
   enum Flag : uint16_t { kFlagIsMla = 0x1 };
 
   uint32_t magic = kMagic;
