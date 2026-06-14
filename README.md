@@ -16,6 +16,13 @@ shared, large-capacity KVCache pool for LLM inference (e.g. GLM-5.1 / MLA),
 - **`dfkv_server`** — a cache-node daemon. Disk + LRU, **cache-only** (a miss is
   a clean NotFound; no object-store fallback), synchronous durable-visible writes.
   Supports **multiple NVMe SSDs per node** (`--dir d1,d2,d3`, intra-node Ketama).
+  With `--mds`, `--group`, `--id`, `--advertise`, `--weight` it registers into the
+  MDS tier; the old static `--members` flag has been removed.
+- **`dfkv_mds`** — stateless Membership Directory Service daemon. Flags:
+  `--listen <port>` and `--etcd <host:port>` (default `127.0.0.1:2379`). The only
+  etcd client in the system; holds each node's etcd lease on its behalf. Deploy as
+  N replicas — no load-balancer needed; nodes and clients each pick any reachable
+  MDS and fail over automatically.
 - **`libdfkv.so`** — C ABI client (key→consistent-hash routing, value header with
   CRC + model/page/dtype/layer geometry guard, Put/Get/Exist).
 - **`python/dfkv_hicache.py`** — SGLang `HiCacheStorage` plugin loaded via
@@ -24,10 +31,20 @@ shared, large-capacity KVCache pool for LLM inference (e.g. GLM-5.1 / MLA),
 
 ## Design in one breath
 SGLang HiCache (zero-copy v1) → `dfkv_hicache.py` (ctypes) → `libdfkv` client
-(Ketama route + header wrap/verify) → TCP → `dfkv_server` (DiskCacheGroup over
-N NVMe, LRU). Membership is a **static list** of node addresses (no MDS).
-Distributed = client-side consistent hashing; no replication (regenerable KV →
-node loss = miss → recompute). RDMA is intentionally not included yet.
+(Ketama route + header wrap/verify) → TCP/RDMA → `dfkv_server` (DiskCacheGroup
+over N NVMe, LRU). Distributed = client-side consistent hashing; no replication
+(regenerable KV → node loss = miss → recompute).
+
+**Membership** is managed by the MDS tier (`dfkv_mds` + etcd). Nodes register
+with the MDS on startup and send periodic heartbeats; etcd leases (TTL 30 s)
+are the liveness signal. Clients call `dfkv_start_mds_discovery(c, "ep1,ep2",
+group, poll_ms)` to poll the MDS and rebuild the weighted consistent-hash ring
+whenever the epoch (etcd revision) advances. Two-layer offline detection:
+**layer-2** — etcd lease expiry → MDS view changes → client epoch → ring rebuild
+(authoritative removal, ≤ 30 s); **layer-1** — `PeerHealth` fast avoidance: a
+peer that fails transport IO is short-circuited to miss for a cooldown period
+without any ring change. The legacy static path (`dfkv_open(members=...)` /
+`dfkv_set_members`) still exists for simple or single-node setups.
 
 ## Build & test (no GPU / no RDMA needed)
 ```bash
@@ -35,19 +52,31 @@ cmake -S . -B build            # add -DDFKV_STATIC_LIBSTDCXX=ON for portable bin
 cmake --build build -j
 ctest --test-dir build --output-on-failure   # C++ gtests + the Python plugin test
 ```
-Artifacts: `build/dfkv_server`, `build/libdfkv.so`.
+Artifacts: `build/dfkv_server`, `build/dfkv_mds`, `build/libdfkv.so`.
 
 ## Run a cluster
 ```bash
-# on each node (one or more NVMe dirs; --cap is total, split across disks)
-dfkv_server --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv --port 12000 --cap 6597069766656
+# 1. Start etcd (one or three nodes, external)
+
+# 2. Start MDS replicas (stateless, any number)
+dfkv_mds --listen 9400 --etcd 127.0.0.1:2379
+
+# 3. On each cache node (--mds requires --id and --advertise)
+dfkv_server --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
+            --port 12000 --cap 6597069766656 \
+            --mds 10.0.0.1:9400,10.0.0.2:9400 \
+            --group default --id n1 --advertise 10.0.0.10:12000
+
+# 4. Client: MDS-based discovery (recommended)
+#    dfkv_start_mds_discovery(c, "10.0.0.1:9400,10.0.0.2:9400", "default", 3000);
+# OR legacy static path (single-node / simple setups)
+#    dfkv_open("n1=10.0.0.10:12000,...", ...)
 ```
-Point the SGLang plugin at all nodes via `members="n1=ip:12000,n2=ip:12000,..."`.
-Full rollout runbook: `docs/DEPLOY.md`.
+Full rollout runbook (etcd + MDS + systemd units): `docs/DEPLOY.md`.
 
 ## Layout
 ```
-src/        portable C++ core (headers + .cc) + dfkv_server_main.cc
+src/        portable C++ core (headers + .cc) + dfkv_server_main.cc + dfkv_mds_main.cc
 python/     dfkv_hicache.py  (SGLang dynamic backend plugin)
 tests/      gtest suites + tests/python (unittest + no-torch sglang shim)
 docs/       DEPLOY.md (standalone rollout) · INTEGRATION.md (fuse into dingo-cache)
@@ -58,7 +87,10 @@ docs/       DEPLOY.md (standalone rollout) · INTEGRATION.md (fuse into dingo-ca
 - **Batch APIs** with concurrent fan-out across nodes (`BatchPut/Get/Exist`, C ABI + plugin).
 - **Connect/IO timeouts + stale-connection retry**: a hung node fails fast, never hangs.
 - **Metrics**: server counters + Prometheus text (`dfkvctl stat <node>` / `kStats` op).
-- **Dynamic membership**: `SetMembers()` hot-swaps the ring (no client restart).
+- **Dynamic membership**: MDS discovery (`dfkv_start_mds_discovery`) polls the MDS
+  tier and rebuilds the weighted Ketama ring on each etcd-epoch change. Legacy
+  `SetMembers()` hot-swap and `dfkv_refresh_members` (single-seed query) are still
+  supported.
 - **CLI tools**: `dfkv_smoke` (roundtrip check), `dfkvctl` (put/get/exist/stat).
 - **RDMA transport** (gated `-DDFKV_WITH_RDMA=ON`, native libibverbs RC): device
   selected **by name** (`DFKV_RDMA_DEV=ib7s400p0`, comma-list = multi-rail), QP

@@ -3,12 +3,14 @@
 > **Status — read first.** The primary, supported way to run dfkv is the
 > **standalone repo** with its own daemon + native-verbs RDMA transport
 > (`dfkv_server`, see `docs/DEPLOY.md`). It is feature-complete and validated on
-> 400G. This document is an **optional, aspirational** guide for an alternative
-> path: re-implementing the same Cache/Range/Exist semantics *inside* the
-> production `dingo-cache` (brpc + MDS + DiskCache) so HiCache could talk to the
-> existing cache fleet over brpc instead of dfkv_server. It is **not required**
-> for deployment and parts may be stale — re-confirm line refs on the build tag.
-> Most users want `DEPLOY.md`, not this.
+> 400G. The standalone path now includes its **own lightweight MDS** (`dfkv_mds` +
+> etcd) for dynamic membership and service discovery — it does **not** require or
+> touch the production dingo-cache MDS. This document is an **optional,
+> aspirational** guide for an alternative path: re-implementing the same
+> Cache/Range/Exist semantics *inside* the production `dingo-cache` (brpc + MDS +
+> DiskCache) so HiCache could talk to the existing cache fleet over brpc instead
+> of dfkv_server. It is **not required** for deployment and parts may be stale —
+> re-confirm line refs on the build tag. Most users want `DEPLOY.md`, not this.
 
 To wire the semantics into the full dingofs build, apply the following.
 **Compile in the full toolchain (gcc-13 / cmake-3.30 / dingo-eureka).**
@@ -121,7 +123,9 @@ install(TARGETS pydingofs_kv DESTINATION dingofs)
 from the portable `.cc` + `dingofs_transport.cc`, linking
 `cache_remotecache cache_cachegroup cache_blockcache cache_common cache_iutil`.
 
-## 8. RDMA (deferred)
-Out of scope for now (no env). Add an RDMA `Transport` later (brpc rdma or
-ibverbs one-sided + GPUDirect, mirroring Mooncake), keeping value_header/key_map/
-plugin unchanged.
+## 8. RDMA (deferred for the dingo-cache fusion path)
+Out of scope for the brpc/dingo-cache fusion path (no env). The standalone
+`dfkv_server` already has a production-validated native-verbs RDMA transport
+(built with `-DDFKV_WITH_RDMA=ON`, validated at 400G on hd03). For the fusion
+path, an RDMA `Transport` can be added later (brpc rdma or ibverbs one-sided +
+GPUDirect, mirroring Mooncake), keeping value_header/key_map/plugin unchanged.
