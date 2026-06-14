@@ -54,6 +54,34 @@ void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> membe
   addr_ = std::move(addr);
 }
 
+void KVClient::SetMembers(const std::vector<MemberInfo>& members) {
+  ConHash ring;
+  std::map<std::string, std::string> addr;
+  for (const auto& m : members) {
+    ring.AddNode(m.id, m.weight < 1 ? 1 : static_cast<int>(m.weight));
+    addr[m.id] = m.ip + ":" + std::to_string(m.port);
+  }
+  ring.Build();
+  std::lock_guard<std::mutex> lk(ring_mu_);
+  ring_ = std::move(ring);
+  addr_ = std::move(addr);
+}
+
+void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
+                                 const std::string& group, int poll_ms) {
+  StopMdsDiscovery();
+  poller_ = std::make_unique<MdsMemberPoller>(
+      std::move(mds_eps), group,
+      [this](const std::vector<MemberInfo>& ms) { SetMembers(ms); }, poll_ms);
+  poller_->Start();
+}
+
+void KVClient::StopMdsDiscovery() {
+  if (poller_) { poller_->Stop(); poller_.reset(); }
+}
+
+KVClient::~KVClient() { StopMdsDiscovery(); }
+
 bool KVClient::RefreshMembers(const std::string& seed_addr) {
   std::string text;
   if (t_->Members(seed_addr, &text) != Status::kOk) return false;

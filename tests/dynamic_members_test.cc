@@ -37,7 +37,7 @@ TEST(DynamicMembers, AddingNodeReroutesNewKeys) {
     ASSERT_TRUE(c.Put("p1_" + std::to_string(i), v.data(), v.size()));
   EXPECT_EQ(b->srv->Count(), 0u);  // b not in the ring yet
 
-  c.SetMembers({{"a", a->addr}, {"b", b->addr}});  // hot add node b
+  c.SetMembers(std::vector<std::pair<std::string,std::string>>{{"a", a->addr}, {"b", b->addr}});  // hot add node b
   for (int i = 0; i < 60; ++i)
     ASSERT_TRUE(c.Put("p2_" + std::to_string(i), v.data(), v.size()));
   EXPECT_GT(b->srv->Count(), 0u);  // some new keys now land on b

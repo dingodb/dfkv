@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "con_hash.h"
+#include "membership.h"
+#include "mds_member_poller.h"
 #include "transport.h"
 #include "value_header.h"
 
@@ -29,6 +31,7 @@ class KVClient {
   // transport defaults to TcpTransport (owned) when nullptr.
   KVClient(std::vector<std::pair<std::string, std::string>> members,
            ValueHeader self_hdr, Transport* transport = nullptr);
+  ~KVClient();
 
   bool Put(const std::string& key, const void* value, size_t n);
   bool Get(const std::string& key, void* out, size_t n);  // true = hit (exact n)
@@ -48,6 +51,16 @@ class KVClient {
   // Thread-safe vs concurrent Put/Get/Exist.
   void SetMembers(std::vector<std::pair<std::string, std::string>> members);
 
+  // Apply a weighted member view (from MDS discovery); rebuilds the ring with
+  // per-node vnode weight and resolves addr = "ip:port".
+  void SetMembers(const std::vector<MemberInfo>& members);
+
+  // Start background MDS discovery: poll the MDS endpoints for `group` and rebuild
+  // the ring on each epoch change. Replaces static membership.
+  void StartMdsDiscovery(std::vector<std::string> mds_eps, const std::string& group,
+                         int poll_ms = 3000);
+  void StopMdsDiscovery();
+
   // Discovery: query a seed node ("ip:port") for the current cluster membership
   // and SetMembers() it. Lets clients learn add/remove without a static list or
   // MDS — point at any live node. Returns true if a non-empty list was applied.
@@ -63,6 +76,7 @@ class KVClient {
   std::unique_ptr<Transport> owned_;
   Transport* t_;
   size_t batch_concurrency_ = 8;
+  std::unique_ptr<MdsMemberPoller> poller_;
 };
 
 }  // namespace dfkv

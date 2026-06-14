@@ -100,6 +100,21 @@ int dfkv_refresh_members(dfkv_client_t c, const char* seed) {
   return static_cast<KVClient*>(c)->RefreshMembers(seed) ? 0 : 1;
 }
 
+int dfkv_start_mds_discovery(dfkv_client_t c, const char* mds_endpoints,
+                             const char* group, int poll_ms) {
+  if (!c || !mds_endpoints || !group) return -1;
+  std::vector<std::string> eps;
+  std::string s(mds_endpoints);
+  for (size_t i = 0, j; i <= s.size(); i = j + 1) {
+    j = s.find(',', i);
+    if (j == std::string::npos) j = s.size();
+    if (j > i) eps.push_back(s.substr(i, j - i));
+  }
+  static_cast<KVClient*>(c)->StartMdsDiscovery(std::move(eps), group,
+                                               poll_ms > 0 ? poll_ms : 3000);
+  return 0;
+}
+
 void dfkv_close(dfkv_client_t c) { delete static_cast<KVClient*>(c); }
 
 }  // extern "C"

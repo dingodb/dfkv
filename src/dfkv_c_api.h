@@ -29,6 +29,10 @@ int dfkv_set_members(dfkv_client_t c, const char* members);
 // Discovery: query seed ("ip:port") for the cluster member list and apply it.
 // Returns 0 on success, non-zero on failure (seed unreachable / empty list).
 int dfkv_refresh_members(dfkv_client_t c, const char* seed);
+// Start background MDS-based discovery. mds_endpoints: comma-separated "ip:port" list.
+// poll_ms: poll interval (default 3000 if <= 0). Returns 0 on success.
+int dfkv_start_mds_discovery(dfkv_client_t c, const char* mds_endpoints,
+                             const char* group, int poll_ms);
 
 // Batched, concurrently fanned out. n items; out_* arrays (len n) receive
 // per-item results (1/0). Return 0 on call success.

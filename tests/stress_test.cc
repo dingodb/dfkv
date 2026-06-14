@@ -57,8 +57,8 @@ TEST(Stress, ConcurrentPutGetExistAndSetMembers) {
   std::thread mem([&] {
     while (!go.load()) {}
     for (int i = 0; i < 20; ++i) {
-      c.SetMembers({{"a", a->addr}, {"b", b->addr}});
-      c.SetMembers({{"a", a->addr}});
+      c.SetMembers(std::vector<std::pair<std::string,std::string>>{{"a", a->addr}, {"b", b->addr}});
+      c.SetMembers(std::vector<std::pair<std::string,std::string>>{{"a", a->addr}});
     }
   });
   go = true;
