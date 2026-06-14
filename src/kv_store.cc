@@ -66,24 +66,29 @@ void KVStore::EvictIfNeededLocked() {
 
 Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
   if (data == nullptr && len != 0) return Status::kInvalid;
-  std::lock_guard<std::mutex> lk(mu_);
   const std::string fname = key.Filename();
-  if (index_.count(fname)) return Status::kOk;  // idempotent skip
-
+  {  // best-effort early idempotent skip (avoids a needless 2.74 MiB write)
+    std::lock_guard<std::mutex> lk(mu_);
+    if (index_.count(fname)) return Status::kOk;
+  }
+  // Write the payload OUTSIDE the lock so concurrent writes to the same disk run
+  // in parallel (the mutex only guards the in-memory index/LRU). A unique tmp
+  // name per writer avoids collisions; the index re-check below resolves races.
   fs::path full = fs::path(opt_.cache_dir) / key.StoreKey();
   std::error_code ec;
   fs::create_directories(full.parent_path(), ec);
   fs::path tmp = full;
-  tmp += ".tmp";
+  tmp += "." + std::to_string(tmp_seq_.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
   {
     std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
     if (!ofs) return Status::kIOError;
     if (len) ofs.write(static_cast<const char*>(data), static_cast<std::streamsize>(len));
-    if (!ofs) return Status::kIOError;
+    if (!ofs) { fs::remove(tmp, ec); return Status::kIOError; }
   }
+  std::lock_guard<std::mutex> lk(mu_);
+  if (index_.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first
   fs::rename(tmp, full, ec);  // atomic publish
   if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
-
   lru_.push_front(fname);
   index_[fname] = Entry{full.string(), len, lru_.begin()};
   used_bytes_ += len;

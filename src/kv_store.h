@@ -6,6 +6,7 @@
 #ifndef DFKV_KV_STORE_H_
 #define DFKV_KV_STORE_H_
 
+#include <atomic>
 #include <cstdint>
 #include <list>
 #include <mutex>
@@ -54,6 +55,7 @@ class KVStore {
   std::unordered_map<std::string, Entry> index_;  // filename -> entry
   std::list<std::string> lru_;                    // filenames, front = MRU
   uint64_t used_bytes_ = 0;
+  std::atomic<uint64_t> tmp_seq_{0};  // unique suffix for concurrent lock-free writes
 };
 
 }  // namespace dfkv
