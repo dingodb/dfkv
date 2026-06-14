@@ -17,6 +17,7 @@
 #include "con_hash.h"
 #include "membership.h"
 #include "mds_member_poller.h"
+#include "peer_health.h"
 #include "transport.h"
 #include "value_header.h"
 
@@ -68,6 +69,7 @@ class KVClient {
 
  private:
   std::string Route(const std::string& key) const;
+  uint64_t NowMs() const;
 
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
@@ -77,6 +79,7 @@ class KVClient {
   Transport* t_;
   size_t batch_concurrency_ = 8;
   std::unique_ptr<MdsMemberPoller> poller_;
+  PeerHealth health_;
 };
 
 }  // namespace dfkv

@@ -1,6 +1,7 @@
 #include "kv_client.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <thread>
@@ -82,6 +83,11 @@ void KVClient::StopMdsDiscovery() {
 
 KVClient::~KVClient() { StopMdsDiscovery(); }
 
+uint64_t KVClient::NowMs() const {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 bool KVClient::RefreshMembers(const std::string& seed_addr) {
   std::string text;
   if (t_->Members(seed_addr, &text) != Status::kOk) return false;
@@ -112,6 +118,8 @@ std::string KVClient::Route(const std::string& key) const {
 bool KVClient::Put(const std::string& key, const void* value, size_t n) {
   std::string node = Route(key);
   if (node.empty()) return false;
+  uint64_t now = NowMs();
+  if (!health_.Healthy(node, now)) return false;
 
   ValueHeader h = self_hdr_;
   h.SetPayload(value, n);  // sets payload_len + crc32
@@ -120,17 +128,24 @@ bool KVClient::Put(const std::string& key, const void* value, size_t n) {
   if (n) std::memcpy(buf.data() + ValueHeader::kSize, value, n);
 
   BlockKey bk = ToBlockKey(key);
-  return t_->Cache(node, bk, buf.data(), buf.size()) == Status::kOk;
+  Status st = t_->Cache(node, bk, buf.data(), buf.size());
+  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
+  health_.MarkGood(node);
+  return st == Status::kOk;
 }
 
 bool KVClient::Get(const std::string& key, void* out, size_t n) {
   std::string node = Route(key);
   if (node.empty()) return false;
+  uint64_t now = NowMs();
+  if (!health_.Healthy(node, now)) return false;
 
   BlockKey bk = ToBlockKey(key);
   std::string raw;
-  if (t_->Range(node, bk, 0, ValueHeader::kSize + n, &raw) != Status::kOk)
-    return false;
+  Status st = t_->Range(node, bk, 0, ValueHeader::kSize + n, &raw);
+  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
+  health_.MarkGood(node);
+  if (st != Status::kOk) return false;
   if (raw.size() < ValueHeader::kSize) return false;
 
   ValueHeader h;
@@ -148,9 +163,13 @@ bool KVClient::Get(const std::string& key, void* out, size_t n) {
 bool KVClient::GetAuto(const std::string& key, std::string* out, size_t max_bytes) {
   std::string node = Route(key);
   if (node.empty()) return false;
+  uint64_t now = NowMs();
+  if (!health_.Healthy(node, now)) return false;
   std::string raw;
-  if (t_->Range(node, ToBlockKey(key), 0, ValueHeader::kSize + max_bytes, &raw) != Status::kOk)
-    return false;
+  Status st = t_->Range(node, ToBlockKey(key), 0, ValueHeader::kSize + max_bytes, &raw);
+  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
+  health_.MarkGood(node);
+  if (st != Status::kOk) return false;
   if (raw.size() < ValueHeader::kSize) return false;
   ValueHeader h;
   if (!ValueHeader::Parse(raw.data(), raw.size(), &h)) return false;
@@ -165,9 +184,13 @@ bool KVClient::GetAuto(const std::string& key, std::string* out, size_t max_byte
 bool KVClient::Exist(const std::string& key) {
   std::string node = Route(key);
   if (node.empty()) return false;
+  uint64_t now = NowMs();
+  if (!health_.Healthy(node, now)) return false;
   bool e = false;
-  if (t_->Exist(node, ToBlockKey(key), &e) != Status::kOk) return false;
-  return e;
+  Status st = t_->Exist(node, ToBlockKey(key), &e);
+  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
+  health_.MarkGood(node);
+  return st == Status::kOk && e;
 }
 
 std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
@@ -196,12 +219,17 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
   std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
   RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
     const std::string& node = groups[g].first;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) return;
     const std::vector<size_t>& idx = groups[g].second;
     std::vector<CacheItem> ci;
     ci.reserve(idx.size());
     for (size_t k : idx) ci.push_back(CacheItem{ToBlockKey(items[k].key), bufs[k].data(), bufs[k].size()});
     std::vector<Status> sts = t_->CacheMany(node, ci);
     for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
+    bool resp = false, ioerr = false;
+    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
   });
   return std::vector<bool>(ok.begin(), ok.end());
 }
@@ -225,6 +253,8 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
   std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups(by.begin(), by.end());
   RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
     const std::string& node = groups[g].first.first;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) return;
     const size_t n = groups[g].first.second;
     const std::vector<size_t>& idx = groups[g].second;
     std::vector<BlockKey> keys;
@@ -239,6 +269,9 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     // header for geometry/CRC verification (CRC is computed over the dst buffer).
     std::vector<std::string> hdrs;
     std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
+    bool resp = false, ioerr = false;
+    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
     for (size_t m = 0; m < idx.size(); ++m) {
       if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
       ValueHeader h;
