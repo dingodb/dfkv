@@ -93,12 +93,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ git ca-certificates \
             libibverbs-dev librdmacm-dev rdma-core iproute2
-      - name: Set up Soft-RoCE (rdma_rxe) over the primary NIC
+      - name: Set up Soft-RoCE (rdma_rxe) over loopback
         run: |
+          # rxe over 'lo' keeps packets in-host, so RC self-loopback actually
+          # works in CI (rxe over a physical NIC relies on the network hairpinning
+          # packets back, which GitHub runners don't do).
           sudo modprobe rdma_rxe || true
-          IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
-          echo "iface=$IFACE"
-          sudo rdma link add rxe0 type rxe netdev "$IFACE" || true
+          sudo rdma link add rxe0 type rxe netdev lo || true
           rdma link show || true
       - name: Build (RDMA + tests)
         run: |
