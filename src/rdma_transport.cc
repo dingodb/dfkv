@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -21,6 +22,31 @@ void EncodePrefix(char* p, WireOp op, const BlockKey& k, uint64_t offset,
   net::PutU64(p + 25, length);
   net::PutU64(p + 33, payload_len);
 }
+
+// Post w requests (already built in ep.sbuf[j], send length slen[j]) with one
+// recv per slot, then reap all 2*w completions. recv wr_id = slot, so the reply
+// for request j lands in ep.rbuf[j] (RC in-order delivery). rbytes[j] = reply
+// length. Returns false (connection unusable) on any error completion.
+bool RunWindow(rdma::RcEndpoint& ep, const std::vector<size_t>& slen,
+               std::vector<uint32_t>* rbytes) {
+  const size_t w = slen.size();
+  rbytes->assign(w, 0);
+  for (size_t j = 0; j < w; ++j)
+    if (!ep.PostRecv(j) || !ep.PostSend(j, slen[j])) return false;
+  std::vector<ibv_wc> wcs(2 * w);
+  int need = static_cast<int>(2 * w);
+  while (need > 0) {
+    int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
+    if (g <= 0) return false;
+    for (int i = 0; i < g; ++i) {
+      if (wcs[i].status != IBV_WC_SUCCESS) return false;
+      if (wcs[i].opcode == IBV_WC_RECV)
+        (*rbytes)[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
+      --need;
+    }
+  }
+  return true;
+}
 }  // namespace
 
 struct RdmaTransport::Conn {
@@ -35,11 +61,13 @@ bool RdmaTransport::Available() {
 }
 
 RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
-    : max_msg_(max_msg), dev_name_(dev_name) {
+    : max_msg_(max_msg), depth_(1), dev_name_(dev_name) {
   if (dev_name_.empty()) {
     const char* e = std::getenv("DFKV_RDMA_DEV");
     if (e && *e) dev_name_ = e;
   }
+  const char* d = std::getenv("DFKV_RDMA_DEPTH");  // pipeline depth (must be <= server's)
+  if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
 }
 
 RdmaTransport::~RdmaTransport() {
@@ -66,7 +94,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   if (fd < 0) return nullptr;
 
   auto* c = new Conn();
-  if (!c->ep.Open(dev_name_.empty() ? nullptr : dev_name_.c_str(), max_msg_, 1)) {
+  if (!c->ep.Open(dev_name_.empty() ? nullptr : dev_name_.c_str(), max_msg_, depth_)) {
     ::close(fd); delete c; return nullptr;
   }
   char mine[rdma::kQpInfoBytes], peer[rdma::kQpInfoBytes];
@@ -147,6 +175,81 @@ Status RdmaTransport::Exist(const std::string& node, const BlockKey& key, bool* 
   if (st == Status::kOk) { *exist = true; return Status::kOk; }
   if (st == Status::kNotFound) { *exist = false; return Status::kOk; }
   return st;
+}
+
+std::vector<Status> RdmaTransport::CacheMany(const std::string& node,
+                                             const std::vector<CacheItem>& items) {
+  const size_t n = items.size();
+  std::vector<Status> res(n, Status::kIOError);
+  if (n == 0) return res;
+  for (const auto& it : items)
+    if (kReqPrefix + it.len > max_msg_) return Transport::CacheMany(node, items);  // oversized: fall back
+
+  bool from_pool = false;
+  Conn* c = Acquire(node, &from_pool);
+  if (!c) return res;
+  rdma::RcEndpoint& ep = c->ep;
+  const size_t W = ep.depth();
+  bool conn_ok = true;
+  for (size_t base = 0; base < n && conn_ok; base += W) {
+    const size_t w = std::min(W, n - base);
+    std::vector<size_t> slen(w);
+    for (size_t j = 0; j < w; ++j) {
+      const CacheItem& it = items[base + j];
+      EncodePrefix(ep.sbuf(j), WireOp::kCache, it.key, 0, 0, it.len);
+      if (it.len) std::memcpy(ep.sbuf(j) + kReqPrefix, it.data, it.len);
+      slen[j] = kReqPrefix + it.len;
+    }
+    std::vector<uint32_t> rbytes;
+    if (!RunWindow(ep, slen, &rbytes)) { conn_ok = false; break; }
+    for (size_t j = 0; j < w; ++j)
+      if (rbytes[j] >= kRespPrefix)
+        res[base + j] = static_cast<Status>(static_cast<uint8_t>(ep.rbuf(j)[0]));
+  }
+  if (conn_ok) Release(node, c); else Destroy(c);
+  return res;
+}
+
+std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
+                                             const std::vector<BlockKey>& keys,
+                                             uint64_t offset, uint64_t length,
+                                             std::vector<std::string>* outs) {
+  const size_t n = keys.size();
+  outs->assign(n, std::string());
+  std::vector<Status> res(n, Status::kIOError);
+  if (n == 0) return res;
+  if (kRespPrefix + length > max_msg_)  // reply wouldn't fit the recv buffer
+    return Transport::RangeMany(node, keys, offset, length, outs);
+
+  bool from_pool = false;
+  Conn* c = Acquire(node, &from_pool);
+  if (!c) return res;
+  rdma::RcEndpoint& ep = c->ep;
+  const size_t W = ep.depth();
+  bool conn_ok = true;
+  for (size_t base = 0; base < n && conn_ok; base += W) {
+    const size_t w = std::min(W, n - base);
+    std::vector<size_t> slen(w);
+    for (size_t j = 0; j < w; ++j) {
+      EncodePrefix(ep.sbuf(j), WireOp::kRange, keys[base + j], offset, length, 0);
+      slen[j] = kReqPrefix;
+    }
+    std::vector<uint32_t> rbytes;
+    if (!RunWindow(ep, slen, &rbytes)) { conn_ok = false; break; }
+    for (size_t j = 0; j < w; ++j) {
+      uint32_t rb = rbytes[j];
+      if (rb < kRespPrefix) continue;
+      Status st = static_cast<Status>(static_cast<uint8_t>(ep.rbuf(j)[0]));
+      res[base + j] = st;
+      if (st == Status::kOk) {
+        uint64_t dlen = net::GetU64(ep.rbuf(j) + 1);
+        if (kRespPrefix + dlen <= rb) (*outs)[base + j].assign(ep.rbuf(j) + kRespPrefix, dlen);
+        else res[base + j] = Status::kIOError;
+      }
+    }
+  }
+  if (conn_ok) Release(node, c); else Destroy(c);
+  return res;
 }
 
 }  // namespace dfkv

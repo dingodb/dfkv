@@ -1,0 +1,14 @@
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/dfkv_core.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/dfkv.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/dfkv_server.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/dfkv_smoke.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/dfkvctl.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/dfkv_bench.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/package.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/package_source.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/edit_cache.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/rebuild_cache.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/list_install_components.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/install.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/install/local.dir
+/home/ketor/Code/git/ketor/dfkv/build-rdma/CMakeFiles/install/strip.dir

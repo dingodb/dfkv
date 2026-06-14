@@ -35,6 +35,15 @@ class RdmaTransport : public Transport {
   Status Exist(const std::string& node, const BlockKey& key,
                bool* exist) override;
 
+  bool pipelined() const override { return true; }
+  // Pipelined: up to `depth_` requests in flight on a single connection.
+  std::vector<Status> CacheMany(const std::string& node,
+                                const std::vector<CacheItem>& items) override;
+  std::vector<Status> RangeMany(const std::string& node,
+                                const std::vector<BlockKey>& keys,
+                                uint64_t offset, uint64_t length,
+                                std::vector<std::string>* outs) override;
+
  private:
   struct Conn;
   Conn* Acquire(const std::string& node, bool* from_pool);
@@ -47,6 +56,7 @@ class RdmaTransport : public Transport {
   std::mutex mu_;
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
   size_t max_msg_;
+  size_t depth_;
   std::string dev_name_;
 };
 

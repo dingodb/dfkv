@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/ketor/Code/git/ketor/dfkv/build-rdma/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

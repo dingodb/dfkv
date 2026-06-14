@@ -124,17 +124,80 @@ bool KVClient::Exist(const std::string& key) {
 }
 
 std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
-  std::vector<char> ok(items.size(), 0);  // char (not vector<bool>) for thread-safe writes
-  RunParallel(items.size(), batch_concurrency_, [&](size_t i) {
-    ok[i] = Put(items[i].key, items[i].value, items[i].n) ? 1 : 0;
+  const size_t N = items.size();
+  std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
+  if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
+    RunParallel(N, batch_concurrency_, [&](size_t i) {
+      ok[i] = Put(items[i].key, items[i].value, items[i].n) ? 1 : 0;
+    });
+    return std::vector<bool>(ok.begin(), ok.end());
+  }
+  // RDMA: group by node, wrap once, pipeline each node's writes on one connection.
+  std::vector<std::vector<char>> bufs(N);
+  std::map<std::string, std::vector<size_t>> by_node;
+  for (size_t i = 0; i < N; ++i) {
+    std::string node = Route(items[i].key);
+    if (node.empty()) continue;
+    ValueHeader h = self_hdr_;
+    h.SetPayload(items[i].value, items[i].n);
+    bufs[i].resize(ValueHeader::kSize + items[i].n);
+    h.Serialize(bufs[i].data());
+    if (items[i].n)
+      std::memcpy(bufs[i].data() + ValueHeader::kSize, items[i].value, items[i].n);
+    by_node[node].push_back(i);
+  }
+  std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
+  RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
+    const std::string& node = groups[g].first;
+    const std::vector<size_t>& idx = groups[g].second;
+    std::vector<CacheItem> ci;
+    ci.reserve(idx.size());
+    for (size_t k : idx) ci.push_back(CacheItem{ToBlockKey(items[k].key), bufs[k].data(), bufs[k].size()});
+    std::vector<Status> sts = t_->CacheMany(node, ci);
+    for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
   });
   return std::vector<bool>(ok.begin(), ok.end());
 }
 
 std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
-  std::vector<char> hit(items.size(), 0);
-  RunParallel(items.size(), batch_concurrency_, [&](size_t i) {
-    hit[i] = Get(items[i].key, items[i].out, items[i].n) ? 1 : 0;
+  const size_t N = items.size();
+  std::vector<char> hit(N, 0);
+  if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
+    RunParallel(N, batch_concurrency_, [&](size_t i) {
+      hit[i] = Get(items[i].key, items[i].out, items[i].n) ? 1 : 0;
+    });
+    return std::vector<bool>(hit.begin(), hit.end());
+  }
+  // RDMA: group by (node, n) so each group shares the Range length, then pipeline.
+  std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
+  for (size_t i = 0; i < N; ++i) {
+    std::string node = Route(items[i].key);
+    if (node.empty()) continue;
+    by[{node, items[i].n}].push_back(i);
+  }
+  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups(by.begin(), by.end());
+  RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
+    const std::string& node = groups[g].first.first;
+    const size_t n = groups[g].first.second;
+    const std::vector<size_t>& idx = groups[g].second;
+    std::vector<BlockKey> keys;
+    keys.reserve(idx.size());
+    for (size_t k : idx) keys.push_back(ToBlockKey(items[k].key));
+    std::vector<std::string> raws;
+    std::vector<Status> sts = t_->RangeMany(node, keys, 0, ValueHeader::kSize + n, &raws);
+    for (size_t m = 0; m < idx.size(); ++m) {
+      if (sts[m] != Status::kOk) continue;
+      const std::string& raw = raws[m];
+      if (raw.size() < ValueHeader::kSize) continue;
+      ValueHeader h;
+      if (!ValueHeader::Parse(raw.data(), raw.size(), &h)) continue;
+      if (!HeaderMatches(self_hdr_, h)) continue;
+      if (h.payload_len != n || raw.size() < ValueHeader::kSize + n) continue;
+      const char* p = raw.data() + ValueHeader::kSize;
+      if (Crc32(p, n) != h.crc32) continue;
+      std::memcpy(items[idx[m]].out, p, n);
+      hit[idx[m]] = 1;
+    }
   });
   return std::vector<bool>(hit.begin(), hit.end());
 }
