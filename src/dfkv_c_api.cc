@@ -34,7 +34,8 @@ dfkv_client_t dfkv_open(const char* members, uint64_t model_hash,
                         uint32_t tp_size, uint32_t tp_rank, uint32_t layer_num,
                         uint32_t head_num, uint32_t head_dim) {
   auto mem = ParseMembers(members);
-  if (mem.empty()) return nullptr;
+  // Empty member list is valid: discovery-only client; ring gets populated by
+  // dfkv_start_mds_discovery. KVClient handles an empty member vector.
   ValueHeader self = ValueHeader::Make(
       model_hash, page_size, dtype_tag, static_cast<uint16_t>(flags),
       static_cast<uint16_t>(tp_size), static_cast<uint16_t>(tp_rank),

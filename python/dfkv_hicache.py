@@ -49,6 +49,8 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_set_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.dfkv_refresh_members.restype = ctypes.c_int
     lib.dfkv_refresh_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.dfkv_start_mds_discovery.restype = ctypes.c_int
+    lib.dfkv_start_mds_discovery.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [ctypes.c_void_p]
     return lib
@@ -73,19 +75,27 @@ class DfkvHiCache(HiCacheStorage):
         self.tp_rank = int(storage_config.tp_rank)
         self.tp_size = int(storage_config.tp_size)
         self.is_mla = bool(storage_config.is_mla_model)
-        if "members" not in cfg:
-            raise ValueError("dingofs hicache: extra_config.members required")
+        mds = cfg.get("mds_endpoints", "")
+        members = cfg.get("members", "")
+        if not mds and not members:
+            raise ValueError("dingofs hicache: extra_config needs 'mds_endpoints' (MDS discovery) or 'members' (static)")
         self._lib = _load_lib(cfg.get("lib_path"))
         flags = _FLAG_IS_MLA if self.is_mla else 0
         model_hash = int(cfg.get("model_hash", 0)) & 0xFFFFFFFFFFFFFFFF
         self._h = self._lib.dfkv_open(
-            cfg["members"].encode(), model_hash,
+            members.encode(), model_hash,
             int(cfg.get("page_size", 64)), int(cfg.get("dtype_tag", 0)), flags,
             self.tp_size, self.tp_rank,
             int(cfg.get("layer_num", 0)), int(cfg.get("head_num", 0)),
             int(cfg.get("head_dim", 0)))
         if not self._h:
-            raise RuntimeError("dfkv_open failed (bad members?)")
+            raise RuntimeError("dfkv_open failed")
+        if mds:
+            group = cfg.get("mds_group", "default")
+            poll_ms = int(cfg.get("mds_poll_ms", 3000))
+            rc = self._lib.dfkv_start_mds_discovery(self._h, mds.encode(), group.encode(), poll_ms)
+            if rc != 0:
+                raise RuntimeError("dfkv_start_mds_discovery failed")
         self.mem_pool_host = None
 
     def __del__(self):
@@ -108,6 +118,11 @@ class DfkvHiCache(HiCacheStorage):
         Lets the cluster grow/shrink without restarting clients. Returns True on
         success (seed reachable and returned a non-empty member list)."""
         return self._lib.dfkv_refresh_members(self._h, seed.encode()) == 0
+
+    def start_mds_discovery(self, mds_endpoints: str, group: str = "default", poll_ms: int = 3000) -> bool:
+        """Start background MDS-based discovery. mds_endpoints: comma-separated 'ip:port' list.
+        Returns True on success."""
+        return self._lib.dfkv_start_mds_discovery(self._h, mds_endpoints.encode(), group.encode(), poll_ms) == 0
 
     # --- key scheme: MLA single object (no rank suffix); MHA two objects ---
     def _keys(self, page_hash: str) -> List[str]:
