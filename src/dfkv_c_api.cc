@@ -89,6 +89,12 @@ int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist) 
   return 0;
 }
 
+int dfkv_set_members(dfkv_client_t c, const char* members) {
+  if (!c) return -1;
+  static_cast<KVClient*>(c)->SetMembers(ParseMembers(members));
+  return 0;
+}
+
 void dfkv_close(dfkv_client_t c) { delete static_cast<KVClient*>(c); }
 
 }  // extern "C"

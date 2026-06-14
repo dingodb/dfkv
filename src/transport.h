@@ -13,7 +13,7 @@
 namespace dfkv {
 
 // Wire op codes (shared by TcpTransport and KvNodeServer).
-enum class WireOp : uint8_t { kCache = 1, kRange = 2, kExist = 3 };
+enum class WireOp : uint8_t { kCache = 1, kRange = 2, kExist = 3, kStats = 4 };
 // Fixed request prefix: op(1) id(8) index(4) size(4) offset(8) length(8) payload_len(8)
 constexpr size_t kReqPrefix = 1 + 8 + 4 + 4 + 8 + 8 + 8;  // = 41
 // Fixed response prefix: status(1) data_len(8)

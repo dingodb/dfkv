@@ -16,9 +16,12 @@ if(DFKV_STATIC_LIBSTDCXX)
   add_link_options(-static-libstdc++ -static-libgcc)
 endif()
 
-# --- portable core library (everything in src/ except the server main) ---
+# --- portable core library (everything in src/ except the *_main.cc entrypoints) ---
 file(GLOB DFKV_SRCS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc)
-list(REMOVE_ITEM DFKV_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_server_main.cc)
+list(REMOVE_ITEM DFKV_SRCS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_server_main.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_smoke_main.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkvctl_main.cc)
 
 add_library(dfkv_core STATIC ${DFKV_SRCS})
 target_include_directories(dfkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -30,12 +33,16 @@ add_library(dfkv SHARED ${DFKV_SRCS})
 target_include_directories(dfkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dfkv PUBLIC Threads::Threads)
 
-# standalone cache-node daemon
+# standalone cache-node daemon + CLI tools
 add_executable(dfkv_server ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_server_main.cc)
 target_link_libraries(dfkv_server PRIVATE dfkv_core)
+add_executable(dfkv_smoke ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_smoke_main.cc)
+target_link_libraries(dfkv_smoke PRIVATE dfkv_core)
+add_executable(dfkvctl ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkvctl_main.cc)
+target_link_libraries(dfkvctl PRIVATE dfkv_core)
 
 include(GNUInstallDirs)
-install(TARGETS dfkv dfkv_server dfkv_core
+install(TARGETS dfkv dfkv_server dfkv_smoke dfkvctl dfkv_core
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -70,4 +77,8 @@ if(DFKV_BUILD_TESTS)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so")
   endif()
+
+  # CLI tools integration smoke (dfkv_server + dfkv_smoke + dfkvctl)
+  add_test(NAME tool_smoke
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/tool_smoke.sh ${CMAKE_BINARY_DIR})
 endif()

@@ -10,6 +10,7 @@
 #include <string>
 
 #include "kv_node_server.h"
+#include "log.h"
 
 using dfkv::KvNodeServer;
 using dfkv::Status;
@@ -45,7 +46,9 @@ int main(int argc, char** argv) {
   }
   std::printf("PORT %d\n", srv.port());
   std::fflush(stdout);
+  DFKV_LOG_INFO("dfkv_server listening on port " + std::to_string(srv.port()) + ", dir=" + dir);
   while (!g_stop) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
+  DFKV_LOG_INFO("dfkv_server shutting down");
   srv.Stop();
   return 0;
 }

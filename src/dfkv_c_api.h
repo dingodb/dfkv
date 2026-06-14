@@ -24,6 +24,8 @@ dfkv_client_t dfkv_open(const char* members, uint64_t model_hash,
 int dfkv_put(dfkv_client_t c, const char* key, const void* ptr, uint64_t n);  // 0=ok
 int dfkv_get(dfkv_client_t c, const char* key, void* ptr, uint64_t n);        // 1=hit,0=miss
 int dfkv_exist(dfkv_client_t c, const char* key);                            // 1/0
+// Hot-swap cluster membership ("n1=ip:port,n2=ip:port"). Returns 0 on success.
+int dfkv_set_members(dfkv_client_t c, const char* members);
 
 // Batched, concurrently fanned out. n items; out_* arrays (len n) receive
 // per-item results (1/0). Return 0 on call success.

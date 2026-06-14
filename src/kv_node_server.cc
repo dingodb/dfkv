@@ -1,5 +1,7 @@
 #include "kv_node_server.h"
 
+#include <string>
+
 #include <vector>
 
 #include "net_util.h"
@@ -56,6 +58,25 @@ void KvNodeServer::Stop() {
   for (auto& t : threads) if (t.joinable()) t.join();
 }
 
+std::string KvNodeServer::MetricsText() const {
+  auto line = [](const char* k, size_t v) {
+    return std::string(k) + " " + std::to_string(v) + "\n";
+  };
+  std::string s;
+  s += line("dfkv_cache_put_total", m_cache_put());
+  s += line("dfkv_cache_hit_total", m_cache_hit());
+  s += line("dfkv_cache_miss_total", m_cache_miss());
+  s += line("dfkv_exist_hit_total", m_exist_hit());
+  s += line("dfkv_exist_miss_total", m_exist_miss());
+  s += line("dfkv_bytes_written_total", bytes_written_.load(std::memory_order_relaxed));
+  s += line("dfkv_bytes_read_total", bytes_read_.load(std::memory_order_relaxed));
+  s += line("dfkv_accepts_total", AcceptCount());
+  s += line("dfkv_objects", group_.Count());
+  s += line("dfkv_used_bytes", group_.UsedBytes());
+  s += line("dfkv_disks", group_.DiskCount());
+  return s;
+}
+
 void KvNodeServer::AcceptLoop() {
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
@@ -95,12 +116,27 @@ void KvNodeServer::Handle(int fd) {
     switch (op) {
       case WireOp::kCache:
         st = group_.Cache(key, payload.data(), payload_len);
+        if (st == Status::kOk) {
+          cache_put_.fetch_add(1, std::memory_order_relaxed);
+          bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
+        }
         break;
       case WireOp::kRange:
         st = group_.Range(key, offset, length, &data);
+        if (st == Status::kOk) {
+          cache_hit_.fetch_add(1, std::memory_order_relaxed);
+          bytes_read_.fetch_add(data.size(), std::memory_order_relaxed);
+        } else if (st == Status::kNotFound) {
+          cache_miss_.fetch_add(1, std::memory_order_relaxed);
+        }
         break;
       case WireOp::kExist:
-        st = group_.IsCached(key) ? Status::kOk : Status::kNotFound;
+        if (group_.IsCached(key)) { st = Status::kOk; exist_hit_.fetch_add(1, std::memory_order_relaxed); }
+        else { st = Status::kNotFound; exist_miss_.fetch_add(1, std::memory_order_relaxed); }
+        break;
+      case WireOp::kStats:
+        data = MetricsText();
+        st = Status::kOk;
         break;
     }
 

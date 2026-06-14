@@ -35,9 +35,20 @@ class KvNodeServer {
   size_t DiskCount() const { return group_.DiskCount(); }
   size_t AcceptCount() const { return accept_count_.load(std::memory_order_relaxed); }
 
+  // metrics (relaxed atomics)
+  size_t m_cache_put() const { return cache_put_.load(std::memory_order_relaxed); }
+  size_t m_cache_hit() const { return cache_hit_.load(std::memory_order_relaxed); }
+  size_t m_cache_miss() const { return cache_miss_.load(std::memory_order_relaxed); }
+  size_t m_exist_hit() const { return exist_hit_.load(std::memory_order_relaxed); }
+  size_t m_exist_miss() const { return exist_miss_.load(std::memory_order_relaxed); }
+  std::string MetricsText() const;  // Prometheus text format
+
  private:
   void AcceptLoop();
   void Handle(int fd);
+  std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
+  std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
+  std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
 
   DiskCacheGroup group_;
   int listen_fd_ = -1;

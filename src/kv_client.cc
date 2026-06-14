@@ -32,11 +32,7 @@ void RunParallel(size_t n, size_t workers, const std::function<void(size_t)>& fn
 KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
                    ValueHeader self_hdr, Transport* transport)
     : self_hdr_(self_hdr) {
-  for (auto& [name, addr] : members) {
-    ring_.AddNode(name);
-    addr_[name] = addr;
-  }
-  ring_.Build();
+  SetMembers(std::move(members));
   if (transport) {
     t_ = transport;
   } else {
@@ -45,7 +41,21 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
   }
 }
 
+void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> members) {
+  ConHash ring;
+  std::map<std::string, std::string> addr;
+  for (auto& [name, a] : members) {
+    ring.AddNode(name);
+    addr[name] = a;
+  }
+  ring.Build();
+  std::lock_guard<std::mutex> lk(ring_mu_);
+  ring_ = std::move(ring);
+  addr_ = std::move(addr);
+}
+
 std::string KVClient::Route(const std::string& key) const {
+  std::lock_guard<std::mutex> lk(ring_mu_);
   std::string name;
   if (!ring_.Lookup(key, &name)) return "";
   auto it = addr_.find(name);
@@ -85,6 +95,23 @@ bool KVClient::Get(const std::string& key, void* out, size_t n) {
   const char* payload = raw.data() + ValueHeader::kSize;
   if (Crc32(payload, n) != h.crc32) return false;          // corruption => miss
   std::memcpy(out, payload, n);
+  return true;
+}
+
+bool KVClient::GetAuto(const std::string& key, std::string* out, size_t max_bytes) {
+  std::string node = Route(key);
+  if (node.empty()) return false;
+  std::string raw;
+  if (t_->Range(node, ToBlockKey(key), 0, ValueHeader::kSize + max_bytes, &raw) != Status::kOk)
+    return false;
+  if (raw.size() < ValueHeader::kSize) return false;
+  ValueHeader h;
+  if (!ValueHeader::Parse(raw.data(), raw.size(), &h)) return false;
+  if (!HeaderMatches(self_hdr_, h)) return false;
+  if (raw.size() < ValueHeader::kSize + h.payload_len) return false;
+  const char* p = raw.data() + ValueHeader::kSize;
+  if (Crc32(p, h.payload_len) != h.crc32) return false;
+  out->assign(p, h.payload_len);
   return true;
 }
 

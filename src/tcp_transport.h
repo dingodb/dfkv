@@ -25,6 +25,9 @@ class TcpTransport : public Transport {
   Status Exist(const std::string& node, const BlockKey& key,
                bool* exist) override;
 
+  // Fetch a node's Prometheus-format metrics text (not part of Transport iface).
+  Status Stats(const std::string& node, std::string* out);
+
   // connect/IO timeouts (ms); 0 = block indefinitely. Defaults bound hangs.
   void set_timeouts(int connect_ms, int io_ms) {
     connect_ms_ = connect_ms; io_ms_ = io_ms;

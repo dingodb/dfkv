@@ -9,6 +9,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,7 +31,10 @@ class KVClient {
            ValueHeader self_hdr, Transport* transport = nullptr);
 
   bool Put(const std::string& key, const void* value, size_t n);
-  bool Get(const std::string& key, void* out, size_t n);  // true = hit
+  bool Get(const std::string& key, void* out, size_t n);  // true = hit (exact n)
+  // Variable-size get: learns payload length from the stored header. For CLI/
+  // tooling where the caller doesn't know the page size up front.
+  bool GetAuto(const std::string& key, std::string* out, size_t max_bytes = (64u << 20));
   bool Exist(const std::string& key);
 
   // Batched, concurrently fanned out across owning nodes. Per-item results.
@@ -40,9 +44,14 @@ class KVClient {
 
   void set_batch_concurrency(size_t n) { batch_concurrency_ = n ? n : 1; }
 
+  // Hot-swap the cluster membership (rebuilds the consistent-hash ring).
+  // Thread-safe vs concurrent Put/Get/Exist.
+  void SetMembers(std::vector<std::pair<std::string, std::string>> members);
+
  private:
   std::string Route(const std::string& key) const;
 
+  mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
   std::map<std::string, std::string> addr_;  // name -> ip:port
   ValueHeader self_hdr_;
