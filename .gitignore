@@ -1,0 +1,8 @@
+/build/
+/_deps/
+*.o
+*.so
+*.a
+__pycache__/
+*.pyc
+compile_commands.json

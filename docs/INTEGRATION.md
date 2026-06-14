@@ -1,0 +1,120 @@
+# Full-build brpc integration guide (`feat/kvcache-sglang`)
+
+The portable core (this dir) is compiled & tested standalone. To wire it into the
+production `dingo-cache` (brpc + MDS + DiskCache) apply the following in the full
+dingofs build. Line refs are from the analysis on `main`/v5.1; re-confirm on the
+build tag. **Compile in the full toolchain (gcc-13 / cmake-3.30 / dingo-eureka),
+not in the standalone harness.**
+
+## 1. proto (DONE on this branch)
+`proto/dingofs/blockcache.proto`: added `ExistRequest/ExistResponse`,
+`rpc Exist`, `rpc SyncCache(CacheRequest) returns (CacheResponse)`. Regenerate
+`blockcache.pb.h`.
+
+## 2. cachegroup service handlers — `src/cache/cachegroup/service.{h,cc}`
+Add (mirror the existing `Range`/`Cache`/`Ping` handlers):
+```cpp
+// service.h (declarations)
+void Exist(google::protobuf::RpcController*, const pb::cache::ExistRequest*,
+           pb::cache::ExistResponse*, google::protobuf::Closure*) override;
+void SyncCache(google::protobuf::RpcController*, const pb::cache::CacheRequest*,
+               pb::cache::CacheResponse*, google::protobuf::Closure*) override;
+```
+```cpp
+// service.cc
+void BlockCacheServiceImpl::Exist(google::protobuf::RpcController*,
+    const pb::cache::ExistRequest* req, pb::cache::ExistResponse* resp,
+    google::protobuf::Closure* done) {
+  brpc::ClosureGuard g(done);
+  auto ctx = NewContext();
+  bool exist = node_->Exist(ctx, FromContextPB(req->block_ctx()));
+  resp->set_exist(exist);
+  resp->set_status(ToPBErr(Status::OK()));
+}
+void BlockCacheServiceImpl::SyncCache(google::protobuf::RpcController* cntl_base,
+    const pb::cache::CacheRequest* req, pb::cache::CacheResponse* resp,
+    google::protobuf::Closure* done) {
+  brpc::ClosureGuard g(done);
+  auto* cntl = static_cast<brpc::Controller*>(cntl_base);
+  auto ctx = NewContext();
+  IOBuffer buffer(cntl->request_attachment().movable());
+  auto st = CheckBodySize(req->block_size(), buffer.Size());
+  if (st.ok()) st = node_->SyncCache(ctx, FromContextPB(req->block_ctx()),
+                                     Block(std::move(buffer)));
+  resp->set_status(ToPBErr(st));
+}
+```
+
+## 3. CacheNode — `src/cache/cachegroup/node.{h,cc}`
+```cpp
+// node.h
+bool   Exist(ContextSPtr, const BlockContext&);
+Status SyncCache(ContextSPtr, const BlockContext&, const Block&);
+```
+```cpp
+// node.cc
+bool CacheNode::Exist(ContextSPtr, const BlockContext& bctx) {
+  if (!IsRunning()) return false;
+  return block_cache_->IsCached(bctx);            // local only, never RetrieveStorage
+}
+Status CacheNode::SyncCache(ContextSPtr ctx, const BlockContext& bctx, const Block& b) {
+  if (!IsRunning()) return Status::CacheDown("down");
+  return block_cache_->Cache(ctx, bctx, b);       // SYNC Cache: WriteFile+Add before return
+}
+```
+Also `peer.cc NextTimeoutMs`/`ShouldRetry`: add `"Exist"` and `"SyncCache"`
+method cases (else the brpc client hits `CHECK(false) "Unknown rpc method"`).
+And in `upstream.{h,cc}` add `SendExistRequest`/`SendSyncCacheRequest`
+(mirror `SendRangeRequest`/`SendCacheRequest`), and expose
+`RemoteBlockCacheImpl::Exist`/`SyncCache`.
+
+## 4. cache-only / no-S3 — `node.cc` (Range) + `dingo_cache.cc` (startup)
+```cpp
+// node.cc — DEFINE_bool(kv_cache_only, false, "KV: Range miss=NotFound, no S3; allow no-S3 start");
+Status CacheNode::Range(... ) {
+  auto st = RetrieveCache(ctx, bctx, offset, length, buffer);   // node.cc:236
+  if (st.IsNotFound()) {
+    if (FLAGS_kv_cache_only) return st;                         // short-circuit, no S3
+    st = RetrieveStorage(ctx, bctx, offset, length, buffer, block_length);
+  }
+  return st;
+}
+// CacheNode ctor: kv_cache_only ? storage_client_pool_ = make_shared<NullStorageClientPool>()
+//                              : StorageClientPoolImpl(mds_client_)
+// where NullStorageClientPool::GetStorageClient returns Status::NotSupport.
+```
+```cpp
+// dingo_cache.cc:56-69 — only enforce enable_stage when NOT kv_cache_only:
+if (!FLAGS_kv_cache_only && !FLAGS_enable_stage) { ...return -1; }
+```
+
+## 5. DingofsTransport (route via dingofs PeerGroup, reuse the portable KVClient)
+New `src/cache/kvclient/dingofs_transport.{h,cc}` implementing
+`dingofs::cache::kv::Transport` over `remotecache::RemoteBlockCacheImpl`. It
+translates the portable `BlockKey`→`pb::cache::BlockContext`, wraps the value
+bytes in an `IOBuffer` (zero-copy via `AppendUserData`), and **ignores the `node`
+arg** (RemoteBlockCacheImpl re-derives the peer from the BlockKey via the MDS
+PeerGroup Ketama — so client-side `ConHash` is harness-only; pass a single
+placeholder member to `KVClient`). Maps: Put→`SyncCache`, Get→`Range`+`CopyTo`,
+Exist→`Exist`. The value_header / key_map / `dingofs_hicache.py` are reused
+unchanged. (The C-ABI/`libdfkv.so` stays for the ctypes plugin; or build the
+nanobind module below.)
+
+## 6. nanobind module (optional alt to ctypes) — mirror `sdk/python/CMakeLists.txt`
+```cmake
+find_package(nanobind CONFIG REQUIRED HINTS "${THIRD_PARTY_INSTALL_PATH}/nanobind/cmake")
+nanobind_add_module(pydingofs_kv python/py_kv_client.cc)
+target_link_libraries(pydingofs_kv PRIVATE cache_kvclient cache_remotecache
+                      cache_cachegroup cache_blockcache cache_common cache_iutil)
+install(TARGETS pydingofs_kv DESTINATION dingofs)
+```
+
+## 7. dingofs CMake wiring — `src/cache/CMakeLists.txt`
+`add_subdirectory(kvclient)`; `kvclient/CMakeLists.txt` builds `cache_kvclient`
+from the portable `.cc` + `dingofs_transport.cc`, linking
+`cache_remotecache cache_cachegroup cache_blockcache cache_common cache_iutil`.
+
+## 8. RDMA (deferred)
+Out of scope for now (no env). Add an RDMA `Transport` later (brpc rdma or
+ibverbs one-sided + GPUDirect, mirroring Mooncake), keeping value_header/key_map/
+plugin unchanged.
