@@ -79,13 +79,30 @@ void MdsServer::AcceptLoop() {
 Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
   std::string key = MemberKey(group, m.id);
   std::string val = EncodeMembers({m}, 0);
-  std::lock_guard<std::mutex> lk(lease_mu_);
-  auto it = leases_.find(key);
-  if (it != leases_.end() && etcd_.LeaseKeepAlive(it->second)) return Status::kOk;
+  // Look up this member's known lease under the lock, then do the BLOCKING etcd
+  // calls OUTSIDE it. Previously lease_mu_ was held across LeaseKeepAlive/Grant/Put,
+  // so every member's heartbeat serialized on one mutex held across network I/O —
+  // a slow etcd stalled all members' liveness. Now heartbeats for distinct members
+  // run in parallel; the lock only guards the in-memory {key->leaseID} map.
+  int64_t existing = 0;
+  bool have = false;
+  {
+    std::lock_guard<std::mutex> lk(lease_mu_);
+    auto it = leases_.find(key);
+    if (it != leases_.end()) { existing = it->second; have = true; }
+  }
+  if (have && etcd_.LeaseKeepAlive(existing)) return Status::kOk;  // fast path: refresh
+  // Slow path: (re)grant a lease and (re)write the member key. A same-key race
+  // here (two heartbeats both missing the lease) can briefly orphan one lease,
+  // which expires on its own via the TTL; same-key heartbeats are serial in
+  // practice (one node, one connection), so this is rare and harmless.
   auto lid = etcd_.LeaseGrant(kTtlSeconds);
   if (!lid) return Status::kIOError;
   if (!etcd_.Put(key, val, *lid)) return Status::kIOError;
-  leases_[key] = *lid;
+  {
+    std::lock_guard<std::mutex> lk(lease_mu_);
+    leases_[key] = *lid;
+  }
   return Status::kOk;
 }
 
