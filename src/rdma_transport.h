@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "transport.h"
@@ -38,10 +39,14 @@ class RdmaTransport : public Transport {
                bool* exist) override;
   Status Members(const std::string& node, std::string* out) override;
 
+  void RegisterMemory(void* base, size_t size) override;
+
   bool pipelined() const override { return true; }
   // Pipelined: up to `depth_` requests in flight on a single connection.
   std::vector<Status> CacheMany(const std::string& node,
                                 const std::vector<CacheItem>& items) override;
+  std::vector<Status> CacheFrom(const std::string& node,
+                                const std::vector<CacheSrc>& srcs) override;
   std::vector<Status> RangeMany(const std::string& node,
                                 const std::vector<BlockKey>& keys,
                                 uint64_t offset, uint64_t length,
@@ -63,6 +68,9 @@ class RdmaTransport : public Transport {
 
   std::mutex mu_;
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
+  // Caller memory regions to register on every connection (the host KV pool).
+  // Guarded by mu_; snapshotted in Acquire and registered on the connection.
+  std::vector<std::pair<void*, size_t>> pools_;
   size_t max_msg_;
   size_t depth_;
   int connect_ms_ = 3000;             // bootstrap TCP connect timeout (DFKV_RDMA_CONNECT_MS)

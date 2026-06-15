@@ -89,14 +89,17 @@ RdmaTransport::~RdmaTransport() {
 void RdmaTransport::Destroy(Conn* c) { delete c; }  // RcEndpoint dtor tears down QP/MRs
 
 RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_pool) {
+  std::vector<std::pair<void*, size_t>> pools;
+  Conn* pooled = nullptr;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    pools = pools_;  // snapshot (a few regions); register on the conn outside the lock
     auto it = pool_.find(node);
     if (it != pool_.end() && !it->second.empty()) {
-      Conn* c = it->second.back(); it->second.pop_back();
-      *from_pool = true; return c;
+      pooled = it->second.back(); it->second.pop_back();
     }
   }
+  if (pooled) { pooled->ep.EnsurePoolMrs(pools); *from_pool = true; return pooled; }
   *from_pool = false;
   // Bootstrap the QP over a short-lived TCP connection to the node's member
   // address (control plane). The data plane then rides the named RDMA device.
@@ -127,7 +130,17 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   char ready = 0;
   if (!net::ReadAll(fd, &ready, 1) || ready != 1) { ::close(fd); delete c; return nullptr; }
   ::close(fd);  // bootstrap done; QP is RTS
+  c->ep.EnsurePoolMrs(pools);  // register the declared host-pool regions on this PD
   return c;
+}
+
+void RdmaTransport::RegisterMemory(void* base, size_t size) {
+  if (!base || size == 0) return;
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& p : pools_) if (p.first == base) return;  // dedup by base
+  pools_.push_back({base, size});
+  // Connections register this lazily on their next Acquire (EnsurePoolMrs); call
+  // before traffic so every connection's PD has the whole pool registered once.
 }
 
 void RdmaTransport::Release(const std::string& node, Conn* c) {
@@ -303,13 +316,18 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
     std::vector<ibv_mr*> mrs(w, nullptr);
     bool regok = true;
     for (size_t j = 0; j < w && regok; ++j) {
+      if (dsts[base + j].n == 0) continue;  // empty: header-only reply into rbuf, no MR
       mrs[j] = ep.RegisterUser(dsts[base + j].payload, dsts[base + j].n);
       if (!mrs[j]) regok = false;
     }
     if (!regok) { Release(node, c); return Transport::RangeInto(node, keys, dsts, header_size, hdrs); }
     // Scatter recv [hdr -> rbuf | payload -> caller buffer], then send the Range req.
+    // Empty (n==0) dsts use a plain recv (the reply is just resp-prefix + header).
     for (size_t j = 0; j < w && conn_ok; ++j) {
-      if (!ep.PostRecvScatter(j, dsts[base + j].payload, dsts[base + j].n, mrs[j], hdr_bytes)) { conn_ok = false; break; }
+      bool armed = dsts[base + j].n
+                       ? ep.PostRecvScatter(j, dsts[base + j].payload, dsts[base + j].n, mrs[j], hdr_bytes)
+                       : ep.PostRecv(j);
+      if (!armed) { conn_ok = false; break; }
       EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + dsts[base + j].n, 0);
       if (!ep.PostSend(j, kReqPrefix)) { conn_ok = false; break; }
     }
@@ -338,6 +356,77 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
         if (rb >= hdr_bytes) (*hdrs)[base + j].assign(ep.rbuf(j) + kRespPrefix, header_size);
         else res[base + j] = Status::kIOError;
       }
+    }
+  }
+  if (conn_ok) Release(node, c); else Destroy(c);
+  return res;
+}
+
+std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
+                                             const std::vector<CacheSrc>& srcs) {
+  const size_t n = srcs.size();
+  std::vector<Status> res(n, Status::kIOError);
+  if (n == 0) return res;
+  // Oversized items fall back to the base copy path (it re-materializes the
+  // contiguous [header|payload] buffer and routes through CacheMany).
+  for (const auto& s : srcs)
+    if (kReqPrefix + s.header_len + s.payload_len > max_msg_)
+      return Transport::CacheFrom(node, srcs);
+
+  bool from_pool = false;
+  Conn* c = Acquire(node, &from_pool);
+  if (!c) return res;
+  rdma::RcEndpoint& ep = c->ep;
+  const size_t W = ep.depth();
+  bool conn_ok = true;
+  for (size_t base = 0; base < n && conn_ok; base += W) {
+    const size_t w = std::min(W, n - base);
+    // Register the payload buffers (cached). Any failure => give the conn back
+    // and fall back to the copy path for the whole call (Cache is idempotent, so
+    // re-sending already-sent earlier windows is harmless — same as RangeInto).
+    std::vector<ibv_mr*> mrs(w, nullptr);
+    bool regok = true;
+    for (size_t j = 0; j < w && regok; ++j) {
+      const CacheSrc& s = srcs[base + j];
+      if (s.payload_len == 0) continue;  // empty value: header-only 1-SGE send, no MR
+      // const_cast: a SEND source is only read by the NIC; the LOCAL_WRITE-only
+      // MR is never written, and RegisterUser keys its cache by address.
+      mrs[j] = ep.RegisterUser(const_cast<void*>(s.payload), s.payload_len);
+      if (!mrs[j]) regok = false;
+    }
+    if (!regok) { Release(node, c); return Transport::CacheFrom(node, srcs); }
+    // Build [req prefix | value header] into sbuf[j], scatter-send with the
+    // payload coming straight from the caller's registered buffer. The wire
+    // payload_len field is header_len + user payload_len (the full stored blob).
+    for (size_t j = 0; j < w && conn_ok; ++j) {
+      const CacheSrc& s = srcs[base + j];
+      EncodeReq(ep.sbuf(j), WireOp::kCache, s.key, 0, 0, s.header_len + s.payload_len);
+      if (s.header_len) std::memcpy(ep.sbuf(j) + kReqPrefix, s.header, s.header_len);
+      if (!ep.PostRecv(j)) { conn_ok = false; break; }
+      if (!ep.PostSendScatter(j, kReqPrefix + s.header_len, s.payload, s.payload_len, mrs[j])) {
+        conn_ok = false; break;
+      }
+    }
+    if (!conn_ok) break;
+    // Reap 2*w completions (send + recv per slot) before reusing any slot or
+    // returning — the NIC reads the user payload until the SEND completes.
+    std::vector<ibv_wc> wcs(2 * w);
+    std::vector<uint32_t> rbytes(w, 0);
+    int need = static_cast<int>(2 * w);
+    while (need > 0) {
+      int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
+      if (g <= 0) { conn_ok = false; break; }
+      for (int i = 0; i < g; ++i) {
+        if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
+        if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
+        --need;
+      }
+      if (!conn_ok) break;
+    }
+    if (!conn_ok) break;
+    for (size_t j = 0; j < w; ++j) {
+      Status st; uint64_t dl = 0;
+      if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
     }
   }
   if (conn_ok) Release(node, c); else Destroy(c);

@@ -38,6 +38,8 @@ void RcEndpoint::Close() {
   for (auto& [addr, e] : user_mr_) if (e.first) ibv_dereg_mr(e.first);
   user_mr_.clear();
   user_lru_.clear();
+  for (auto& p : pool_mr_) if (p.mr) ibv_dereg_mr(p.mr);
+  pool_mr_.clear();
   smr_.clear(); rmr_.clear();
   for (auto* b : sbuf_) delete[] b;
   for (auto* b : rbuf_) delete[] b;
@@ -86,7 +88,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   qa.send_cq = cq_; qa.recv_cq = cq_;
   qa.cap.max_send_wr = static_cast<uint32_t>(depth_ + 1);
   qa.cap.max_recv_wr = static_cast<uint32_t>(depth_ + 1);
-  qa.cap.max_send_sge = 1; qa.cap.max_recv_sge = 2;  // recv may scatter [hdr | payload]
+  qa.cap.max_send_sge = 2; qa.cap.max_recv_sge = 2;  // both may scatter [hdr | payload]
   qa.qp_type = IBV_QPT_RC;
   qa.sq_sig_all = 1;
   qp_ = ibv_create_qp(pd_, &qa);
@@ -214,7 +216,26 @@ bool RcEndpoint::PostSend(size_t slot, size_t len) {
   return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
+bool RcEndpoint::AddPoolMr(void* base, size_t size) {
+  auto b = reinterpret_cast<uintptr_t>(base);
+  for (const auto& p : pool_mr_) if (p.base == b) return true;  // already registered
+  ibv_mr* mr = ibv_reg_mr(pd_, base, size, IBV_ACCESS_LOCAL_WRITE);
+  if (!mr) return false;
+  pool_mr_.push_back(PoolMr{b, size, mr});
+  return true;
+}
+
+void RcEndpoint::EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions) {
+  for (const auto& [base, size] : regions) AddPoolMr(base, size);
+}
+
 ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
+  // Fast path: addr fully inside a pre-registered pool region -> reuse its MR
+  // (the SGE uses `addr` with this MR's lkey; valid anywhere in the MR's range).
+  auto a = reinterpret_cast<uintptr_t>(addr);
+  for (const auto& p : pool_mr_)
+    if (a >= p.base && a + len <= p.base + p.size) return p.mr;
+
   auto key = reinterpret_cast<uintptr_t>(addr);
   auto it = user_mr_.find(key);
   if (it != user_mr_.end()) {
@@ -240,6 +261,22 @@ ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
     user_mr_[key] = {mr, user_lru_.begin()};
   }
   return mr;
+}
+
+bool RcEndpoint::PostSendScatter(size_t slot, size_t hdr_len, const void* payload,
+                                 size_t payload_len, ibv_mr* payload_mr) {
+  ibv_sge sge[2]{};
+  sge[0].addr = reinterpret_cast<uintptr_t>(sbuf_[slot]);  // req prefix + value header
+  sge[0].length = static_cast<uint32_t>(hdr_len);
+  sge[0].lkey = smr_[slot]->lkey;
+  sge[1].addr = reinterpret_cast<uintptr_t>(payload);      // payload from caller's MR
+  sge[1].length = static_cast<uint32_t>(payload_len);
+  sge[1].lkey = payload_len ? payload_mr->lkey : 0;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot; wr.sg_list = sge;
+  wr.num_sge = payload_len ? 2 : 1;  // empty value -> header-only 1-SGE send
+  wr.opcode = IBV_WR_SEND; wr.send_flags = IBV_SEND_SIGNALED;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
 bool RcEndpoint::PostRecvScatter(size_t slot, void* payload, size_t payload_len,

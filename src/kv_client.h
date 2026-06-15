@@ -48,6 +48,12 @@ class KVClient {
 
   void set_batch_concurrency(size_t n) { batch_concurrency_ = n ? n : 1; }
 
+  // Register a large caller memory region (e.g. the whole SGLang host KV pool) for
+  // zero-copy transfer, so Put/Get never do a per-op RDMA MR registration — every
+  // buffer inside the region resolves to the pre-registered pool MR. No-op on TCP.
+  // Call once at startup (after the pool is allocated) before traffic.
+  void RegisterMemory(void* base, size_t size) { t_->RegisterMemory(base, size); }
+
   // Hot-swap the cluster membership (rebuilds the consistent-hash ring).
   // Thread-safe vs concurrent Put/Get/Exist.
   void SetMembers(std::vector<std::pair<std::string, std::string>> members);

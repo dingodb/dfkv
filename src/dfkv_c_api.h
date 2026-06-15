@@ -24,6 +24,11 @@ dfkv_client_t dfkv_open(const char* members, uint64_t model_hash,
 int dfkv_put(dfkv_client_t c, const char* key, const void* ptr, uint64_t n);  // 0=ok
 int dfkv_get(dfkv_client_t c, const char* key, void* ptr, uint64_t n);        // 1=hit,0=miss
 int dfkv_exist(dfkv_client_t c, const char* key);                            // 1/0
+// Register a large host memory region (e.g. the whole SGLang host KV pool) so
+// put/get into any buffer inside it never do a per-op RDMA MR registration — the
+// region is registered once per connection. No-op on the TCP transport. Call once
+// at startup after the pool is allocated, before traffic. Returns 0 on success.
+int dfkv_register_memory(dfkv_client_t c, const void* base, uint64_t size);
 // Hot-swap cluster membership ("n1=ip:port,n2=ip:port"). Returns 0 on success.
 int dfkv_set_members(dfkv_client_t c, const char* members);
 // Discovery: query seed ("ip:port") for the cluster member list and apply it.

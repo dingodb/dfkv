@@ -8,11 +8,13 @@
 #include "kv_node_server.h"
 #include "rdma_server.h"
 #include "rdma_transport.h"
+#include "rdma_verbs.h"
 #include "value_header.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -118,6 +120,103 @@ TEST(RdmaLoopback, BatchZeroCopyRoundtrip) {
     EXPECT_TRUE(gr[i]) << i;
     EXPECT_EQ(outs[i], vals[i]) << i;
   }
+}
+
+// Single Put/Get always take the zero-copy fast path on RDMA (register caller
+// buffer + scatter-send / scatter-recv) — no size threshold.
+TEST(RdmaLoopback, SingleZeroCopyPutGet) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("szc");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  std::string v(8192, '\0');
+  for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>((i * 37 + 11) & 0xFF);
+  // Put twice into the SAME source buffer to exercise the MR-cache hit on re-put.
+  ASSERT_TRUE(c.Put("z1", v.data(), v.size()));
+  ASSERT_TRUE(c.Put("z1", v.data(), v.size()));
+
+  // Get into the SAME dst buffer twice (scatter-recv straight in; MR-cache hit).
+  std::string out(v.size(), '\0');
+  ASSERT_TRUE(c.Get("z1", &out[0], out.size()));
+  EXPECT_EQ(out, v);
+  out.assign(v.size(), '\0');
+  ASSERT_TRUE(c.Get("z1", &out[0], out.size()));
+  EXPECT_EQ(out, v);
+
+  // Miss on the zero-copy Get path must be a clean miss (kNotFound), not an error.
+  std::string m(v.size(), '\0');
+  EXPECT_FALSE(c.Get("absent", &m[0], m.size()));
+  // Size mismatch (stored payload_len != requested n) => miss, not corruption.
+  std::string shorter(v.size() / 2, '\0');
+  EXPECT_FALSE(c.Get("z1", &shorter[0], shorter.size()));
+}
+
+// A registered memory region (RegisterMemory) is registered once; every buffer
+// inside it resolves to that one MR with no per-op ibv_reg_mr. Verified directly
+// at the endpoint: two distinct sub-buffers return the SAME MR; an outside buffer
+// registers ad-hoc (a different MR).
+TEST(RdmaLoopback, PoolMrSharedAcrossBuffers) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  rdma::RcEndpoint ep;
+  ASSERT_TRUE(ep.Open(nullptr, 64 * 1024, 1));
+  std::vector<char> region(256 * 1024);
+  ASSERT_TRUE(ep.AddPoolMr(region.data(), region.size()));
+  ibv_mr* a = ep.RegisterUser(region.data() + 4096, 4096);
+  ibv_mr* b = ep.RegisterUser(region.data() + 200000, 4096);
+  ASSERT_NE(a, nullptr);
+  EXPECT_EQ(a, b);  // both inside the pool -> one shared MR, no per-op registration
+  std::vector<char> outside(4096);
+  ibv_mr* c = ep.RegisterUser(outside.data(), outside.size());
+  ASSERT_NE(c, nullptr);
+  EXPECT_NE(c, a);  // outside the pool -> ad-hoc registration
+}
+
+// End-to-end: register the host pool once, then Put from / Get into sub-buffers
+// of it. All transfers hit the pool MR (no per-op registration) and round-trip.
+TEST(RdmaLoopback, RegisterMemoryRoundtrip) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("rmr");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::vector<char> pool(128 * 1024);
+  c.RegisterMemory(pool.data(), pool.size());  // one region covers every page below
+
+  const size_t sz = 4096;
+  for (int i = 0; i < 8; ++i) {
+    char* src = pool.data() + i * sz * 2;            // distinct sub-buffer per page
+    char* dst = pool.data() + i * sz * 2 + sz;       // get into a neighbouring slot
+    for (size_t k = 0; k < sz; ++k) src[k] = static_cast<char>((i * 17 + k) & 0xFF);
+    std::string key = "rm" + std::to_string(i);
+    ASSERT_TRUE(c.Put(key, src, sz)) << i;
+    ASSERT_TRUE(c.Get(key, dst, sz)) << i;
+    EXPECT_EQ(0, std::memcmp(src, dst, sz)) << i;
+  }
+}
+
+// An empty (n==0) value in a batch exercises the PostSendScatter 1-SGE degrade
+// (no payload SGE / no MR registration) alongside non-empty items.
+TEST(RdmaLoopback, BatchPutEmptyValue) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("bev");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  std::string nonempty(2048, 'x');
+  std::vector<KvPutItem> puts = {
+      {"e_full", nonempty.data(), nonempty.size()},
+      {"e_empty", nullptr, 0},
+  };
+  auto pr = c.BatchPut(puts);
+  ASSERT_TRUE(pr[0]);
+  ASSERT_TRUE(pr[1]);
+
+  EXPECT_TRUE(c.Exist("e_empty"));
+  std::string out(nonempty.size(), '\0');
+  ASSERT_TRUE(c.Get("e_full", &out[0], out.size()));
+  EXPECT_EQ(out, nonempty);
+  // Empty value round-trips: a 0-byte Get is a hit.
+  EXPECT_TRUE(c.Get("e_empty", nullptr, 0));
 }
 
 TEST(RdmaLoopback, PipelinedPoolDepth) {

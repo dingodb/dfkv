@@ -39,6 +39,8 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_get.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_exist.restype = ctypes.c_int
     lib.dfkv_exist.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.dfkv_register_memory.restype = ctypes.c_int
+    lib.dfkv_register_memory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_batch_put.restype = ctypes.c_int
     lib.dfkv_batch_put.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
                                    ctypes.POINTER(ctypes.c_void_p),
@@ -132,8 +134,50 @@ class DfkvHiCache(HiCacheStorage):
         except Exception:
             pass
 
+    def register_memory(self, base: int, size: int) -> bool:
+        """Register a host memory region for RDMA zero-copy (registered once per
+        connection; buffers inside it then transfer with no per-op MR register).
+        No-op on TCP. Returns True on success."""
+        if not base or not size:
+            return False
+        return self._lib.dfkv_register_memory(
+            self._h, ctypes.c_void_p(int(base)), ctypes.c_uint64(int(size))) == 0
+
+    def _register_pool_buffers(self, pool) -> int:
+        """Best-effort: register a host pool's backing buffer(s) so its pages
+        transfer zero-copy without per-op MR registration. Probes the common
+        SGLang HostKVCache backing-buffer attributes; failure is non-fatal (pages
+        just fall back to ad-hoc per-buffer registration). Returns #regions done."""
+        done = 0
+        for attr in ("kv_buffer", "host_kv_buffer", "data_buffer", "buffer", "data"):
+            buf = getattr(pool, attr, None)
+            if buf is None:
+                continue
+            tensors = buf if isinstance(buf, (list, tuple)) else [buf]
+            for t in tensors:
+                if not (hasattr(t, "data_ptr") and hasattr(t, "numel")
+                        and hasattr(t, "element_size")):
+                    continue
+                try:
+                    if self.register_memory(t.data_ptr(), t.numel() * t.element_size()):
+                        done += 1
+                except Exception:
+                    pass
+            if done:
+                break  # first attribute that yielded registrable tensors wins
+        return done
+
     def register_mem_pool_host(self, mem_pool_host):
         self.mem_pool_host = mem_pool_host
+        with access_log("register_mem_pool_host",
+                        lambda: f"{self._alog_tag}") as r:
+            n = 0
+            try:
+                n = self._register_pool_buffers(mem_pool_host)
+            except Exception as e:  # never fail HiCache setup over an optimization
+                r.result = f"skip ({type(e).__name__})"
+                return
+            r.result = f"registered {n} region(s)" if n else "no backing buffer found"
 
     def set_members(self, members: str):
         """Hot-swap cluster membership, e.g. 'n1=ip:12000,n2=ip:12000'."""

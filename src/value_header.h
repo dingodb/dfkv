@@ -2,10 +2,13 @@
  * DingoFS KV-cache for SGLang HiCache — value header.
  *
  * Every stored KV value is prefixed with this fixed 48-byte header so a read
- * whose model / page-size / dtype / layer geometry / CRC does not match the
- * reader's expectation is treated as a MISS (recompute) instead of silently
- * returning wrong bytes. For MLA models the latent is TP-layout invariant, so
- * tp_size/tp_rank are NOT part of the match (flags bit0 = is_mla).
+ * whose model / page-size / dtype / layer geometry does not match the reader's
+ * expectation is treated as a MISS (recompute) instead of silently returning
+ * wrong bytes. For MLA models the latent is TP-layout invariant, so
+ * tp_size/tp_rank are NOT part of the match (flags bit0 = is_mla). Payload
+ * integrity is left to the transport (RC RDMA / RoCE carry a hardware ICRC); the
+ * header no longer carries a payload checksum (was CRC32C through v2) — this also
+ * keeps the zero-copy datapath zero-TOUCH (the CPU never reads the payload).
  *
  * Portable (no brpc/MDS deps) so it builds & is unit-tested standalone.
  * Serialization is host-endian (memcpy); all targets are x86_64 LE. A read on
@@ -15,66 +18,17 @@
 #ifndef DFKV_VALUE_HEADER_H_
 #define DFKV_VALUE_HEADER_H_
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
 namespace dfkv {
 
-// Integrity checksum = CRC32C (Castagnoli, reflected poly 0x82F63B78, init/xorout
-// 0xFFFFFFFF) — chosen over IEEE 0xEDB88320 because x86-64 has a hardware crc32c
-// instruction (SSE4.2) that runs ~10-20 GB/s vs ~0.3 GB/s for the byte-at-a-time
-// table. At the GLM-5.1 MLA page size (2.74 MiB) the table CRC was the dominant
-// per-op cost (~7 ms); hardware crc32c removes it. We runtime-dispatch on
-// __builtin_cpu_supports so the binary stays portable; the scalar table is the
-// fallback and the two must agree bit-for-bit (see value_header_test).
-namespace detail {
-
-// Scalar Castagnoli table (thread-safe magic static; no init race in batch fan-out).
-inline uint32_t Crc32cScalar(const void* data, size_t len) {
-  static const std::array<uint32_t, 256> table = [] {
-    std::array<uint32_t, 256> t{};
-    for (uint32_t i = 0; i < 256; ++i) {
-      uint32_t c = i;
-      for (int k = 0; k < 8; ++k) c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
-      t[i] = c;
-    }
-    return t;
-  }();
-  uint32_t c = 0xFFFFFFFFu;
-  const auto* p = static_cast<const uint8_t*>(data);
-  for (size_t i = 0; i < len; ++i) c = table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
-  return c ^ 0xFFFFFFFFu;
-}
-
-#if defined(__x86_64__) || defined(__i386__)
-// Hardware crc32c via SSE4.2; target attribute lets the rest of the TU compile
-// without -msse4.2 while this function uses the instruction (runtime-gated below).
-__attribute__((target("sse4.2"))) inline uint32_t Crc32cHw(const void* data, size_t len) {
-  const auto* p = static_cast<const uint8_t*>(data);
-  uint64_t c = 0xFFFFFFFFu;
-  while (len >= 8) { uint64_t v; std::memcpy(&v, p, 8); c = __builtin_ia32_crc32di(c, v); p += 8; len -= 8; }
-  while (len) { c = __builtin_ia32_crc32qi(static_cast<uint32_t>(c), *p++); --len; }
-  return static_cast<uint32_t>(c) ^ 0xFFFFFFFFu;
-}
-#endif
-
-}  // namespace detail
-
-inline uint32_t Crc32(const void* data, size_t len) {
-#if defined(__x86_64__) || defined(__i386__)
-  static const bool kHw = __builtin_cpu_supports("sse4.2");
-  if (kHw) return detail::Crc32cHw(data, len);
-#endif
-  return detail::Crc32cScalar(data, len);
-}
-
 #pragma pack(push, 1)
 struct ValueHeader {
   static constexpr size_t kSize = 48;
   static constexpr uint32_t kMagic = 0x444F4B56u;  // 'DFKV'
-  static constexpr uint16_t kVersion = 2;  // v2: integrity checksum is CRC32C (was IEEE crc32 in v1)
+  static constexpr uint16_t kVersion = 3;  // v3: dropped payload checksum (was CRC32C in v2, IEEE in v1)
   enum Flag : uint16_t { kFlagIsMla = 0x1 };
 
   uint32_t magic = kMagic;
@@ -90,7 +44,7 @@ struct ValueHeader {
   uint16_t head_dim = 0;
   uint16_t reserved = 0;
   uint64_t payload_len = 0;
-  uint32_t crc32 = 0;            // CRC32 over payload bytes
+  uint32_t reserved2 = 0;        // was CRC32 over payload (v2); reserved for future use
 
   static ValueHeader Make(uint64_t model_hash, uint32_t page_size,
                           uint32_t dtype_tag, uint16_t flags, uint16_t tp_size,
@@ -109,13 +63,8 @@ struct ValueHeader {
     h.head_num = head_num;
     h.head_dim = head_dim;
     h.payload_len = 0;
-    h.crc32 = 0;
+    h.reserved2 = 0;
     return h;
-  }
-
-  void SetPayload(const void* p, size_t n) {
-    payload_len = n;
-    crc32 = Crc32(p, n);
   }
 
   bool is_mla() const { return (flags & kFlagIsMla) != 0; }

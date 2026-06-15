@@ -59,6 +59,13 @@ int dfkv_exist(dfkv_client_t c, const char* key) {
   return static_cast<KVClient*>(c)->Exist(key) ? 1 : 0;
 }
 
+int dfkv_register_memory(dfkv_client_t c, const void* base, uint64_t size) {
+  if (!c) return -1;
+  static_cast<KVClient*>(c)->RegisterMemory(const_cast<void*>(base),
+                                            static_cast<size_t>(size));
+  return 0;
+}
+
 int dfkv_batch_put(dfkv_client_t c, const char** keys, const void** ptrs,
                    const uint64_t* sizes, int n, int* out_ok) {
   if (!c || n < 0) return -1;

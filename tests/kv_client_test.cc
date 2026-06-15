@@ -109,7 +109,11 @@ TEST_F(KVClientTest, HeaderMismatchTreatedAsMiss) {
   EXPECT_FALSE(reader.Get("k_shared", &out[0], out.size()));
 }
 
-TEST_F(KVClientTest, CrcCorruptionTreatedAsMiss) {
+TEST_F(KVClientTest, PayloadCorruptionNotDetectedAfterV3) {
+  // v3 dropped the payload checksum (integrity is left to the RC RDMA/RoCE ICRC),
+  // so a corrupted payload byte under an INTACT geometry header now comes back as
+  // a HIT. The header still guards model/page/dtype/layer drift (other tests),
+  // just not bit-level corruption — a deliberate zero-touch tradeoff.
   nodes_.push_back(StartNode("a4"));
   KVClient c({{ "a", nodes_[0]->addr }}, SelfHdr());
   std::string v(1024, 'y');
@@ -121,7 +125,8 @@ TEST_F(KVClientTest, CrcCorruptionTreatedAsMiss) {
   { std::fstream io(f, std::ios::in | std::ios::out | std::ios::binary);
     io.seekp(48 + 100); char b = '!'; io.write(&b, 1); }
   std::string out(v.size(), '\0');
-  EXPECT_FALSE(c.Get("k_crc", &out[0], out.size()));  // CRC fails -> miss
+  EXPECT_TRUE(c.Get("k_crc", &out[0], out.size()));  // no checksum -> still a hit
+  EXPECT_EQ(out[100], '!');                           // the corrupted byte is returned
 }
 
 TEST_F(KVClientTest, TwoNodeConsistentHashCrossNodeRead) {
