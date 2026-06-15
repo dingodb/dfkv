@@ -3,9 +3,12 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <thread>
+#include <vector>
 
 using dfkv::BlockKey;
 using dfkv::KVStore;
@@ -24,8 +27,8 @@ class KVStoreTest : public ::testing::Test {
     fs::create_directories(dir_);
   }
   void TearDown() override { fs::remove_all(dir_); }
-  KVStore::Options Opts(uint64_t cap = (1ull << 30)) {
-    return KVStore::Options{dir_.string(), cap};
+  KVStore::Options Opts(uint64_t cap = (1ull << 30), size_t shards = 16) {
+    return KVStore::Options{dir_.string(), cap, shards};
   }
   fs::path dir_;
 };
@@ -120,8 +123,11 @@ TEST_F(KVStoreTest, LargeObjectOver128KiBLocalRead) {
 }
 
 TEST_F(KVStoreTest, LruEvictsLeastRecentlyUsedWhenOverCapacity) {
-  // capacity holds ~2 objects of 1000B
-  KVStore s(Opts(/*cap=*/2200));
+  // capacity holds ~2 objects of 1000B. shards=1 so all keys share one stripe and
+  // eviction is the strict single-shard CLOCK (a touched entry gets a second
+  // chance); with the default 16 shards these 3 keys would land in different
+  // stripes and per-shard capacity (2200/16) couldn't hold even one object.
+  KVStore s(Opts(/*cap=*/2200, /*shards=*/1));
   auto put = [&](uint64_t id) {
     std::string v(1000, char('a' + (id % 20)));
     return s.Cache(BlockKey{id, 0, 1}, v.data(), v.size());
@@ -149,4 +155,45 @@ TEST_F(KVStoreTest, ReloadFromDiskRebuildsIndex) {
   std::string out;
   ASSERT_EQ(s2.Range(k, 0, v.size(), &out), Status::kOk);
   EXPECT_EQ(out, v);
+}
+
+// Stress the sharded index under concurrency: many keys spread over the default
+// 16 stripes, written then read back from 8 threads each. Writers take the
+// exclusive per-shard lock, readers the shared one; correctness here (every
+// reader hits every key with the right bytes) plus a clean TSan run validate the
+// shared_mutex + CLOCK-bit access pattern. 1 GiB cap => no eviction interferes.
+TEST_F(KVStoreTest, ConcurrentShardedReadWrite) {
+  KVStore s(Opts());  // default 16 shards, 1 GiB capacity
+  const int N = 256;
+  auto val = [](int i) { return std::string(300, static_cast<char>('a' + (i % 26))); };
+
+  {  // concurrent writers, interleaved keys across threads (and thus shards)
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 8; ++t)
+      ts.emplace_back([&, t] {
+        for (int i = t; i < N; i += 8) {
+          std::string v = val(i);
+          EXPECT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(i), 0, 1}, v.data(), v.size()),
+                    Status::kOk);
+        }
+      });
+    for (auto& th : ts) th.join();
+  }
+  EXPECT_EQ(s.Count(), static_cast<size_t>(N));
+
+  {  // concurrent readers (shared lock): every thread reads every key correctly
+    std::atomic<int> hits{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 8; ++t)
+      ts.emplace_back([&] {
+        for (int i = 0; i < N; ++i) {
+          std::string out;
+          if (s.Range(BlockKey{static_cast<uint64_t>(i), 0, 1}, 0, 300, &out) == Status::kOk &&
+              out == val(i))
+            hits.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    for (auto& th : ts) th.join();
+    EXPECT_EQ(hits.load(), N * 8);
+  }
 }
