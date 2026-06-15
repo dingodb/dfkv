@@ -85,13 +85,14 @@ static void Report(const char* phase, size_t count, size_t size, size_t threads,
 
 int main(int argc, char** argv) {
   std::string members, op = "both";
-  size_t size = 2752512, count = 2000, threads = 8, batch = 1;
+  size_t size = 2752512, count = 2000, threads = 8, batch = 1, bc = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!std::strcmp(argv[i], "--members")) members = argv[i + 1];
     else if (!std::strcmp(argv[i], "--size")) size = std::stoull(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--count")) count = std::stoull(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--threads")) threads = std::stoull(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--batch")) batch = std::stoull(argv[i + 1]);
+    else if (!std::strcmp(argv[i], "--bc")) bc = std::stoull(argv[i + 1]);  // KVClient internal batch_concurrency
     else if (!std::strcmp(argv[i], "--op")) op = argv[i + 1];
   }
   if (batch < 1) batch = 1;
@@ -106,6 +107,11 @@ int main(int argc, char** argv) {
   ValueHeader hdr = ValueHeader::Make(0x51, 64, 0x46384534u, ValueHeader::kFlagIsMla,
                                       8, 0, 78, 1, 576);
   KVClient c(mem, hdr);
+  // External --threads already provide concurrency; with multi-node members the
+  // client's per-call internal RunParallel(batch_concurrency) would nest under
+  // each external thread (threads x nodes x bc) and can exhaust threads/connections.
+  // --bc 1 disables internal nesting so external threads drive load cleanly.
+  if (bc) c.set_batch_concurrency(bc);
 
   std::string val(size, '\0');
   for (size_t i = 0; i < size; ++i) val[i] = static_cast<char>(i & 0xFF);
