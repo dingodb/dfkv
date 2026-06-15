@@ -210,32 +210,52 @@ void KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
     uint64_t sz = static_cast<uint64_t>(fs::file_size(it->path(), ec));
     Shard& sh = ShardFor(fname);
     sh.ring.push_front(fname);
-    sh.index.try_emplace(fname, it->path().string(), sz, sh.ring.begin());
+    sh.index.try_emplace(fname, it->path().string(), sz);
     sh.used_bytes += sz;
   }
 }
 
+// Advance the CLOCK hand one step toward the front (newer). Past the front,
+// return end() so the next iteration wraps back to the tail (oldest).
+static std::list<std::string>::iterator HandNext(
+    std::list<std::string>& ring, std::list<std::string>::iterator it) {
+  return (it == ring.begin()) ? ring.end() : std::prev(it);
+}
+
 // CLOCK second-chance eviction within one shard (exclusive lock held). A newly
-// inserted entry starts unreferenced; an access (read lock) sets its bit. The
-// hand sweeps from the ring tail: a referenced entry is cleared and given a
-// second chance (spliced to the front), an unreferenced one is evicted. Each
-// full sweep clears every bit, so the loop always terminates.
+// inserted entry starts unreferenced; an access (read lock) sets its bit. A
+// PERSISTENT hand (sh.hand) sweeps tail->front across calls: a referenced entry
+// is cleared and given a second chance (hand advances, no list reorder), an
+// unreferenced one is evicted. Carrying the hand across Cache() calls amortizes
+// the scan so a hot, over-capacity shard does not re-clear the whole ring on
+// every write (the previous splice-to-front did). The per-call work is also
+// bounded (`limit`): after sweeping ~two full cycles without freeing enough, the
+// current victim is evicted regardless of its bit, guaranteeing forward progress
+// and termination even under ring/index drift.
 void KVStore::EvictLocked(Shard& sh) {
   // size() > 1 (not !empty()): never evict a shard's last entry, so a value larger
   // than the per-shard capacity still stays cached (it just keeps the shard over).
+  size_t spins = 0;
   while (sh.used_bytes > sh.capacity && sh.ring.size() > 1) {
-    auto it = sh.index.find(sh.ring.back());
-    if (it == sh.index.end()) { sh.ring.pop_back(); continue; }  // ring/index drift (shouldn't happen)
-    if (it->second.referenced.load(std::memory_order_relaxed)) {
-      it->second.referenced.store(false, std::memory_order_relaxed);  // second chance
-      sh.ring.splice(sh.ring.begin(), sh.ring, std::prev(sh.ring.end()));
-      it->second.ring_it = sh.ring.begin();
+    const size_t limit = 2 * sh.ring.size();  // recomputed: ring shrinks as we evict
+    if (sh.hand == sh.ring.end()) sh.hand = std::prev(sh.ring.end());  // (re)start at tail
+    auto cur = sh.hand;
+    auto it = sh.index.find(*cur);
+    if (it == sh.index.end()) {  // ring/index drift (shouldn't happen): drop the node
+      sh.hand = HandNext(sh.ring, cur);
+      sh.ring.erase(cur);
       continue;
     }
+    if (it->second.referenced.load(std::memory_order_relaxed) && ++spins <= limit) {
+      it->second.referenced.store(false, std::memory_order_relaxed);  // second chance
+      sh.hand = HandNext(sh.ring, cur);
+      continue;
+    }
+    sh.hand = HandNext(sh.ring, cur);  // move off the victim before erasing it
     std::error_code ec;
     fs::remove(it->second.path, ec);
     sh.used_bytes -= it->second.size;
-    sh.ring.erase(it->second.ring_it);
+    sh.ring.erase(cur);
     sh.index.erase(it);
   }
 }
@@ -265,7 +285,7 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
   fs::rename(tmp, full, ec);  // atomic publish
   if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
   sh.ring.push_front(fname);
-  sh.index.try_emplace(fname, full.string(), len, sh.ring.begin());
+  sh.index.try_emplace(fname, full.string(), len);
   sh.used_bytes += len;
   EvictLocked(sh);
   return Status::kOk;

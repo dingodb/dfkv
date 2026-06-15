@@ -143,6 +143,30 @@ TEST_F(KVStoreTest, LruEvictsLeastRecentlyUsedWhenOverCapacity) {
   EXPECT_LE(s.UsedBytes(), 2200u);
 }
 
+// All-hot eviction: every resident entry is marked referenced right before each
+// new insert. The persistent CLOCK hand must still make progress — clear a cycle
+// of reference bits, then evict — and keep usage bounded. A naive guard could
+// loop forever (always finds a referenced entry) or let the shard grow without
+// bound; this pins that it does neither.
+TEST_F(KVStoreTest, EvictsUnderAllReferencedPressure) {
+  const uint64_t obj = 1000, cap = 5500;  // ~5 objects fit in one shard
+  KVStore s(Opts(cap, /*shards=*/1));
+  auto put = [&](uint64_t id) {
+    std::string v(obj, char('a' + (id % 20)));
+    return s.Cache(BlockKey{id, 0, 1}, v.data(), v.size());
+  };
+  auto touch = [&](uint64_t id) {
+    std::string out;
+    s.Range(BlockKey{id, 0, 1}, 0, 8, &out);  // sets the CLOCK bit if resident
+  };
+  for (uint64_t id = 1; id <= 40; ++id) {
+    for (uint64_t j = (id > 8 ? id - 8 : 1); j < id; ++j) touch(j);  // make all hot
+    ASSERT_EQ(put(id), Status::kOk) << "id=" << id;
+    EXPECT_LE(s.UsedBytes(), cap) << "id=" << id;  // eviction kept usage bounded
+  }
+  EXPECT_TRUE(s.IsCached(BlockKey{40, 0, 1}));  // the newest insert survives
+}
+
 TEST_F(KVStoreTest, ReloadFromDiskRebuildsIndex) {
   BlockKey k{55, 0, 1};
   std::string v = "persisted";

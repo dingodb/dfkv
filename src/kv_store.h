@@ -70,10 +70,8 @@ class KVStore {
   struct Entry {
     std::string path;
     uint64_t size = 0;
-    std::list<std::string>::iterator ring_it;  // position in the shard's CLOCK ring
-    std::atomic<bool> referenced{false};        // CLOCK bit: set on access (read lock)
-    Entry(std::string p, uint64_t s, std::list<std::string>::iterator it)
-        : path(std::move(p)), size(s), ring_it(it) {}
+    std::atomic<bool> referenced{false};  // CLOCK bit: set on access (read lock)
+    Entry(std::string p, uint64_t s) : path(std::move(p)), size(s) {}
   };
   struct Shard {
     mutable std::shared_mutex mu;
@@ -81,6 +79,12 @@ class KVStore {
     std::list<std::string> ring;                    // CLOCK ring, front = newest
     uint64_t used_bytes = 0;
     uint64_t capacity = 0;
+    // Persistent CLOCK hand: the next eviction candidate, swept tail->front and
+    // wrapped. Carrying it across Cache() calls amortizes the second-chance scan
+    // so a hot, over-capacity shard does not re-clear the whole ring on every
+    // write. end() means "(re)start at the tail (oldest)".
+    std::list<std::string>::iterator hand;
+    Shard() : hand(ring.end()) {}
   };
 
   Shard& ShardFor(const std::string& fname) const;
