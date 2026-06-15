@@ -9,6 +9,8 @@
  * connection (cap by DFKV_RDMA_DEPTH); B=1 is the per-op path. Each op uses a
  * unique key ("dfkv-bench-<i>") so the write-once cache never collides. Reports
  * aggregate GB/s and per-call p50/p99/max latency for the PUT and GET phases. */
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -107,7 +109,13 @@ int main(int argc, char** argv) {
 
   std::string val(size, '\0');
   for (size_t i = 0; i < size; ++i) val[i] = static_cast<char>(i & 0xFF);
-  auto key = [](size_t i) { return "dfkv-bench-" + std::to_string(i); };
+  // Unique key namespace per run (pid + size): dfkv is write-once (idempotent
+  // Cache), so a fixed key set would make reruns at a different --size skip the
+  // PUT (measuring nothing) and miss the GET (stored size != requested size) =>
+  // false fails. pid+size guarantees fresh keys each invocation.
+  const std::string run_id =
+      "dfkv-bench-" + std::to_string(static_cast<long>(getpid())) + "-" + std::to_string(size) + "-";
+  auto key = [&run_id](size_t i) { return run_id + std::to_string(i); };
   const size_t units = (count + batch - 1) / batch;
 
   std::vector<double> lat;
