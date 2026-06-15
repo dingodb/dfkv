@@ -164,6 +164,40 @@ class DingoFSHiCacheTest(unittest.TestCase):
         finally:
             os.environ.pop("DFKV_RDMA_DEPTH", None)
 
+    def _rail_for(self, members, rails_csv, tp_rank, tp_size):
+        saved = os.environ.get("DFKV_RDMA_DEV")
+        os.environ["DFKV_RDMA_DEV"] = rails_csv
+        os.environ.pop("DFKV_RDMA_NUMA", None)
+        try:
+            cfg = self._cfg(members, tp_rank=tp_rank, tp_size=tp_size)
+            cfg.extra_config["rail_affinity"] = True
+            dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+            return os.environ.get("DFKV_RDMA_DEV"), os.environ.get("DFKV_RDMA_NUMA")
+        finally:
+            os.environ.pop("DFKV_RDMA_NUMA", None)
+            if saved is None:
+                os.environ.pop("DFKV_RDMA_DEV", None)
+            else:
+                os.environ["DFKV_RDMA_DEV"] = saved
+
+    def test_rail_affinity_8rails_rank_i_to_rail_i(self):
+        # hd03 (rails==ranks): block=1 -> rank i pins to ib7s400p{i} (NUMA-aligned).
+        members, _, _ = self._node("rail8")
+        rails = "ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7"
+        dev, numa = self._rail_for(members, rails, tp_rank=3, tp_size=8)
+        self.assertEqual(dev, "ib7s400p3")
+        self.assertEqual(numa, "1")
+
+    def test_rail_affinity_2rails_numa_block(self):
+        # hd04 (2 rails, 8 ranks): block=4 -> ranks 0-3 -> rail0(NUMA0),
+        # ranks 4-7 -> rail1(NUMA1). Modulo would put rank5 on rail1 too but rank2
+        # on rail0; block keeps each socket's ranks on one rail.
+        members, _, _ = self._node("rail2")
+        rails = "ibA,ibB"  # ibA=NUMA0 first, ibB=NUMA1
+        self.assertEqual(self._rail_for(members, rails, tp_rank=2, tp_size=8)[0], "ibA")
+        self.assertEqual(self._rail_for(members, rails, tp_rank=5, tp_size=8)[0], "ibB")
+        self.assertEqual(self._rail_for(members, rails, tp_rank=7, tp_size=8)[0], "ibB")
+
     def test_generic_get_roundtrip(self):
         # Generic (non zero-copy) set/get round-trips a page through dfkv.
         members, _, _ = self._node("gget")
