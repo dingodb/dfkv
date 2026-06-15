@@ -5,9 +5,10 @@ DingoFS as its L3 external KV store (GLM-5.1 / MLA). Two layers:
 
 1. **Portable semantic core (this dir)** — no brpc/MDS deps, builds & is fully
    unit/integration tested on a plain Linux box (gcc + cmake, no GPU/RDMA):
-   - `value_header.h` — 48B header (model/page/dtype/layer geometry + CRC32);
-     mismatch/corruption ⇒ safe MISS (recompute), never wrong bytes. MLA latent
-     is TP-layout invariant ⇒ tp_rank not part of the match.
+   - `value_header.h` — 48B header (model/page/dtype/layer geometry; no payload
+     checksum as of v3 — integrity is left to RC RDMA/RoCE ICRC, keeping the
+     datapath zero-touch); geometry mismatch ⇒ safe MISS (recompute), never wrong
+     bytes. MLA latent is TP-layout invariant ⇒ tp_rank not part of the match.
    - `kv_types.h` / `key_map.h` — sglang page-hash → `BlockKey`. **F1 fix:**
      `BlockKey.size` is a fixed constant, so Put/Get/Exist build the identical
      identity key and route identically (payload length lives in the header).
@@ -23,7 +24,7 @@ DingoFS as its L3 external KV store (GLM-5.1 / MLA). Two layers:
    - `kv_node_server.{h,cc}` + `dfkv_server_main.cc` — a cache-node daemon
      (`dfkv_server`) over the wire protocol.
    - `kv_client.{h,cc}` — routes (conhash) → wraps value w/ header → Put
-     (SyncCache) / Get (verify header+CRC) / Exist.
+     (SyncCache) / Get (verify header geometry) / Exist.
    - `dfkv_c_api.{h,cc}` — C ABI (`libdfkv.so`) for the Python plugin (ctypes).
    - `python/dingofs_hicache.py` — the SGLang `HiCacheStorage` plugin
      (`--hicache-storage-backend dynamic`). MLA: single object/page, no rank

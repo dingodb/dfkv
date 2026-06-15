@@ -78,6 +78,11 @@ class KVClient {
   std::unique_ptr<Transport> owned_;
   Transport* t_;
   size_t batch_concurrency_ = 8;
+  // Single Put/Get use zero-copy (register caller buffer + RDMA scatter) only when
+  // the payload is >= this; smaller/transient buffers take the cheaper memcpy path
+  // (MR registration isn't worth it, and this cleanly avoids the n==0 edge). Read
+  // from env DFKV_ZEROCOPY_MIN once at construction. Default 256 KiB.
+  size_t zerocopy_min_ = 256u << 10;
   std::unique_ptr<MdsMemberPoller> poller_;
   PeerHealth health_;
 };

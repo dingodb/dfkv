@@ -1,7 +1,9 @@
 #include "kv_client.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <thread>
@@ -33,6 +35,11 @@ void RunParallel(size_t n, size_t workers, const std::function<void(size_t)>& fn
 KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
                    ValueHeader self_hdr, Transport* transport)
     : self_hdr_(self_hdr) {
+  if (const char* z = std::getenv("DFKV_ZEROCOPY_MIN")) {
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(z, &end, 10);
+    if (end != z) zerocopy_min_ = static_cast<size_t>(v);
+  }
   SetMembers(std::move(members));
   if (transport) {
     t_ = transport;
@@ -122,13 +129,24 @@ bool KVClient::Put(const std::string& key, const void* value, size_t n) {
   if (!health_.Healthy(node, now)) return false;
 
   ValueHeader h = self_hdr_;
-  h.SetPayload(value, n);  // sets payload_len + crc32
-  std::vector<char> buf(ValueHeader::kSize + n);
-  h.Serialize(buf.data());
-  if (n) std::memcpy(buf.data() + ValueHeader::kSize, value, n);
-
+  h.payload_len = n;  // geometry comes from self_hdr_; no payload checksum (v3)
   BlockKey bk = ToBlockKey(key);
-  Status st = t_->Cache(node, bk, buf.data(), buf.size());
+  Status st;
+  if (t_->pipelined() && n >= zerocopy_min_) {
+    // Zero copy: build only the 48B header, scatter-send [header|value] with the
+    // value gathered straight from the caller's registered buffer. `value` must
+    // stay stable until this returns (CacheFrom is synchronous).
+    std::array<char, ValueHeader::kSize> hdr;
+    h.Serialize(hdr.data());
+    std::vector<CacheSrc> srcs{CacheSrc{bk, hdr.data(), ValueHeader::kSize, value, n}};
+    st = t_->CacheFrom(node, srcs)[0];
+  } else {
+    // Small/transient/empty: the proven copy path (wrap into one buffer, Cache).
+    std::vector<char> buf(ValueHeader::kSize + n);
+    h.Serialize(buf.data());
+    if (n) std::memcpy(buf.data() + ValueHeader::kSize, value, n);
+    st = t_->Cache(node, bk, buf.data(), buf.size());
+  }
   if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
   health_.MarkGood(node);
   return st == Status::kOk;
@@ -141,6 +159,26 @@ bool KVClient::Get(const std::string& key, void* out, size_t n) {
   if (!health_.Healthy(node, now)) return false;
 
   BlockKey bk = ToBlockKey(key);
+  if (t_->pipelined() && n >= zerocopy_min_) {
+    // Zero copy AND zero touch: the payload scatters straight into `out` and the
+    // CPU never reads it; only the 48B header comes back (hdrs[0]) for geometry verify.
+    std::vector<BlockKey> keys{bk};
+    std::vector<RangeDst> dsts{RangeDst{out, n}};
+    std::vector<std::string> hdrs;
+    Status st = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs)[0];
+    // A miss decodes to kNotFound (a healthy response), not kIOError — only a
+    // real transport error marks the node bad.
+    if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
+    health_.MarkGood(node);
+    if (st != Status::kOk || hdrs[0].size() < ValueHeader::kSize) return false;
+    ValueHeader h;
+    if (!ValueHeader::Parse(hdrs[0].data(), hdrs[0].size(), &h)) return false;
+    if (!HeaderMatches(self_hdr_, h)) return false;        // geometry drift => miss
+    if (h.payload_len != n) return false;
+    return true;
+  }
+
+  // Small/transient: the proven copy path (response into a string, then to out).
   std::string raw;
   Status st = t_->Range(node, bk, 0, ValueHeader::kSize + n, &raw);
   if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
@@ -155,7 +193,6 @@ bool KVClient::Get(const std::string& key, void* out, size_t n) {
   if (raw.size() < ValueHeader::kSize + n) return false;
 
   const char* payload = raw.data() + ValueHeader::kSize;
-  if (Crc32(payload, n) != h.crc32) return false;          // corruption => miss
   std::memcpy(out, payload, n);
   return true;
 }
@@ -176,7 +213,6 @@ bool KVClient::GetAuto(const std::string& key, std::string* out, size_t max_byte
   if (!HeaderMatches(self_hdr_, h)) return false;
   if (raw.size() < ValueHeader::kSize + h.payload_len) return false;
   const char* p = raw.data() + ValueHeader::kSize;
-  if (Crc32(p, h.payload_len) != h.crc32) return false;
   out->assign(p, h.payload_len);
   return true;
 }
@@ -202,18 +238,17 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     });
     return std::vector<bool>(ok.begin(), ok.end());
   }
-  // RDMA: group by node, wrap once, pipeline each node's writes on one connection.
-  std::vector<std::vector<char>> bufs(N);
+  // RDMA: group by node and scatter-send [header|value] — zero copy of the value.
+  // Build only the 48B header per item (just stamps payload_len; no payload pass);
+  // hdrs must outlive the RunParallel lambdas that reference it.
+  std::vector<std::array<char, ValueHeader::kSize>> hdrs(N);
   std::map<std::string, std::vector<size_t>> by_node;
   for (size_t i = 0; i < N; ++i) {
     std::string node = Route(items[i].key);
     if (node.empty()) continue;
     ValueHeader h = self_hdr_;
-    h.SetPayload(items[i].value, items[i].n);
-    bufs[i].resize(ValueHeader::kSize + items[i].n);
-    h.Serialize(bufs[i].data());
-    if (items[i].n)
-      std::memcpy(bufs[i].data() + ValueHeader::kSize, items[i].value, items[i].n);
+    h.payload_len = items[i].n;
+    h.Serialize(hdrs[i].data());
     by_node[node].push_back(i);
   }
   std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
@@ -222,10 +257,12 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     uint64_t now = NowMs();
     if (!health_.Healthy(node, now)) return;
     const std::vector<size_t>& idx = groups[g].second;
-    std::vector<CacheItem> ci;
-    ci.reserve(idx.size());
-    for (size_t k : idx) ci.push_back(CacheItem{ToBlockKey(items[k].key), bufs[k].data(), bufs[k].size()});
-    std::vector<Status> sts = t_->CacheMany(node, ci);
+    std::vector<CacheSrc> srcs;
+    srcs.reserve(idx.size());
+    for (size_t k : idx)
+      srcs.push_back(CacheSrc{ToBlockKey(items[k].key), hdrs[k].data(),
+                              ValueHeader::kSize, items[k].value, items[k].n});
+    std::vector<Status> sts = t_->CacheFrom(node, srcs);
     for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
     bool resp = false, ioerr = false;
     for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
@@ -265,8 +302,8 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
       keys.push_back(ToBlockKey(items[k].key));
       dsts.push_back(RangeDst{items[k].out, n});
     }
-    // Zero-copy: the payload lands straight in items[].out; hdrs[] gets the value
-    // header for geometry/CRC verification (CRC is computed over the dst buffer).
+    // Zero-copy + zero-touch: the payload lands straight in items[].out (CPU never
+    // reads it); hdrs[] gets the value header for geometry verification only.
     std::vector<std::string> hdrs;
     std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
     bool resp = false, ioerr = false;
@@ -278,7 +315,6 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
       if (!ValueHeader::Parse(hdrs[m].data(), hdrs[m].size(), &h)) continue;
       if (!HeaderMatches(self_hdr_, h)) continue;
       if (h.payload_len != n) continue;
-      if (Crc32(items[idx[m]].out, n) != h.crc32) continue;  // verify in-place
       hit[idx[m]] = 1;
     }
   });

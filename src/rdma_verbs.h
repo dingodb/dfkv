@@ -71,14 +71,22 @@ class RcEndpoint {
   bool PostSend(size_t slot, size_t len);              // SEND sbuf_[slot][0,len)
 
   // Register a caller buffer (e.g. a SGLang HiCache host page) on this PD for
-  // zero-copy receive. Cached by address — HiCache pool buffers are stable so a
-  // buffer registers once and is reused. Returns nullptr on failure.
+  // zero-copy transfer. Cached by address — HiCache pool buffers are stable so a
+  // buffer registers once and is reused. Valid as a recv target AND a send source
+  // (LOCAL_WRITE is a superset of the no-flag local read a SEND does). nullptr on failure.
   ibv_mr* RegisterUser(void* addr, size_t len);
   // Scatter recv: first `hdr_bytes` of the message land in rbuf_[slot] (resp
   // prefix + value header), the remaining payload lands directly in `payload`
   // (must belong to `payload_mr` from RegisterUser) — zero copy into the caller.
   bool PostRecvScatter(size_t slot, void* payload, size_t payload_len,
                        ibv_mr* payload_mr, size_t hdr_bytes);
+  // Scatter send (mirror of PostRecvScatter): SGE0 = sbuf_[slot][0,hdr_len) (req
+  // prefix + value header we built), SGE1 = caller `payload` (must belong to
+  // `payload_mr` from RegisterUser) — gathers [prefix|header|payload] into one
+  // wire SEND with zero copy of the payload. Degrades to a 1-SGE send (header
+  // only) when payload_len==0, so payload_mr may be null for empty values.
+  bool PostSendScatter(size_t slot, size_t hdr_len, const void* payload,
+                       size_t payload_len, ibv_mr* payload_mr);
 
   // Block until at least one completion, drain up to `max` into out[]; returns
   // the count (>0), or <0 on error / when Wake() is called. wr_id of each wc =

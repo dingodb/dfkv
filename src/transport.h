@@ -19,6 +19,15 @@ namespace dfkv {
 struct CacheItem { BlockKey key; const void* data; size_t len; };
 // One zero-copy read target: `n` payload bytes are written straight into `payload`.
 struct RangeDst { void* payload; size_t n; };
+// One zero-copy write source: `header` (e.g. the 48B ValueHeader) and `payload`
+// live in separate buffers; the transport gathers [header|payload] on the wire
+// without a client-side concat copy (RDMA scatter-send). Both must outlive the
+// CacheFrom call and `payload` must stay unmodified until it returns.
+struct CacheSrc {
+  BlockKey key;
+  const void* header; size_t header_len;
+  const void* payload; size_t payload_len;
+};
 
 class Transport {
  public:
@@ -87,6 +96,26 @@ class Transport {
       std::memcpy(dsts[i].payload, raw.data() + header_size, pn);
     }
     return r;
+  }
+
+  // Zero-copy batched write: gathers [srcs[i].header | srcs[i].payload] for
+  // keys[i] without a client concat copy (RDMA scatter-send). Default: concat
+  // each into a temp buffer and route through CacheMany (no zero-copy) so TCP
+  // and any non-pipelined transport stay correct. RDMA's override also falls
+  // back here (which re-materializes the contiguous buffer) on oversize/reg failure.
+  virtual std::vector<Status> CacheFrom(const std::string& node,
+                                        const std::vector<CacheSrc>& srcs) {
+    std::vector<std::vector<char>> bufs(srcs.size());
+    std::vector<CacheItem> items;
+    items.reserve(srcs.size());
+    for (size_t i = 0; i < srcs.size(); ++i) {
+      bufs[i].resize(srcs[i].header_len + srcs[i].payload_len);
+      if (srcs[i].header_len) std::memcpy(bufs[i].data(), srcs[i].header, srcs[i].header_len);
+      if (srcs[i].payload_len)
+        std::memcpy(bufs[i].data() + srcs[i].header_len, srcs[i].payload, srcs[i].payload_len);
+      items.push_back(CacheItem{srcs[i].key, bufs[i].data(), bufs[i].size()});
+    }
+    return CacheMany(node, items);
   }
 };
 

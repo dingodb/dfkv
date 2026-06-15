@@ -120,6 +120,65 @@ TEST(RdmaLoopback, BatchZeroCopyRoundtrip) {
   }
 }
 
+// Force the single Put/Get zero-copy fast path (register caller buffer +
+// scatter-send / scatter-recv) by lowering DFKV_ZEROCOPY_MIN below the value
+// size. Without the env override the 4 KB test values fall under the 256 KiB
+// default threshold and take the copy path (covered by PutGetExistMissOverRdma).
+TEST(RdmaLoopback, SingleZeroCopyPutGet) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_ZEROCOPY_MIN", "1024", 1);
+  RdmaNode node("szc");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);  // reads the env at construction
+
+  std::string v(8192, '\0');
+  for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>((i * 37 + 11) & 0xFF);
+  // Put twice into the SAME source buffer to exercise the MR-cache hit on re-put.
+  ASSERT_TRUE(c.Put("z1", v.data(), v.size()));
+  ASSERT_TRUE(c.Put("z1", v.data(), v.size()));
+
+  // Get into the SAME dst buffer twice (scatter-recv straight in; MR-cache hit).
+  std::string out(v.size(), '\0');
+  ASSERT_TRUE(c.Get("z1", &out[0], out.size()));
+  EXPECT_EQ(out, v);
+  out.assign(v.size(), '\0');
+  ASSERT_TRUE(c.Get("z1", &out[0], out.size()));
+  EXPECT_EQ(out, v);
+
+  // Miss on the zero-copy Get path must be a clean miss (kNotFound), not an error.
+  std::string m(v.size(), '\0');
+  EXPECT_FALSE(c.Get("absent", &m[0], m.size()));
+  // Size mismatch (stored payload_len != requested n) => miss, not corruption.
+  std::string shorter(v.size() / 2, '\0');
+  EXPECT_FALSE(c.Get("z1", &shorter[0], shorter.size()));
+  ::unsetenv("DFKV_ZEROCOPY_MIN");
+}
+
+// An empty (n==0) value in a batch exercises the PostSendScatter 1-SGE degrade
+// (no payload SGE / no MR registration) alongside non-empty items.
+TEST(RdmaLoopback, BatchPutEmptyValue) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("bev");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  std::string nonempty(2048, 'x');
+  std::vector<KvPutItem> puts = {
+      {"e_full", nonempty.data(), nonempty.size()},
+      {"e_empty", nullptr, 0},
+  };
+  auto pr = c.BatchPut(puts);
+  ASSERT_TRUE(pr[0]);
+  ASSERT_TRUE(pr[1]);
+
+  EXPECT_TRUE(c.Exist("e_empty"));
+  std::string out(nonempty.size(), '\0');
+  ASSERT_TRUE(c.Get("e_full", &out[0], out.size()));
+  EXPECT_EQ(out, nonempty);
+  // Empty value round-trips: a 0-byte Get is a hit.
+  EXPECT_TRUE(c.Get("e_empty", nullptr, 0));
+}
+
 TEST(RdmaLoopback, PipelinedPoolDepth) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   // depth>1 enables client pipelining + the server GET worker pool (the most

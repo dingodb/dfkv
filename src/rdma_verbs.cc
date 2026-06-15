@@ -86,7 +86,7 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   qa.send_cq = cq_; qa.recv_cq = cq_;
   qa.cap.max_send_wr = static_cast<uint32_t>(depth_ + 1);
   qa.cap.max_recv_wr = static_cast<uint32_t>(depth_ + 1);
-  qa.cap.max_send_sge = 1; qa.cap.max_recv_sge = 2;  // recv may scatter [hdr | payload]
+  qa.cap.max_send_sge = 2; qa.cap.max_recv_sge = 2;  // both may scatter [hdr | payload]
   qa.qp_type = IBV_QPT_RC;
   qa.sq_sig_all = 1;
   qp_ = ibv_create_qp(pd_, &qa);
@@ -240,6 +240,22 @@ ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
     user_mr_[key] = {mr, user_lru_.begin()};
   }
   return mr;
+}
+
+bool RcEndpoint::PostSendScatter(size_t slot, size_t hdr_len, const void* payload,
+                                 size_t payload_len, ibv_mr* payload_mr) {
+  ibv_sge sge[2]{};
+  sge[0].addr = reinterpret_cast<uintptr_t>(sbuf_[slot]);  // req prefix + value header
+  sge[0].length = static_cast<uint32_t>(hdr_len);
+  sge[0].lkey = smr_[slot]->lkey;
+  sge[1].addr = reinterpret_cast<uintptr_t>(payload);      // payload from caller's MR
+  sge[1].length = static_cast<uint32_t>(payload_len);
+  sge[1].lkey = payload_len ? payload_mr->lkey : 0;
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot; wr.sg_list = sge;
+  wr.num_sge = payload_len ? 2 : 1;  // empty value -> header-only 1-SGE send
+  wr.opcode = IBV_WR_SEND; wr.send_flags = IBV_SEND_SIGNALED;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
 }
 
 bool RcEndpoint::PostRecvScatter(size_t slot, void* payload, size_t payload_len,

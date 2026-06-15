@@ -7,7 +7,6 @@
 #include <string>
 
 using dfkv::ValueHeader;
-using dfkv::Crc32;
 using dfkv::HeaderMatches;
 
 namespace {
@@ -30,7 +29,7 @@ TEST(ValueHeader, IsExactly48Bytes) {
 TEST(ValueHeader, SerializeParseRoundTripPreservesFields) {
   std::string payload = "hello-kv-cache-payload";
   ValueHeader h = MakeSelf();
-  h.SetPayload(payload.data(), payload.size());
+  h.payload_len = payload.size();
 
   char buf[ValueHeader::kSize];
   h.Serialize(buf);
@@ -47,40 +46,6 @@ TEST(ValueHeader, SerializeParseRoundTripPreservesFields) {
   EXPECT_EQ(got.head_dim, h.head_dim);
   EXPECT_EQ(got.flags, h.flags);
   EXPECT_EQ(got.payload_len, payload.size());
-  EXPECT_EQ(got.crc32, h.crc32);
-}
-
-TEST(ValueHeader, CrcMatchesPayloadAndDetectsCorruption) {
-  std::string payload = "deadbeef-kv";
-  ValueHeader h = MakeSelf();
-  h.SetPayload(payload.data(), payload.size());
-  EXPECT_EQ(h.crc32, Crc32(payload.data(), payload.size()));
-
-  std::string corrupt = payload;
-  corrupt[0] ^= 0xFF;
-  EXPECT_NE(h.crc32, Crc32(corrupt.data(), corrupt.size()));
-}
-
-TEST(Crc32c, MatchesKnownCastagnoliCheckVector) {
-  // CRC32C (Castagnoli) standard check value for the ASCII string "123456789".
-  const char* s = "123456789";
-  EXPECT_EQ(Crc32(s, 9), 0xE3069283u);
-  EXPECT_EQ(Crc32("", 0), 0u);  // CRC of empty == 0 (init ^ xorout)
-}
-
-TEST(Crc32c, HardwareMatchesScalarOnRandomBuffers) {
-  // The SSE4.2 path and the table fallback must produce identical CRC32C.
-  std::string buf;
-  uint32_t x = 0x12345678u;
-  for (size_t len : {0u, 1u, 7u, 8u, 9u, 63u, 64u, 1000u, 65537u}) {
-    buf.resize(len);
-    for (size_t i = 0; i < len; ++i) { x = x * 1103515245u + 12345u; buf[i] = char(x >> 16); }
-#if defined(__x86_64__) || defined(__i386__)
-    EXPECT_EQ(dfkv::detail::Crc32cScalar(buf.data(), len),
-              dfkv::detail::Crc32cHw(buf.data(), len)) << "len=" << len;
-#endif
-    EXPECT_EQ(Crc32(buf.data(), len), dfkv::detail::Crc32cScalar(buf.data(), len)) << "len=" << len;
-  }
 }
 
 TEST(ValueHeader, ParseRejectsBadMagicAndShortBuffer) {

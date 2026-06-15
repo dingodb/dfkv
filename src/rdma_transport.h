@@ -42,6 +42,8 @@ class RdmaTransport : public Transport {
   // Pipelined: up to `depth_` requests in flight on a single connection.
   std::vector<Status> CacheMany(const std::string& node,
                                 const std::vector<CacheItem>& items) override;
+  std::vector<Status> CacheFrom(const std::string& node,
+                                const std::vector<CacheSrc>& srcs) override;
   std::vector<Status> RangeMany(const std::string& node,
                                 const std::vector<BlockKey>& keys,
                                 uint64_t offset, uint64_t length,
