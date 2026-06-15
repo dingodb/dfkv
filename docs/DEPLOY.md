@@ -160,6 +160,7 @@ export DFKV_RDMA=1                       # 启用 RDMA 数据面（否则 TCP）
 export DFKV_RDMA_DEV=ib7s400p0           # 数据面设备；多轨用逗号列表 ib7s400p0,ib7s400p1,...
 # 可选: DFKV_RDMA_DEPTH=16 (单连接 pipeline, K 个请求在途; 利于 PUT; client+server 两端都要设)
 ```
+> 写流水也可写进 extra_config 的 `"rdma_depth":16`（插件在 dfkv_open 前自动设 DFKV_RDMA_DEPTH，免去手动 export）；**dfkv_server 仍须在自己的 env 里设同值或更大**（client depth ≤ server depth）。MLA 单 rank 写是延迟受限，depth>1 让多个 PUT 在途、隐藏单 op 延迟，实测抬高写带宽。
 
 **方案 A — MDS 动态发现（推荐）**：配置 `mds_endpoints` + `mds_group`；插件内部调用
 `dfkv_start_mds_discovery` 自动轮询 MDS，epoch 变化时重建环，无需重启。

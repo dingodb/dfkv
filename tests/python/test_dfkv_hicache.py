@@ -151,6 +151,19 @@ class DingoFSHiCacheTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
 
+    def test_rdma_depth_extra_config_sets_env(self):
+        # extra_config rdma_depth must propagate to DFKV_RDMA_DEPTH so the C client
+        # builds its transport with write pipelining (#1). Set before dfkv_open.
+        members, _, _ = self._node("rdepth")
+        os.environ.pop("DFKV_RDMA_DEPTH", None)
+        try:
+            cfg = self._cfg(members)
+            cfg.extra_config["rdma_depth"] = 8
+            dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+            self.assertEqual(os.environ.get("DFKV_RDMA_DEPTH"), "8")
+        finally:
+            os.environ.pop("DFKV_RDMA_DEPTH", None)
+
     def test_generic_get_roundtrip(self):
         # Generic (non zero-copy) set/get round-trips a page through dfkv.
         members, _, _ = self._node("gget")

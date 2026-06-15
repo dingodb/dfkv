@@ -106,6 +106,14 @@ class DfkvHiCache(HiCacheStorage):
             members = cfg.get("members", "")
             if not mds and not members:
                 raise ValueError("dingofs hicache: extra_config needs 'mds_endpoints' (MDS discovery) or 'members' (static)")
+            # RDMA write pipelining: depth>1 keeps multiple PUTs in flight on one
+            # connection, hiding per-op latency (single-rank MLA writes are
+            # latency-bound). The C client reads DFKV_RDMA_DEPTH when it builds the
+            # transport inside dfkv_open below, so set it from extra_config first.
+            # NOTE: the dfkv_server must set the SAME (or larger) DFKV_RDMA_DEPTH in
+            # its own env -- client depth must be <= server depth.
+            if cfg.get("rdma_depth"):
+                os.environ["DFKV_RDMA_DEPTH"] = str(int(cfg["rdma_depth"]))
             self._lib = _load_lib(cfg.get("lib_path"))
             flags = _FLAG_IS_MLA if self.is_mla else 0
             model_hash = int(cfg.get("model_hash", 0)) & 0xFFFFFFFFFFFFFFFF
