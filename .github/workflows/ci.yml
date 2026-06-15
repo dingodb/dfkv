@@ -26,6 +26,12 @@ jobs:
 
       - name: Install build & test deps
         run: |
+          # Drop preinstalled third-party apt sources (google-chrome, microsoft):
+          # their mirrors intermittently fail `apt-get update` with a size mismatch
+          # ("File has unexpected size ... Mirror sync in progress"), which has
+          # nothing to do with our deps (all from the Ubuntu archive).
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ clang python3 python3-numpy git ca-certificates
@@ -52,6 +58,12 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install deps
         run: |
+          # Drop preinstalled third-party apt sources (google-chrome, microsoft):
+          # their mirrors intermittently fail `apt-get update` with a size mismatch
+          # ("File has unexpected size ... Mirror sync in progress"), which has
+          # nothing to do with our deps (all from the Ubuntu archive).
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build g++ git ca-certificates
       - name: Build with TSan
@@ -71,6 +83,12 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install deps incl. RDMA dev
         run: |
+          # Drop preinstalled third-party apt sources (google-chrome, microsoft):
+          # their mirrors intermittently fail `apt-get update` with a size mismatch
+          # ("File has unexpected size ... Mirror sync in progress"), which has
+          # nothing to do with our deps (all from the Ubuntu archive).
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ git ca-certificates libibverbs-dev
@@ -89,6 +107,12 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install deps incl. RDMA dev + tools
         run: |
+          # Drop preinstalled third-party apt sources (google-chrome, microsoft):
+          # their mirrors intermittently fail `apt-get update` with a size mismatch
+          # ("File has unexpected size ... Mirror sync in progress"), which has
+          # nothing to do with our deps (all from the Ubuntu archive).
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build g++ git ca-certificates \
@@ -132,6 +156,12 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install deps
         run: |
+          # Drop preinstalled third-party apt sources (google-chrome, microsoft):
+          # their mirrors intermittently fail `apt-get update` with a size mismatch
+          # ("File has unexpected size ... Mirror sync in progress"), which has
+          # nothing to do with our deps (all from the Ubuntu archive).
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build g++ git ca-certificates
       - name: Build static-libstdc++ artifacts (no tests)
