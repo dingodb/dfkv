@@ -2,16 +2,27 @@
  * (no S3 fallback; a miss is a clean NotFound). Cache() is synchronous: after
  * it returns the block is on disk and indexed (IsCached==true), giving the
  * cross-node read-after-write visibility the design requires. Portable (no
- * brpc/io_uring); the real cache node uses the dingofs DiskCache engine. */
+ * brpc/io_uring); the real cache node uses the dingofs DiskCache engine.
+ *
+ * Concurrency: the in-memory index + recency are SHARDED into `shards` stripes,
+ * each guarded by its own std::shared_mutex (the dingofs `Shards` pattern). The
+ * GET hot path (Range/RangeDirect/IsCached) takes a SHARED lock and only flips a
+ * per-entry atomic CLOCK bit (no list mutation), so reads to a shard run
+ * concurrently; Cache/eviction take the EXCLUSIVE lock. Eviction is per-shard
+ * second-chance (CLOCK) — an LRU approximation; each shard owns capacity/shards
+ * bytes. The bulk disk I/O always happens OUTSIDE the lock (the open fd pins the
+ * inode, so a concurrent eviction can't pull bytes out from under a reader). */
 #ifndef DFKV_KV_STORE_H_
 #define DFKV_KV_STORE_H_
 
 #include <atomic>
 #include <cstdint>
 #include <list>
-#include <mutex>
+#include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "kv_types.h"
 
@@ -26,6 +37,10 @@ class KVStore {
   struct Options {
     std::string cache_dir;
     uint64_t capacity_bytes = (1ull << 30);
+    // Index/LRU stripes. Each shard owns capacity_bytes/shards and its own lock,
+    // so concurrent ops to distinct shards never contend. Default 16; the strict
+    // cross-key LRU unit test pins it to 1.
+    size_t shards = 16;
   };
 
   explicit KVStore(Options opt);
@@ -54,18 +69,26 @@ class KVStore {
  private:
   struct Entry {
     std::string path;
-    uint64_t size;
-    std::list<std::string>::iterator lru_it;  // position in lru_ (front = MRU)
+    uint64_t size = 0;
+    std::list<std::string>::iterator ring_it;  // position in the shard's CLOCK ring
+    std::atomic<bool> referenced{false};        // CLOCK bit: set on access (read lock)
+    Entry(std::string p, uint64_t s, std::list<std::string>::iterator it)
+        : path(std::move(p)), size(s), ring_it(it) {}
   };
-  void TouchLocked(const std::string& fname);
-  void EvictIfNeededLocked();
+  struct Shard {
+    mutable std::shared_mutex mu;
+    std::unordered_map<std::string, Entry> index;  // filename -> entry
+    std::list<std::string> ring;                    // CLOCK ring, front = newest
+    uint64_t used_bytes = 0;
+    uint64_t capacity = 0;
+  };
+
+  Shard& ShardFor(const std::string& fname) const;
+  void EvictLocked(Shard& sh);  // CLOCK second-chance; exclusive lock held
   void RebuildIndex();
 
   Options opt_;
-  mutable std::mutex mu_;
-  std::unordered_map<std::string, Entry> index_;  // filename -> entry
-  std::list<std::string> lru_;                    // filenames, front = MRU
-  uint64_t used_bytes_ = 0;
+  std::vector<std::unique_ptr<Shard>> shards_;  // fixed after construction
   std::atomic<uint64_t> tmp_seq_{0};  // unique suffix for concurrent lock-free writes
 };
 

@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <shared_mutex>
 
 namespace fs = std::filesystem;
 
@@ -173,15 +175,31 @@ const char* StatusName(Status s) {
 }
 
 KVStore::KVStore(Options opt) : opt_(std::move(opt)) {
+  // Adapt the shard count to capacity: each shard should own a meaningful slice
+  // (>= kMinShardBytes) so a single value can't exceed its shard's capacity (which
+  // would make it un-cacheable). A tiny cache collapses to 1 shard; a large one
+  // uses the full requested fan-out. opt_.shards==1 is honored exactly.
+  constexpr uint64_t kMinShardBytes = 64ull << 20;  // 64 MiB per shard floor
+  const size_t want = opt_.shards ? opt_.shards : 1;
+  size_t fit = static_cast<size_t>(opt_.capacity_bytes / kMinShardBytes);
+  if (fit < 1) fit = 1;
+  const size_t n = want < fit ? want : fit;
+  shards_.reserve(n);
+  const uint64_t base = opt_.capacity_bytes / n, rem = opt_.capacity_bytes % n;
+  for (size_t i = 0; i < n; ++i) {
+    auto sh = std::make_unique<Shard>();
+    sh->capacity = base + (i < rem ? 1 : 0);  // spread remainder so the sum == capacity
+    shards_.push_back(std::move(sh));
+  }
   fs::create_directories(opt_.cache_dir);
   RebuildIndex();
 }
 
-void KVStore::RebuildIndex() {
-  std::lock_guard<std::mutex> lk(mu_);
-  index_.clear();
-  lru_.clear();
-  used_bytes_ = 0;
+KVStore::Shard& KVStore::ShardFor(const std::string& fname) const {
+  return *shards_[std::hash<std::string>{}(fname) % shards_.size()];
+}
+
+void KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
   std::error_code ec;
   if (!fs::exists(opt_.cache_dir, ec)) return;
   for (auto it = fs::recursive_directory_iterator(opt_.cache_dir, ec);
@@ -190,42 +208,48 @@ void KVStore::RebuildIndex() {
     std::string fname = it->path().filename().string();
     if (fname.size() >= 4 && fname.substr(fname.size() - 4) == ".tmp") continue;
     uint64_t sz = static_cast<uint64_t>(fs::file_size(it->path(), ec));
-    lru_.push_front(fname);
-    index_[fname] = Entry{it->path().string(), sz, lru_.begin()};
-    used_bytes_ += sz;
+    Shard& sh = ShardFor(fname);
+    sh.ring.push_front(fname);
+    sh.index.try_emplace(fname, it->path().string(), sz, sh.ring.begin());
+    sh.used_bytes += sz;
   }
 }
 
-void KVStore::TouchLocked(const std::string& fname) {
-  auto it = index_.find(fname);
-  if (it == index_.end()) return;
-  lru_.erase(it->second.lru_it);
-  lru_.push_front(fname);
-  it->second.lru_it = lru_.begin();
-}
-
-void KVStore::EvictIfNeededLocked() {
-  while (used_bytes_ > opt_.capacity_bytes && !lru_.empty()) {
-    std::string victim = lru_.back();
-    auto it = index_.find(victim);
-    if (it == index_.end()) { lru_.pop_back(); continue; }
+// CLOCK second-chance eviction within one shard (exclusive lock held). A newly
+// inserted entry starts unreferenced; an access (read lock) sets its bit. The
+// hand sweeps from the ring tail: a referenced entry is cleared and given a
+// second chance (spliced to the front), an unreferenced one is evicted. Each
+// full sweep clears every bit, so the loop always terminates.
+void KVStore::EvictLocked(Shard& sh) {
+  // size() > 1 (not !empty()): never evict a shard's last entry, so a value larger
+  // than the per-shard capacity still stays cached (it just keeps the shard over).
+  while (sh.used_bytes > sh.capacity && sh.ring.size() > 1) {
+    auto it = sh.index.find(sh.ring.back());
+    if (it == sh.index.end()) { sh.ring.pop_back(); continue; }  // ring/index drift (shouldn't happen)
+    if (it->second.referenced.load(std::memory_order_relaxed)) {
+      it->second.referenced.store(false, std::memory_order_relaxed);  // second chance
+      sh.ring.splice(sh.ring.begin(), sh.ring, std::prev(sh.ring.end()));
+      it->second.ring_it = sh.ring.begin();
+      continue;
+    }
     std::error_code ec;
     fs::remove(it->second.path, ec);
-    used_bytes_ -= it->second.size;
-    lru_.pop_back();
-    index_.erase(it);
+    sh.used_bytes -= it->second.size;
+    sh.ring.erase(it->second.ring_it);
+    sh.index.erase(it);
   }
 }
 
 Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
   if (data == nullptr && len != 0) return Status::kInvalid;
   const std::string fname = key.Filename();
+  Shard& sh = ShardFor(fname);
   {  // best-effort early idempotent skip (avoids a needless 2.74 MiB write)
-    std::lock_guard<std::mutex> lk(mu_);
-    if (index_.count(fname)) return Status::kOk;
+    std::shared_lock<std::shared_mutex> rl(sh.mu);
+    if (sh.index.count(fname)) return Status::kOk;
   }
   // Write the payload OUTSIDE the lock so concurrent writes to the same disk run
-  // in parallel (the mutex only guards the in-memory index/LRU). A unique tmp
+  // in parallel (the lock only guards the in-memory index/ring). A unique tmp
   // name per writer avoids collisions; the index re-check below resolves races.
   fs::path full = fs::path(opt_.cache_dir) / key.StoreKey();
   std::error_code ec;
@@ -236,36 +260,37 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
     fs::remove(tmp, ec);
     return Status::kIOError;
   }
-  std::lock_guard<std::mutex> lk(mu_);
-  if (index_.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first
+  std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
+  if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first
   fs::rename(tmp, full, ec);  // atomic publish
   if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
-  lru_.push_front(fname);
-  index_[fname] = Entry{full.string(), len, lru_.begin()};
-  used_bytes_ += len;
-  EvictIfNeededLocked();
+  sh.ring.push_front(fname);
+  sh.index.try_emplace(fname, full.string(), len, sh.ring.begin());
+  sh.used_bytes += len;
+  EvictLocked(sh);
   return Status::kOk;
 }
 
 Status KVStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
                       std::string* out) {
-  // The mutex protects the in-memory index/LRU, NOT the bulk file read. Holding
-  // it across the whole read serializes all reads to this disk (the GET hot path
-  // for KVCache). Instead: look up + open the file + touch LRU under the lock —
-  // the open fd pins the inode, so a concurrent eviction (fs::remove) can't pull
-  // the bytes out from under us (POSIX unlink keeps the inode alive until close)
-  // — then release the lock and do the 2.74 MiB O_DIRECT read concurrently.
+  // The lock protects the in-memory index/ring, NOT the bulk file read. The GET
+  // hot path takes a SHARED lock (concurrent reads per shard) and only flips the
+  // entry's CLOCK bit; it opens the file under the lock so a concurrent eviction
+  // (exclusive lock) can't fs::remove it first — the open fd then pins the inode
+  // (POSIX unlink keeps it alive until close) — then releases the lock and does
+  // the 2.74 MiB O_DIRECT read concurrently.
+  const std::string fname = key.Filename();
+  Shard& sh = ShardFor(fname);
   Fd fd;
   uint64_t fsize = 0;
   {
-    std::lock_guard<std::mutex> lk(mu_);
-    const std::string fname = key.Filename();
-    auto it = index_.find(fname);
-    if (it == index_.end()) return Status::kNotFound;  // cache-only: clean miss
+    std::shared_lock<std::shared_mutex> rl(sh.mu);
+    auto it = sh.index.find(fname);
+    if (it == sh.index.end()) return Status::kNotFound;  // cache-only: clean miss
     fd.reset(::open(it->second.path.c_str(), O_RDONLY | O_DIRECT));
     if (!fd.valid()) return Status::kIOError;  // entry exists; open failure is I/O
     fsize = it->second.size;
-    TouchLocked(fname);
+    it->second.referenced.store(true, std::memory_order_relaxed);  // CLOCK touch (read lock OK)
   }
   if (offset > fsize) return Status::kInvalid;
   // Clamp by subtraction so offset + length can't overflow uint64_t.
@@ -283,15 +308,16 @@ Status KVStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
   *out_len = 0;
   Fd fd;
   uint64_t fsize = 0;
-  {  // index lookup + open under the lock; bulk read outside (see Range)
-    std::lock_guard<std::mutex> lk(mu_);
+  {  // index lookup + open under a SHARED lock; bulk read outside (see Range)
     const std::string fname = key.Filename();
-    auto it = index_.find(fname);
-    if (it == index_.end()) return Status::kNotFound;
+    Shard& sh = ShardFor(fname);
+    std::shared_lock<std::shared_mutex> rl(sh.mu);
+    auto it = sh.index.find(fname);
+    if (it == sh.index.end()) return Status::kNotFound;
     fd.reset(::open(it->second.path.c_str(), O_RDONLY | O_DIRECT));
     if (!fd.valid()) return Status::kIOError;
     fsize = it->second.size;
-    TouchLocked(fname);
+    it->second.referenced.store(true, std::memory_order_relaxed);  // CLOCK touch
   }
   if (offset > fsize) return Status::kInvalid;
   // Clamp by subtraction so offset + length can't overflow uint64_t.
@@ -312,15 +338,16 @@ Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset, uint64_t lengt
   *out_len = 0;
   Fd fd;
   uint64_t fsize = 0;
-  {  // index lookup + open under the lock; bulk read outside (see Range)
-    std::lock_guard<std::mutex> lk(mu_);
+  {  // index lookup + open under a SHARED lock; bulk read outside (see Range)
     const std::string fname = key.Filename();
-    auto it = index_.find(fname);
-    if (it == index_.end()) return Status::kNotFound;
+    Shard& sh = ShardFor(fname);
+    std::shared_lock<std::shared_mutex> rl(sh.mu);
+    auto it = sh.index.find(fname);
+    if (it == sh.index.end()) return Status::kNotFound;
     fd.reset(::open(it->second.path.c_str(), O_RDONLY | O_DIRECT));
     if (!fd.valid()) return Status::kIOError;
     fsize = it->second.size;
-    TouchLocked(fname);
+    it->second.referenced.store(true, std::memory_order_relaxed);  // CLOCK touch
   }
   if (offset > fsize) return Status::kInvalid;
   uint64_t n = length;
@@ -338,18 +365,28 @@ Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset, uint64_t lengt
 }
 
 bool KVStore::IsCached(const BlockKey& key) const {
-  std::lock_guard<std::mutex> lk(mu_);
-  return index_.count(key.Filename()) != 0;
+  const std::string fname = key.Filename();
+  Shard& sh = ShardFor(fname);
+  std::shared_lock<std::shared_mutex> rl(sh.mu);
+  return sh.index.count(fname) != 0;
 }
 
 uint64_t KVStore::UsedBytes() const {
-  std::lock_guard<std::mutex> lk(mu_);
-  return used_bytes_;
+  uint64_t total = 0;
+  for (const auto& sh : shards_) {
+    std::shared_lock<std::shared_mutex> rl(sh->mu);
+    total += sh->used_bytes;
+  }
+  return total;
 }
 
 size_t KVStore::Count() const {
-  std::lock_guard<std::mutex> lk(mu_);
-  return index_.size();
+  size_t n = 0;
+  for (const auto& sh : shards_) {
+    std::shared_lock<std::shared_mutex> rl(sh->mu);
+    n += sh->index.size();
+  }
+  return n;
 }
 
 }  // namespace dfkv
