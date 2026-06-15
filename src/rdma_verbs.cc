@@ -4,6 +4,7 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -96,15 +97,18 @@ void RcEndpoint::Close() {
   if (qp_) { ibv_destroy_qp(qp_); qp_ = nullptr; }
   for (auto* m : smr_) if (m) ibv_dereg_mr(m);
   for (auto* m : rmr_) if (m) ibv_dereg_mr(m);
+  for (auto* m : dmr_) if (m) ibv_dereg_mr(m);
   for (auto& [addr, e] : user_mr_) if (e.first) ibv_dereg_mr(e.first);
   user_mr_.clear();
   user_lru_.clear();
   for (auto& p : pool_mr_) if (p.mr) ibv_dereg_mr(p.mr);
   pool_mr_.clear();
-  smr_.clear(); rmr_.clear();
+  smr_.clear(); rmr_.clear(); dmr_.clear();
   for (auto* b : sbuf_) delete[] b;
   for (auto* b : rbuf_) delete[] b;
-  sbuf_.clear(); rbuf_.clear();
+  for (auto* b : dbuf_) std::free(b);
+  sbuf_.clear(); rbuf_.clear(); dbuf_.clear();
+  dbuf_cap_ = 0;
   if (cq_) { ibv_destroy_cq(cq_); cq_ = nullptr; }
   if (chan_) { ibv_destroy_comp_channel(chan_); chan_ = nullptr; }
   // ctx_ + pd_ are borrowed from the shared per-device registry; drop our ref
@@ -114,7 +118,8 @@ void RcEndpoint::Close() {
   if (wake_wfd_ >= 0) { ::close(wake_wfd_); wake_wfd_ = -1; }
 }
 
-bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port) {
+bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port,
+                      bool direct_io_buffers) {
   cap_ = cap; depth_ = depth; ib_port_ = ib_port;
 
   int wp[2];
@@ -165,6 +170,11 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   numa_node_ = numa::DeviceNode(dev_name);
   sbuf_.resize(depth_, nullptr); rbuf_.resize(depth_, nullptr);
   smr_.resize(depth_, nullptr); rmr_.resize(depth_, nullptr);
+  if (direct_io_buffers) {
+    dbuf_cap_ = cap_ + 2 * kDirectIoAlign;
+    dbuf_.resize(depth_, nullptr);
+    dmr_.resize(depth_, nullptr);
+  }
   for (size_t i = 0; i < depth_; ++i) {
     sbuf_[i] = new char[cap_]; rbuf_[i] = new char[cap_];
     numa::BindMemory(sbuf_[i], cap_, numa_node_);
@@ -172,6 +182,14 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
     smr_[i] = ibv_reg_mr(pd_, sbuf_[i], cap_, IBV_ACCESS_LOCAL_WRITE);
     rmr_[i] = ibv_reg_mr(pd_, rbuf_[i], cap_, IBV_ACCESS_LOCAL_WRITE);
     if (!smr_[i] || !rmr_[i]) { Close(); return false; }
+    if (direct_io_buffers) {
+      void* p = nullptr;
+      if (posix_memalign(&p, kDirectIoAlign, dbuf_cap_) != 0) { Close(); return false; }
+      dbuf_[i] = static_cast<char*>(p);
+      numa::BindMemory(dbuf_[i], dbuf_cap_, numa_node_);
+      dmr_[i] = ibv_reg_mr(pd_, dbuf_[i], dbuf_cap_, IBV_ACCESS_LOCAL_WRITE);
+      if (!dmr_[i]) { Close(); return false; }
+    }
   }
 
   // local addressing info

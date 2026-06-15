@@ -44,6 +44,14 @@ Status DiskCacheGroup::RangeInto(const BlockKey& key, uint64_t offset,
   return d->RangeInto(key, offset, length, dst, dst_cap, out_len);
 }
 
+Status DiskCacheGroup::RangeDirect(const BlockKey& key, uint64_t offset,
+                                   uint64_t length, char* io_buf, size_t io_cap,
+                                   const char** out_data, size_t* out_len) {
+  KVStore* d = Route(key);
+  if (d == nullptr) return Status::kInvalid;
+  return d->RangeDirect(key, offset, length, io_buf, io_cap, out_data, out_len);
+}
+
 bool DiskCacheGroup::IsCached(const BlockKey& key) const {
   KVStore* d = Route(key);
   return d != nullptr && d->IsCached(key);

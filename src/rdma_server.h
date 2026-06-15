@@ -31,11 +31,14 @@ class RdmaServer {
       uint8_t op, uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
       uint64_t length, const char* payload, uint64_t payload_len,
       std::string* out_data)>;
-  // Optional zero-copy GET handler: read the block straight into `dst` (the send
-  // buffer), no std::string. When set, kRange requests use it instead of Handler.
+  // Optional direct GET handler: read an O_DIRECT-aligned superset into `io_buf`
+  // and return *out_data pointing inside that same registered buffer at the exact
+  // requested range. When set, kRange replies scatter-send [resp | *out_data]
+  // without copying the payload into sbuf.
   using RangeHandler = std::function<Status(
       uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
-      uint64_t length, char* dst, size_t dst_cap, size_t* out_len)>;
+      uint64_t length, char* io_buf, size_t io_cap, const char** out_data,
+      size_t* out_len)>;
 
   // dev_name empty => env DFKV_RDMA_DEV, else first device.
   explicit RdmaServer(Handler handler, size_t max_msg = (8u << 20),

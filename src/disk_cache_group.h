@@ -32,6 +32,9 @@ class DiskCacheGroup {
                std::string* out);
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
                    char* dst, size_t dst_cap, size_t* out_len);
+  Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
+                     char* io_buf, size_t io_cap, const char** out_data,
+                     size_t* out_len);
   bool IsCached(const BlockKey& key) const;
 
   uint64_t UsedBytes() const;   // summed across disks

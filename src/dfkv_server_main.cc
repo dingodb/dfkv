@@ -85,10 +85,10 @@ int main(int argc, char** argv) {
           return srv.ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
         },
         /*max_msg=*/8u << 20, rdma_dev);
-    rsrv->set_range_handler(  // server-side zero-copy GET: read straight into sbuf
+    rsrv->set_range_handler(  // server-side direct GET: disk -> registered dbuf -> RDMA scatter
         [&srv](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
-               char* dst, size_t cap, size_t* out_len) {
-          return srv.RangeInto(id, idx, ks, off, len, dst, cap, out_len);
+               char* io_buf, size_t cap, const char** out_data, size_t* out_len) {
+          return srv.RangeDirect(id, idx, ks, off, len, io_buf, cap, out_data, out_len);
         });
     if (rsrv->Start(rdma_port) == Status::kOk)
       DFKV_LOG_INFO("dfkv_server RDMA listening (TCP bootstrap) on port " +

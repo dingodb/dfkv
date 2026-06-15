@@ -104,7 +104,10 @@ void RdmaServer::Serve(int boot_fd) {
 
   rdma::RcEndpoint ep;
   const size_t K = ServerDepth();
-  if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, K)) { ::close(boot_fd); return; }
+  if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, K,
+               /*ib_port=*/1, /*direct_io_buffers=*/true)) {
+    ::close(boot_fd); return;
+  }
   numa::PinThreadToNode(ep.numa_node());  // keep this conn's serve thread NUMA-local to its NIC
   // QP bootstrap: read client's info, send ours (symmetric to the client).
   char peer[rdma::kQpInfoBytes], mine[rdma::kQpInfoBytes];
@@ -139,26 +142,53 @@ void RdmaServer::Serve(int boot_fd) {
   free_send.reserve(K);
   for (size_t i = 0; i < K; ++i) free_send.push_back(i);
 
-  // Build the reply for one request into ep.sbuf[slot]; returns the send length
-  // or -1 on overflow. For kRange with a zero-copy range handler set, the payload
-  // is read straight into sbuf+kRespPrefix (no std::string) — server-side zero copy.
-  auto build_reply = [&](size_t slot, const ReqFields& rq, const char* payload) -> long {
+  struct Reply {
+    bool scatter = false;
+    size_t first_len = 0;  // plain: full sbuf length; scatter: sbuf header length
+    const void* payload = nullptr;
+    size_t payload_len = 0;
+    ibv_mr* payload_mr = nullptr;
+  };
+
+  // Build the reply for one request. Generic ops are materialized in sbuf. For
+  // kRange with a direct range handler set, O_DIRECT reads into ep.dbuf[slot]
+  // (4096-aligned + registered) and the wire reply is scatter-sent as
+  // [resp-prefix from sbuf | value bytes from dbuf], with no payload memcpy.
+  auto build_reply = [&](size_t slot, const ReqFields& rq, const char* payload,
+                         Reply* reply) -> bool {
     char* sb = ep.sbuf(slot);
     if (rq.op == static_cast<uint8_t>(WireOp::kRange) && range_handler_) {
+      if (!ep.dbuf(slot) || !ep.dmr(slot)) return false;
+      const uint64_t max_payload = ep.cap() > kRespPrefix ? ep.cap() - kRespPrefix : 0;
+      if (rq.length > max_payload) {
+        EncodeResp(sb, Status::kInvalid, 0);
+        reply->first_len = kRespPrefix;
+        return true;
+      }
+      const char* out_data = nullptr;
       size_t out_len = 0;
       Status st = range_handler_(rq.id, rq.index, rq.size, rq.offset, rq.length,
-                                 sb + kRespPrefix, ep.cap() - kRespPrefix, &out_len);
+                                 ep.dbuf(slot), ep.dbuf_cap(), &out_data, &out_len);
       uint64_t dlen = (st == Status::kOk) ? out_len : 0;
       EncodeResp(sb, st, dlen);
-      return static_cast<long>(kRespPrefix + dlen);
+      reply->first_len = kRespPrefix;
+      if (st == Status::kOk && dlen != 0) {
+        if (!out_data) return false;
+        reply->scatter = true;
+        reply->payload = out_data;
+        reply->payload_len = out_len;
+        reply->payload_mr = ep.dmr(slot);
+      }
+      return true;
     }
     std::string data;
     Status st = handler_(rq.op, rq.id, rq.index, rq.size, rq.offset, rq.length,
                          payload, rq.payload_len, &data);
-    if (kRespPrefix + data.size() > ep.cap()) return -1;
+    if (kRespPrefix + data.size() > ep.cap()) return false;
     EncodeResp(sb, st, data.size());
     if (!data.empty()) std::memcpy(sb + kRespPrefix, data.data(), data.size());
-    return static_cast<long>(kRespPrefix + data.size());
+    reply->first_len = kRespPrefix + data.size();
+    return true;
   };
 
   // Single-threaded serve loop: reap completions and process each RECV inline, in
@@ -185,10 +215,15 @@ void RdmaServer::Serve(int boot_fd) {
       size_t s = free_send.back(); free_send.pop_back();
       const char* payload = (rq.payload_len && wc.byte_len >= kReqPrefix + rq.payload_len)
                                 ? ep.rbuf(r) + kReqPrefix : nullptr;
-      long sl = build_reply(s, rq, payload);   // consumes rbuf[r] for a PUT payload
+      Reply reply;
+      bool built = build_reply(s, rq, payload, &reply);   // consumes rbuf[r] for a PUT payload
       if (!ep.PostRecv(r)) { fail = true; break; }  // re-arm (request consumed)
-      if (sl < 0) { fail = true; break; }
-      if (!ep.PostSend(s, static_cast<size_t>(sl))) { fail = true; break; }
+      if (!built) { fail = true; break; }
+      bool sent = reply.scatter
+                      ? ep.PostSendScatter(s, reply.first_len, reply.payload,
+                                           reply.payload_len, reply.payload_mr)
+                      : ep.PostSend(s, reply.first_len);
+      if (!sent) { fail = true; break; }
     }
   }
   { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }

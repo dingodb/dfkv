@@ -58,6 +58,13 @@ class KvNodeServer {
   Status RangeInto(uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
                    uint64_t length, char* dst, size_t dst_cap, size_t* out_len);
 
+  // RDMA direct GET: read an O_DIRECT-aligned superset into `io_buf`; *out_data
+  // points inside that same buffer at the exact requested range so the RDMA layer
+  // can scatter-send it without copying into sbuf.
+  Status RangeDirect(uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
+                     uint64_t length, char* io_buf, size_t io_cap,
+                     const char** out_data, size_t* out_len);
+
  private:
   void AcceptLoop();
   void Handle(int fd);

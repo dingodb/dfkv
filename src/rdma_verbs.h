@@ -44,6 +44,9 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]);
 // Fixed-size device-name field the client sends first in the bootstrap so the
 // server opens its QP on the matching device (same rail) for multi-rail setups.
 constexpr size_t kDevNameBytes = 32;
+// Alignment used for server-side O_DIRECT read buffers. NVMe/xfs are happy with
+// 4096, and it is a safe superset for 512-byte logical-sector devices.
+constexpr size_t kDirectIoAlign = 4096;
 
 // One RC connection: device context + PD + CQ(+channel) + QP + a ring of
 // `depth` send and recv buffers (each `cap` bytes, registered once).
@@ -55,8 +58,11 @@ class RcEndpoint {
   RcEndpoint& operator=(const RcEndpoint&) = delete;
 
   // Open device `dev_name` (nullptr/"" = first device), create RC QP in INIT,
-  // allocate+register `depth` send & recv buffers of `cap` bytes. False on error.
-  bool Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port = 1);
+  // allocate+register `depth` send & recv buffers of `cap` bytes. When
+  // direct_io_buffers is true, also allocate one 4096-aligned registered buffer
+  // per send slot for O_DIRECT reads that are scatter-sent without a copy.
+  bool Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port = 1,
+            bool direct_io_buffers = false);
 
   QpInfo Local() const { return local_; }              // my QP info (after Open)
   bool Connect(const QpInfo& remote);                  // INIT -> RTR -> RTS
@@ -66,6 +72,9 @@ class RcEndpoint {
   int numa_node() const { return numa_node_; }  // device's NUMA node, or -1
   char* sbuf(size_t slot) { return sbuf_[slot]; }
   char* rbuf(size_t slot) { return rbuf_[slot]; }
+  char* dbuf(size_t slot) { return dbuf_.empty() ? nullptr : dbuf_[slot]; }
+  size_t dbuf_cap() const { return dbuf_cap_; }
+  ibv_mr* dmr(size_t slot) { return dmr_.empty() ? nullptr : dmr_[slot]; }
 
   bool PostRecv(size_t slot);                          // arm recv into rbuf_[slot]
   bool PostSend(size_t slot, size_t len);              // SEND sbuf_[slot][0,len)
@@ -90,11 +99,10 @@ class RcEndpoint {
   // (must belong to `payload_mr` from RegisterUser) — zero copy into the caller.
   bool PostRecvScatter(size_t slot, void* payload, size_t payload_len,
                        ibv_mr* payload_mr, size_t hdr_bytes);
-  // Scatter send (mirror of PostRecvScatter): SGE0 = sbuf_[slot][0,hdr_len) (req
-  // prefix + value header we built), SGE1 = caller `payload` (must belong to
-  // `payload_mr` from RegisterUser) — gathers [prefix|header|payload] into one
-  // wire SEND with zero copy of the payload. Degrades to a 1-SGE send (header
-  // only) when payload_len==0, so payload_mr may be null for empty values.
+  // Scatter send: SGE0 = sbuf_[slot][0,hdr_len), SGE1 = `payload` (must belong to
+  // `payload_mr`). Used by client PUT and server GET to gather a tiny header plus
+  // a registered payload into one wire SEND with zero copy of the payload. Degrades
+  // to a 1-SGE send when payload_len==0, so payload_mr may be null.
   bool PostSendScatter(size_t slot, size_t hdr_len, const void* payload,
                        size_t payload_len, ibv_mr* payload_mr);
 
@@ -121,9 +129,9 @@ class RcEndpoint {
   ibv_mtu mtu_ = IBV_MTU_4096;
   unsigned cq_armed_unacked_ = 0;
 
-  size_t cap_ = 0, depth_ = 0;
-  std::vector<char*> sbuf_, rbuf_;
-  std::vector<ibv_mr*> smr_, rmr_;
+  size_t cap_ = 0, depth_ = 0, dbuf_cap_ = 0;
+  std::vector<char*> sbuf_, rbuf_, dbuf_;
+  std::vector<ibv_mr*> smr_, rmr_, dmr_;
   // Big pre-registered caller regions (the host KV pool). Registered once at
   // connection setup, never evicted; RegisterUser range-looks-up into these.
   struct PoolMr { uintptr_t base; size_t size; ibv_mr* mr; };

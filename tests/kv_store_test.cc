@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 
@@ -59,6 +60,26 @@ TEST_F(KVStoreTest, RangeIntoReadsStraightIntoCallerBuffer) {
   ASSERT_EQ(s.RangeInto(k, 0, v.size(), buf, 4, &got), Status::kOk);
   EXPECT_EQ(got, 4u);
   EXPECT_EQ(std::string(buf, 4), v.substr(0, 4));
+}
+
+TEST_F(KVStoreTest, RangeDirectReturnsSliceInsideAlignedBuffer) {
+  KVStore s(Opts());
+  BlockKey k{333, 0, 1};
+  std::string v(9000, '\0');
+  for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>((i * 13 + 5) & 0xFF);
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+
+  void* raw = nullptr;
+  ASSERT_EQ(posix_memalign(&raw, 4096, 16 * 1024), 0);
+  char* io = static_cast<char*>(raw);
+  const char* data = nullptr;
+  size_t got = 0;
+  ASSERT_EQ(s.RangeDirect(k, 123, 5000, io, 16 * 1024, &data, &got), Status::kOk);
+  EXPECT_EQ(got, 5000u);
+  EXPECT_GE(data, io);
+  EXPECT_LT(data, io + 16 * 1024);
+  EXPECT_EQ(std::string(data, got), v.substr(123, 5000));
+  std::free(raw);
 }
 
 TEST_F(KVStoreTest, RangeMissReturnsNotFoundNoS3) {

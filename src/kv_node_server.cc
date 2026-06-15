@@ -160,6 +160,21 @@ Status KvNodeServer::RangeInto(uint64_t id, uint32_t index, uint32_t ksize,
   return st;
 }
 
+Status KvNodeServer::RangeDirect(uint64_t id, uint32_t index, uint32_t ksize,
+                                 uint64_t offset, uint64_t length, char* io_buf,
+                                 size_t io_cap, const char** out_data,
+                                 size_t* out_len) {
+  BlockKey key{id, index, ksize};
+  Status st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data, out_len);
+  if (st == Status::kOk) {
+    cache_hit_.fetch_add(1, std::memory_order_relaxed);
+    bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
+  } else if (st == Status::kNotFound) {
+    cache_miss_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return st;
+}
+
 // Keep-alive: serve requests on this connection until the peer closes it.
 void KvNodeServer::Handle(int fd) {
   while (running_) {

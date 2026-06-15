@@ -40,6 +40,12 @@ class KVStore {
   // bytes into dst; *out_len = bytes read. NotFound if absent.
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
                    char* dst, size_t dst_cap, size_t* out_len);
+  // O_DIRECT range read into a caller-provided aligned buffer. The disk read may
+  // cover an aligned superset of the requested range; *out_data points inside
+  // io_buf at the exact requested bytes and can be scatter-sent directly.
+  Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
+                     char* io_buf, size_t io_cap, const char** out_data,
+                     size_t* out_len);
   bool IsCached(const BlockKey& key) const;
 
   uint64_t UsedBytes() const;

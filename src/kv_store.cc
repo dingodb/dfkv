@@ -114,21 +114,22 @@ bool WriteFileDirect(const std::string& path, const void* data, size_t len) {
   return true;
 }
 
-// Reads exactly [offset, offset+n) from the already-open O_DIRECT fd into `dst`
-// (n > 0, dst holds >= n bytes). Reads the aligned superset into a bounce buffer
-// and trims out the requested slice. Returns true on success.
-bool PreadRangeDirect(int fd, uint64_t offset, size_t n, char* dst) {
+// Reads the aligned superset of [offset, offset+n) from the already-open
+// O_DIRECT fd into `io_buf` (which must be kDioAlign-aligned). *out_data points
+// inside io_buf at the exact requested slice. Returns true on success.
+bool PreadRangeDirectTo(int fd, uint64_t offset, size_t n, char* io_buf,
+                        size_t io_cap, const char** out_data) {
+  if (!io_buf) return false;
+  if ((reinterpret_cast<uintptr_t>(io_buf) & (kDioAlign - 1)) != 0) return false;
   const uint64_t astart = AlignDown(offset);
   uint64_t aend = 0;
   if (!AlignUp(offset + n, &aend)) return false;  // offset+n can't overflow: both bounded by fsize
   const size_t alen = static_cast<size_t>(aend - astart);
-
-  AlignedBuf buf(alen);
-  if (!buf.valid()) return false;
+  if (alen > io_cap) return false;
 
   size_t total = 0;
   while (total < alen) {
-    ssize_t r = ::pread(fd, buf.data() + total, alen - total,
+    ssize_t r = ::pread(fd, io_buf + total, alen - total,
                         static_cast<off_t>(astart + total));
     if (r < 0) { if (errno == EINTR) continue; return false; }
     if (r == 0) break;  // EOF (the aligned tail can legitimately extend past EOF)
@@ -137,7 +138,24 @@ bool PreadRangeDirect(int fd, uint64_t offset, size_t n, char* dst) {
 
   const size_t head = static_cast<size_t>(offset - astart);
   if (total < head + n) return false;  // file shrank/corrupt under us
-  std::memcpy(dst, buf.data() + head, n);
+  *out_data = io_buf + head;
+  return true;
+}
+
+// Reads exactly [offset, offset+n) from the already-open O_DIRECT fd into `dst`
+// (n > 0, dst holds >= n bytes). Reads the aligned superset into a bounce buffer
+// and trims out the requested slice. Returns true on success.
+bool PreadRangeDirect(int fd, uint64_t offset, size_t n, char* dst) {
+  const uint64_t astart = AlignDown(offset);
+  uint64_t aend = 0;
+  if (!AlignUp(offset + n, &aend)) return false;
+  const size_t alen = static_cast<size_t>(aend - astart);
+
+  AlignedBuf buf(alen);
+  if (!buf.valid()) return false;
+  const char* data = nullptr;
+  if (!PreadRangeDirectTo(fd, offset, n, buf.data(), alen, &data)) return false;
+  std::memcpy(dst, data, n);
   return true;
 }
 
@@ -283,6 +301,38 @@ Status KVStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
   if (n == 0) return Status::kOk;  // *out_len already 0
   if (!PreadRangeDirect(fd.get(), offset, static_cast<size_t>(n), dst))
     return Status::kIOError;
+  *out_len = static_cast<size_t>(n);
+  return Status::kOk;
+}
+
+Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
+                            char* io_buf, size_t io_cap, const char** out_data,
+                            size_t* out_len) {
+  *out_data = nullptr;
+  *out_len = 0;
+  Fd fd;
+  uint64_t fsize = 0;
+  {  // index lookup + open under the lock; bulk read outside (see Range)
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::string fname = key.Filename();
+    auto it = index_.find(fname);
+    if (it == index_.end()) return Status::kNotFound;
+    fd.reset(::open(it->second.path.c_str(), O_RDONLY | O_DIRECT));
+    if (!fd.valid()) return Status::kIOError;
+    fsize = it->second.size;
+    TouchLocked(fname);
+  }
+  if (offset > fsize) return Status::kInvalid;
+  uint64_t n = length;
+  if (n > fsize - offset) n = fsize - offset;
+  if (n == 0) {
+    *out_data = io_buf;
+    return Status::kOk;
+  }
+  const char* data = nullptr;
+  if (!PreadRangeDirectTo(fd.get(), offset, static_cast<size_t>(n), io_buf, io_cap, &data))
+    return Status::kIOError;
+  *out_data = data;
   *out_len = static_cast<size_t>(n);
   return Status::kOk;
 }
