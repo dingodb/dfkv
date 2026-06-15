@@ -1,6 +1,6 @@
 # dfkv — distributed KV cache for SGLang HiCache
 
-[![CI](https://github.com/ketor/dfkv/actions/workflows/ci.yml/badge.svg)](https://github.com/ketor/dfkv/actions/workflows/ci.yml)
+[![CI](https://github.com/dingodb/dfkv/actions/workflows/ci.yml/badge.svg)](https://github.com/dingodb/dfkv/actions/workflows/ci.yml)
 
 A small, **self-contained** distributed key-value cache that plugs into SGLang's
 HiCache as its L3 external KV store. Built to pool GPU-node NVMe SSDs into a
