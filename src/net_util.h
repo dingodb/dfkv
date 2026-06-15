@@ -1,6 +1,7 @@
-/* Minimal POSIX TCP + little-endian codec helpers for the portable test
- * transport. The real build uses brpc; this is only for the standalone,
- * GPU-free end-to-end harness. */
+/* Minimal POSIX TCP + integer codec helpers for the portable test transport.
+ * The codec is host-endian (raw memcpy, no byte-swap): it is correct only
+ * between same-endianness peers, which holds for all current x86_64 deploys.
+ * The real build uses brpc; this is only for the standalone, GPU-free harness. */
 #ifndef DFKV_NET_UTIL_H_
 #define DFKV_NET_UTIL_H_
 
@@ -49,6 +50,7 @@ inline bool ReadAll(int fd, void* buf, size_t n) {
   return true;
 }
 
+// host-endian (native byte order via memcpy); see file header for the caveat.
 inline void PutU64(char* p, uint64_t v) { std::memcpy(p, &v, 8); }
 inline void PutU32(char* p, uint32_t v) { std::memcpy(p, &v, 4); }
 inline uint64_t GetU64(const char* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }

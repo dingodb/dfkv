@@ -45,17 +45,17 @@ dfkv_client_t dfkv_open(const char* members, uint64_t model_hash,
 }
 
 int dfkv_put(dfkv_client_t c, const char* key, const void* ptr, uint64_t n) {
-  if (!c) return -1;
+  if (!c || !key) return -1;  // key is wrapped in std::string -> must be non-null
   return static_cast<KVClient*>(c)->Put(key, ptr, static_cast<size_t>(n)) ? 0 : -1;
 }
 
 int dfkv_get(dfkv_client_t c, const char* key, void* ptr, uint64_t n) {
-  if (!c) return 0;
+  if (!c || !key) return 0;  // 0 == miss; null key can't construct std::string
   return static_cast<KVClient*>(c)->Get(key, ptr, static_cast<size_t>(n)) ? 1 : 0;
 }
 
 int dfkv_exist(dfkv_client_t c, const char* key) {
-  if (!c) return 0;
+  if (!c || !key) return 0;
   return static_cast<KVClient*>(c)->Exist(key) ? 1 : 0;
 }
 
@@ -66,34 +66,48 @@ int dfkv_register_memory(dfkv_client_t c, const void* base, uint64_t size) {
   return 0;
 }
 
+// The batch entrypoints take caller-owned C arrays. We validate the array
+// pointers up front (null with n>0 => bad call) and tolerate a null element:
+// a null keys[i] is substituted with an empty item so BatchPut/Get stays index-
+// aligned, and that slot is reported as failed (out[i]=0) instead of feeding a
+// null into std::string() (undefined behavior across the FFI boundary).
 int dfkv_batch_put(dfkv_client_t c, const char** keys, const void** ptrs,
                    const uint64_t* sizes, int n, int* out_ok) {
   if (!c || n < 0) return -1;
+  if (n > 0 && (!keys || !ptrs || !sizes || !out_ok)) return -1;
   std::vector<dfkv::KvPutItem> items(n);
-  for (int i = 0; i < n; ++i)
-    items[i] = {keys[i], ptrs[i], static_cast<size_t>(sizes[i])};
+  for (int i = 0; i < n; ++i) {
+    const char* k = keys[i];
+    items[i] = {k ? std::string(k) : std::string(), k ? ptrs[i] : nullptr,
+                k ? static_cast<size_t>(sizes[i]) : 0};
+  }
   auto r = static_cast<KVClient*>(c)->BatchPut(items);
-  for (int i = 0; i < n; ++i) out_ok[i] = r[i] ? 1 : 0;
+  for (int i = 0; i < n; ++i) out_ok[i] = (keys[i] && r[i]) ? 1 : 0;
   return 0;
 }
 
 int dfkv_batch_get(dfkv_client_t c, const char** keys, void** ptrs,
                    const uint64_t* sizes, int n, int* out_hit) {
   if (!c || n < 0) return -1;
+  if (n > 0 && (!keys || !ptrs || !sizes || !out_hit)) return -1;
   std::vector<dfkv::KvGetItem> items(n);
-  for (int i = 0; i < n; ++i)
-    items[i] = {keys[i], ptrs[i], static_cast<size_t>(sizes[i])};
+  for (int i = 0; i < n; ++i) {
+    const char* k = keys[i];
+    items[i] = {k ? std::string(k) : std::string(), k ? ptrs[i] : nullptr,
+                k ? static_cast<size_t>(sizes[i]) : 0};
+  }
   auto r = static_cast<KVClient*>(c)->BatchGet(items);
-  for (int i = 0; i < n; ++i) out_hit[i] = r[i] ? 1 : 0;
+  for (int i = 0; i < n; ++i) out_hit[i] = (keys[i] && r[i]) ? 1 : 0;
   return 0;
 }
 
 int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist) {
   if (!c || n < 0) return -1;
+  if (n > 0 && (!keys || !out_exist)) return -1;
   std::vector<std::string> ks(n);
-  for (int i = 0; i < n; ++i) ks[i] = keys[i];
+  for (int i = 0; i < n; ++i) ks[i] = keys[i] ? std::string(keys[i]) : std::string();
   auto r = static_cast<KVClient*>(c)->BatchExist(ks);
-  for (int i = 0; i < n; ++i) out_exist[i] = r[i] ? 1 : 0;
+  for (int i = 0; i < n; ++i) out_exist[i] = (keys[i] && r[i]) ? 1 : 0;
   return 0;
 }
 

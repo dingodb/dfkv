@@ -11,7 +11,7 @@
 
 #include "kv_store.h"   // Status
 #include "kv_types.h"   // BlockKey
-#include "net_util.h"   // net::PutU32/PutU64/GetU32/GetU64 (little-endian)
+#include "net_util.h"   // net::PutU32/PutU64/GetU32/GetU64 (host-endian codec)
 
 namespace dfkv {
 
@@ -25,6 +25,14 @@ enum class WireOp : uint8_t {
 };
 
 constexpr uint8_t kProtoVersion = 1;
+
+// Hard ceiling on a single wire frame's variable payload. Decode rejects any
+// frame whose declared length exceeds this, so a garbage/hostile 64-bit length
+// (a version skew, corruption, or a hostile peer) can't drive a multi-exabyte
+// std::vector/std::string allocation -> bad_alloc/OOM that kills the process.
+// No real dfkv frame (one KV block value, or a stats/membership blob) comes
+// anywhere near 16 GiB; callers that know a tighter bound pass it explicitly.
+constexpr uint64_t kMaxFrameLen = 1ull << 34;  // 16 GiB
 
 // Request prefix: ver(1) op(1) id(8) index(4) size(4) offset(8) length(8) payload_len(8)
 constexpr size_t kReqPrefix = 1 + 1 + 8 + 4 + 4 + 8 + 8 + 8;  // = 42
@@ -53,8 +61,12 @@ struct ReqFields {
   uint64_t payload_len;
 };
 
-// Returns false on a protocol-version mismatch (caller drops the connection).
-inline bool DecodeReq(const char* p, ReqFields* o) {
+// Returns false on a protocol-version mismatch or an oversized declared payload
+// (> max_payload); the caller drops the connection in either case. max_payload
+// defaults to the global frame ceiling, so every caller is guarded even without
+// passing a tighter bound.
+inline bool DecodeReq(const char* p, ReqFields* o,
+                      uint64_t max_payload = kMaxFrameLen) {
   if (static_cast<uint8_t>(p[0]) != kProtoVersion) return false;
   o->op = static_cast<uint8_t>(p[1]);
   o->id = net::GetU64(p + 2);
@@ -63,6 +75,7 @@ inline bool DecodeReq(const char* p, ReqFields* o) {
   o->offset = net::GetU64(p + 18);
   o->length = net::GetU64(p + 26);
   o->payload_len = net::GetU64(p + 34);
+  if (o->payload_len > max_payload) return false;  // reject oversized frame
   return true;
 }
 
@@ -72,10 +85,12 @@ inline void EncodeResp(char* p, Status st, uint64_t data_len) {
   net::PutU64(p + 2, data_len);
 }
 
-inline bool DecodeResp(const char* p, Status* st, uint64_t* data_len) {
+inline bool DecodeResp(const char* p, Status* st, uint64_t* data_len,
+                       uint64_t max_data = kMaxFrameLen) {
   if (static_cast<uint8_t>(p[0]) != kProtoVersion) return false;
   *st = static_cast<Status>(static_cast<uint8_t>(p[1]));
   *data_len = net::GetU64(p + 2);
+  if (*data_len > max_data) return false;  // reject oversized frame
   return true;
 }
 

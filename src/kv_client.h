@@ -1,9 +1,12 @@
 /* KVClient — the standalone DingoFS KV cache client used by the SGLang HiCache
  * plugin. Routes keys via consistent hash, wraps values with a ValueHeader
- * (model/page/dtype/layer + CRC), and speaks to cache nodes via a Transport.
+ * (model/page/dtype/layer geometry), and speaks to cache nodes via a Transport.
  *  - Put  -> SyncCache (durable-visible write, header-wrapped)
- *  - Get  -> Range + header/CRC verify (mismatch or corruption => miss)
- *  - Exist-> local existence check on the owning node */
+ *  - Get  -> Range + header geometry verify (mismatch => miss)
+ *  - Exist-> local existence check on the owning node
+ * NOTE: the header carries geometry, not a payload checksum (CRC was dropped in
+ * v3). A geometry mismatch is caught, but silent payload bit-rot on the wire/disk
+ * is not detected here — we rely on the underlying transport/filesystem. */
 #ifndef DFKV_KV_CLIENT_H_
 #define DFKV_KV_CLIENT_H_
 

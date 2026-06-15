@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-#include "net_util.h"  // net::PutU32/PutU64/GetU32/GetU64 (little-endian)
+#include "net_util.h"  // net::PutU32/PutU64/GetU32/GetU64 (host-endian codec)
 
 namespace dfkv {
 
@@ -22,8 +22,9 @@ struct MemberInfo {
 
 // Wire format for a membership view. Register payload = 1 member; ListMembers
 // response = N members + the epoch (etcd revision) clients compare to skip
-// rebuilding an unchanged ring. Layout (little-endian via net::):
+// rebuilding an unchanged ring. Layout (host-endian via net::):
 //   epoch u64 | count u32 | repeat{ idlen u32, id, iplen u32, ip, port u32, weight u32 }
+// (host-endian via net::; correct between same-endianness peers — see net_util.h)
 inline std::string EncodeMembers(const std::vector<MemberInfo>& ms,
                                  uint64_t epoch) {
   std::string out;

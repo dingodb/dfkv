@@ -76,7 +76,13 @@ install(TARGETS dfkv dfkv_server dfkv_mds dfkv_smoke dfkvctl dfkv_bench dfkv_dis
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY src/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dfkv FILES_MATCHING PATTERN "*.h")
-install(FILES python/dfkv_hicache.py DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python)
+# dfkv_hicache.py imports dfkv_access_log and dfkv_metrics at module load, so all
+# three must ship together or an installed plugin fails with ImportError.
+install(FILES
+  python/dfkv_hicache.py
+  python/dfkv_access_log.py
+  python/dfkv_metrics.py
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python)
 
 # --- tests ---
 if(DFKV_BUILD_TESTS)
