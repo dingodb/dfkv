@@ -38,6 +38,7 @@ endif()
 
 add_library(dfkv_core STATIC ${DFKV_SRCS})
 target_include_directories(dfkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(dfkv_core PRIVATE _GNU_SOURCE)  # O_DIRECT/fallocate in kv_store.cc
 find_package(Threads REQUIRED)
 target_link_libraries(dfkv_core PUBLIC Threads::Threads)
 if(DFKV_WITH_RDMA)
@@ -48,6 +49,7 @@ endif()
 # C ABI shared lib for the Python (ctypes) plugin
 add_library(dfkv SHARED ${DFKV_SRCS})
 target_include_directories(dfkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(dfkv PRIVATE _GNU_SOURCE)  # O_DIRECT/fallocate in kv_store.cc
 target_link_libraries(dfkv PUBLIC Threads::Threads)
 if(DFKV_WITH_RDMA)
   target_compile_definitions(dfkv PUBLIC DFKV_WITH_RDMA)
