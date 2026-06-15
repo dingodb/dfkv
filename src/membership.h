@@ -1,6 +1,7 @@
 #ifndef DFKV_MEMBERSHIP_H_
 #define DFKV_MEMBERSHIP_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -68,6 +69,32 @@ inline bool DecodeMembers(const char* p, size_t n,
     out->push_back(std::move(m));
   }
   return true;
+}
+
+// Content epoch for a membership view: an order-independent 64-bit hash of the
+// member SET. Clients compare it to decide whether to rebuild their ring. The
+// MDS uses this instead of etcd's global revision, which bumps on ANY cluster
+// write (other groups too) and would trigger needless full-ring rebuilds. Sorting
+// by id makes the hash canonical regardless of etcd's return order; hashing every
+// field means a content-only change (e.g. an ip/weight edit) still bumps the epoch.
+inline uint64_t MembersEpoch(std::vector<MemberInfo> ms) {
+  std::sort(ms.begin(), ms.end(), [](const MemberInfo& a, const MemberInfo& b) {
+    return a.id < b.id;
+  });
+  uint64_t h = 1469598103934665603ull;  // FNV-1a 64-bit offset basis
+  auto mix = [&h](const void* p, size_t n) {
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+  };
+  for (const auto& m : ms) {
+    uint32_t idn = static_cast<uint32_t>(m.id.size());
+    uint32_t ipn = static_cast<uint32_t>(m.ip.size());
+    mix(&idn, 4); mix(m.id.data(), m.id.size());  // length-prefixed: no field-boundary ambiguity
+    mix(&ipn, 4); mix(m.ip.data(), m.ip.size());
+    mix(&m.port, sizeof(m.port));
+    mix(&m.weight, sizeof(m.weight));
+  }
+  return h;
 }
 
 }  // namespace dfkv

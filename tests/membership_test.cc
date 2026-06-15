@@ -33,3 +33,39 @@ TEST(MembershipCodec, RejectsTruncated) {
     EXPECT_FALSE(DecodeMembers(buf.data(), cut, &got, &epoch)) << "cut=" << cut;
   EXPECT_TRUE(DecodeMembers(buf.data(), buf.size(), &got, &epoch));  // full = ok
 }
+
+TEST(MembersEpoch, OrderIndependentAndContentSensitive) {
+  std::vector<MemberInfo> a = {
+      {"n1", "10.0.0.1", 28000, 1},
+      {"n2", "10.0.0.2", 28000, 3},
+      {"n3", "10.0.0.3", 28000, 1},
+  };
+  std::vector<MemberInfo> reordered = {a[2], a[0], a[1]};
+  EXPECT_EQ(MembersEpoch(a), MembersEpoch(reordered)) << "order must not matter";
+
+  // Removing a member changes the epoch.
+  std::vector<MemberInfo> fewer = {a[0], a[1]};
+  EXPECT_NE(MembersEpoch(a), MembersEpoch(fewer));
+
+  // A content-only change (same ids) changes the epoch.
+  std::vector<MemberInfo> b = a;
+  b[1].weight = 7;  // was 3
+  EXPECT_NE(MembersEpoch(a), MembersEpoch(b));
+  std::vector<MemberInfo> c = a;
+  c[0].ip = "10.0.0.9";
+  EXPECT_NE(MembersEpoch(a), MembersEpoch(c));
+  std::vector<MemberInfo> d = a;
+  d[2].port = 28001;
+  EXPECT_NE(MembersEpoch(a), MembersEpoch(d));
+
+  // Stable across calls; empty set is deterministic.
+  EXPECT_EQ(MembersEpoch(a), MembersEpoch(a));
+  EXPECT_EQ(MembersEpoch({}), MembersEpoch({}));
+}
+
+TEST(MembersEpoch, NoFieldBoundaryCollision) {
+  // Length-prefixing must prevent "ab"+"c" hashing the same as "a"+"bc".
+  std::vector<MemberInfo> x = {{"ab", "c", 0, 0}};
+  std::vector<MemberInfo> y = {{"a", "bc", 0, 0}};
+  EXPECT_NE(MembersEpoch(x), MembersEpoch(y));
+}
