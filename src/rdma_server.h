@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -50,9 +51,24 @@ class RdmaServer {
   void Stop();
   int port() const { return port_; }
 
+  // Observability (used by tests): number of Serve threads not yet reaped.
+  // Bounded under churn now that finished connections are joined as new ones
+  // arrive — previously this grew without bound until Stop().
+  size_t live_conn_count();
+
  private:
   void AcceptLoop();
   void Serve(int boot_fd);
+  void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
+
+  // A live connection: its Serve thread plus a flag the thread sets (last thing
+  // it does) so AcceptLoop can tell it has finished and join it without blocking.
+  // The flag is a shared_ptr because conns_ reallocates on push_back — the thread
+  // captures its own copy, so the atomic outlives any vector move/erase.
+  struct Conn {
+    std::thread th;
+    std::shared_ptr<std::atomic<bool>> done;
+  };
 
   Handler handler_;
   RangeHandler range_handler_;
@@ -63,9 +79,10 @@ class RdmaServer {
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
   // Track per-connection Serve threads + their endpoints so Stop() can wake them
-  // out of WaitComp and join them before the handler's owner is destroyed.
+  // out of WaitComp and join them before the handler's owner is destroyed, and
+  // so finished threads are reaped incrementally (see ReapDoneLocked).
   std::mutex conn_mu_;
-  std::vector<std::thread> conn_threads_;
+  std::vector<Conn> conns_;
   std::unordered_set<rdma::RcEndpoint*> live_eps_;
 };
 

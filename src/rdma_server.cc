@@ -59,13 +59,33 @@ void RdmaServer::Stop() {
   if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
   // Wake every in-flight Serve thread out of WaitComp, then join them all so no
   // handler call can race the owner's destruction after Stop() returns.
-  std::vector<std::thread> threads;
+  std::vector<Conn> conns;
   {
     std::lock_guard<std::mutex> lk(conn_mu_);
     for (rdma::RcEndpoint* ep : live_eps_) ep->Wake();
-    threads.swap(conn_threads_);
+    conns.swap(conns_);
   }
-  for (auto& t : threads) if (t.joinable()) t.join();
+  for (auto& c : conns) if (c.th.joinable()) c.th.join();
+}
+
+// Join and drop any Serve threads that have already finished. Called from
+// AcceptLoop under conn_mu_; only threads whose `done` is set are touched, and a
+// thread sets `done` only after its final conn_mu_ release, so join() never
+// blocks here. This keeps conns_ bounded by the live (not lifetime) conn count.
+void RdmaServer::ReapDoneLocked() {
+  for (auto it = conns_.begin(); it != conns_.end();) {
+    if (it->done->load(std::memory_order_acquire)) {
+      if (it->th.joinable()) it->th.join();
+      it = conns_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+size_t RdmaServer::live_conn_count() {
+  std::lock_guard<std::mutex> lk(conn_mu_);
+  return conns_.size();
 }
 
 void RdmaServer::AcceptLoop() {
@@ -78,7 +98,13 @@ void RdmaServer::AcceptLoop() {
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));  // can't hang Stop()
     std::lock_guard<std::mutex> lk(conn_mu_);
     if (!running_) { ::close(fd); break; }
-    conn_threads_.emplace_back([this, fd] { Serve(fd); });
+    ReapDoneLocked();  // reap connections that finished since the last accept
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    conns_.push_back({std::thread([this, fd, done] {
+                        Serve(fd);
+                        done->store(true, std::memory_order_release);  // last act
+                      }),
+                      done});
   }
 }
 
@@ -90,6 +116,26 @@ size_t ServerDepth() {
   const char* e = std::getenv("DFKV_RDMA_DEPTH");
   if (e && *e) { long v = std::strtol(e, nullptr, 10); if (v >= 1 && v <= 256) return (size_t)v; }
   return 1;
+}
+
+int ServerIdleMs() {
+  // Per-connection idle timeout. A connection with no completions for this long
+  // is reclaimed: its Serve thread returns (freeing the QP, pinned buffers, and
+  // the thread itself, which ReapDoneLocked then joins). Without this, a Serve
+  // thread blocks in WaitComp forever after a silent client disconnect (a torn-
+  // down RC peer yields no completion), so a long-running server accumulates one
+  // live thread per lifetime connection. Reclaiming idle connections is safe:
+  // the client re-dials a stale pooled connection via RdmaTransport's 2-attempt
+  // retry. Default 10 min keeps active/recently-used pooled conns alive; set
+  // DFKV_RDMA_IDLE_MS=0 to disable (block forever, the legacy behavior).
+  const char* e = std::getenv("DFKV_RDMA_IDLE_MS");
+  if (e && *e) {
+    long v = std::strtol(e, nullptr, 10);
+    if (v <= 0) return -1;               // disabled => block forever
+    if (v > 86400000) v = 86400000;      // clamp to 24h
+    return static_cast<int>(v);
+  }
+  return 600000;  // 10 minutes
 }
 
 }  // namespace
@@ -200,9 +246,10 @@ void RdmaServer::Serve(int boot_fd) {
   // it broke zero-copy correctness for marginal gain; GET scales via connections.)
   std::vector<ibv_wc> wcs(K);
   bool fail = false;
+  const int idle_ms = ServerIdleMs();
   while (running_ && !fail) {
-    int g = ep.WaitComp(wcs.data(), static_cast<int>(K));
-    if (g <= 0) break;
+    int g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
+    if (g <= 0) break;  // <0: error / Stop()'s Wake().  0: idle_ms elapsed -> reclaim.
     for (int w = 0; w < g && !fail; ++w) {
       const ibv_wc& wc = wcs[w];
       if (wc.status != IBV_WC_SUCCESS) { fail = true; break; }

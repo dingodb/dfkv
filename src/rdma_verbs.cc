@@ -365,7 +365,7 @@ bool RcEndpoint::PostRecvScatter(size_t slot, void* payload, size_t payload_len,
   return ibv_post_recv(qp_, &wr, &bad) == 0;
 }
 
-int RcEndpoint::WaitComp(ibv_wc* out, int max) {
+int RcEndpoint::WaitComp(ibv_wc* out, int max, int timeout_ms) {
   for (;;) {
     int got = ibv_poll_cq(cq_, max, out);
     if (got != 0) return got;  // >0 completions, or <0 error
@@ -376,8 +376,10 @@ int RcEndpoint::WaitComp(ibv_wc* out, int max) {
     got = ibv_poll_cq(cq_, max, out);
     if (got != 0) return got;
     pollfd pfds[2] = {{chan_->fd, POLLIN, 0}, {wake_rfd_, POLLIN, 0}};
-    int pr = ::poll(pfds, 2, -1);
+    int pr = ::poll(pfds, 2, timeout_ms);
     if (pr < 0) { if (errno == EINTR) continue; return -1; }
+    if (pr == 0)  // timed out (finite timeout_ms): one last poll, else 0 = idle.
+      return ibv_poll_cq(cq_, max, out);
     if (pfds[1].revents & POLLIN) return -1;  // woken for shutdown
     if (pfds[0].revents & POLLIN) {
       ibv_cq* ev_cq = nullptr; void* ev_ctx = nullptr;

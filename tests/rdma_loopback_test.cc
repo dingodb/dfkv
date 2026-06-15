@@ -13,11 +13,13 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -42,7 +44,7 @@ struct RdmaNode {
   std::unique_ptr<RdmaServer> rsrv;
   std::string addr;  // bootstrap "ip:port" for the client member list
 
-  explicit RdmaNode(const std::string& tag) {
+  explicit RdmaNode(const std::string& tag, size_t max_msg = kMaxMsg) {
     dir = fs::temp_directory_path() / ("dfkv_rdma_" + tag);
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -53,7 +55,7 @@ struct RdmaNode {
                uint64_t len, const char* pl, uint64_t pll, std::string* out) {
           return srv->ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
         },
-        kMaxMsg);
+        max_msg);
     rsrv->set_range_handler(
         [this](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
                char* io_buf, size_t cap, const char** out_data, size_t* out_len) {
@@ -273,4 +275,50 @@ TEST(RdmaLoopback, PipelinedPoolDepth) {
 
   ::unsetenv("DFKV_RDMA_DEPTH");
   ::unsetenv("DFKV_RDMA_WORKERS");
+}
+
+// Regression for the conn-thread leak (#3). A server Serve thread blocks in
+// WaitComp forever after a silent client disconnect (a torn-down RC peer yields
+// no completion), so without an idle timeout a long-running server accumulates
+// one live thread per lifetime connection — Stop() is the only reaper. The fix:
+// an idle timeout reclaims the connection (the thread returns), and ReapDoneLocked
+// joins the finished thread on the next accept. This test sets a short idle window
+// and verifies the live count drains back to the baseline; without the fix it
+// would stay pinned near N and time out.
+TEST(RdmaLoopback, ReclaimsAndReapsIdleConnThreads) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_IDLE_MS", "120", 1);  // reclaim idle conns fast (test only)
+  constexpr size_t kSmallMsg = 16 * 1024;   // stay well under an 8 MiB memlock
+  RdmaNode node("reap", kSmallMsg);          // server buffers must be small too
+  // One long-lived client endpoint holds the shared per-device ibv_context open
+  // (its server side may be reclaimed when idle and is transparently re-dialed).
+  RdmaTransport keep(kSmallMsg);
+  KVClient ckeep({{"n", node.addr}}, SelfHdr(), &keep);
+  std::string kk(64, 'k');
+  ASSERT_TRUE(ckeep.Put("keep", kk.data(), kk.size()));
+
+  const int N = 30;
+  for (int i = 0; i < N; ++i) {
+    RdmaTransport rt(kSmallMsg);
+    KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+    std::string v(512, static_cast<char>(i & 0xFF));
+    ASSERT_TRUE(c.Put("k" + std::to_string(i), v.data(), v.size())) << "i=" << i;
+    // rt + c leave scope here -> transient client gone -> server conn goes idle.
+  }
+
+  // Each round: wait past the idle window so every prior connection's Serve thread
+  // has exited, then make ONE connection whose accept runs ReapDoneLocked to join
+  // all the finished threads. Only that single in-flight drain thread should then
+  // remain. Without reclaim+reap the N transient threads stay in conns_ and the
+  // count never falls (the loop exhausts its rounds and the assert fails).
+  size_t live = 0;
+  for (int round = 0; round < 6; ++round) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));  // > idle (120 ms)
+    { RdmaTransport rt(kSmallMsg); KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+      std::string v(16, 'x'); c.Put("drain", v.data(), v.size()); }
+    live = node.rsrv->live_conn_count();
+    if (live <= 2) break;
+  }
+  EXPECT_LE(live, 2u) << "idle conn threads were not reclaimed + reaped (leak)";
+  ::unsetenv("DFKV_RDMA_IDLE_MS");
 }

@@ -109,7 +109,10 @@ class RcEndpoint {
   // Block until at least one completion, drain up to `max` into out[]; returns
   // the count (>0), or <0 on error / when Wake() is called. wr_id of each wc =
   // the slot. Used for single round-trips (max=1) and pipelined batches.
-  int WaitComp(ibv_wc* out, int max);
+  // timeout_ms < 0 blocks forever (the default, used by the client). A finite
+  // timeout returns 0 if no completion arrives in that window — the server uses
+  // it to reclaim an idle/abandoned connection instead of blocking indefinitely.
+  int WaitComp(ibv_wc* out, int max, int timeout_ms = -1);
   // Unblock a thread sitting in WaitComp (so the server can join its Serve
   // threads at shutdown). Thread-safe vs the waiter.
   void Wake();
