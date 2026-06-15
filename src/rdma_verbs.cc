@@ -5,12 +5,73 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
 
 #include "net_util.h"   // PutU32/GetU32/PutU64 little-endian codec
 #include "numa_util.h"  // best-effort NUMA buffer placement
 
 namespace dfkv {
 namespace rdma {
+
+namespace {
+// Per-device shared ibv_context + PD, refcounted across all RcEndpoints on the
+// same device. WHY: opening one ibv_context per connection (ibv_open_device is a
+// heavy uverbs/kernel-context allocation) thrashes and stalls at high fan-out
+// (~96 concurrent connections hung bench at t32+). The data path only needs a
+// QP/CQ per connection; the context+PD are safely shared (MRs on a shared PD are
+// usable by any QP on it). After the first connection opens a device, all others
+// reuse it -- no further ibv_open_device. Keyed by device name (multi-rail rails
+// are distinct devices -> distinct shared entries, which is correct).
+struct SharedDevice { ibv_context* ctx; ibv_pd* pd; long refs; };
+std::mutex g_dev_mu;
+std::unordered_map<std::string, SharedDevice> g_devs;
+
+// Get-or-open the shared {ctx, pd} for `dev_name` (nullptr/"" = first device),
+// bumping its refcount. Returns {nullptr,nullptr} on failure (no refcount taken).
+std::pair<ibv_context*, ibv_pd*> AcquireSharedDevice(const char* dev_name) {
+  const std::string key = (dev_name && *dev_name) ? std::string(dev_name) : std::string("\x01first");
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  auto it = g_devs.find(key);
+  if (it != g_devs.end()) { ++it->second.refs; return {it->second.ctx, it->second.pd}; }
+  int n = 0;
+  ibv_device** list = ibv_get_device_list(&n);
+  if (!list || n == 0) { if (list) ibv_free_device_list(list); return {nullptr, nullptr}; }
+  ibv_device* dev = nullptr;
+  if (dev_name && *dev_name) {
+    for (int i = 0; i < n; ++i)
+      if (std::strcmp(ibv_get_device_name(list[i]), dev_name) == 0) { dev = list[i]; break; }
+  } else {
+    dev = list[0];
+  }
+  if (!dev) { ibv_free_device_list(list); return {nullptr, nullptr}; }
+  ibv_context* ctx = ibv_open_device(dev);
+  ibv_free_device_list(list);
+  if (!ctx) return {nullptr, nullptr};
+  ibv_pd* pd = ibv_alloc_pd(ctx);
+  if (!pd) { ibv_close_device(ctx); return {nullptr, nullptr}; }
+  g_devs.emplace(key, SharedDevice{ctx, pd, 1});
+  return {ctx, pd};
+}
+
+// Drop one reference; when the last RcEndpoint on a device closes, free its PD
+// then context. No-op for nullptr (failed Open).
+void ReleaseSharedDevice(ibv_context* ctx) {
+  if (!ctx) return;
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  for (auto it = g_devs.begin(); it != g_devs.end(); ++it) {
+    if (it->second.ctx != ctx) continue;
+    if (--it->second.refs == 0) {
+      ibv_dealloc_pd(it->second.pd);
+      ibv_close_device(it->second.ctx);
+      g_devs.erase(it);
+    }
+    return;
+  }
+}
+}  // namespace
 
 void SerializeQpInfo(const QpInfo& in, char out[kQpInfoBytes]) {
   std::memset(out, 0, kQpInfoBytes);
@@ -46,8 +107,9 @@ void RcEndpoint::Close() {
   sbuf_.clear(); rbuf_.clear();
   if (cq_) { ibv_destroy_cq(cq_); cq_ = nullptr; }
   if (chan_) { ibv_destroy_comp_channel(chan_); chan_ = nullptr; }
-  if (pd_) { ibv_dealloc_pd(pd_); pd_ = nullptr; }
-  if (ctx_) { ibv_close_device(ctx_); ctx_ = nullptr; }
+  // ctx_ + pd_ are borrowed from the shared per-device registry; drop our ref
+  // (frees them only when the last connection on this device closes).
+  if (ctx_) { ReleaseSharedDevice(ctx_); ctx_ = nullptr; pd_ = nullptr; }
   if (wake_rfd_ >= 0) { ::close(wake_rfd_); wake_rfd_ = -1; }
   if (wake_wfd_ >= 0) { ::close(wake_wfd_); wake_wfd_ = -1; }
 }
@@ -60,23 +122,15 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   ::fcntl(wp[0], F_SETFL, O_NONBLOCK);
   wake_rfd_ = wp[0]; wake_wfd_ = wp[1];
 
-  int n = 0;
-  ibv_device** list = ibv_get_device_list(&n);
-  if (!list || n == 0) { if (list) ibv_free_device_list(list); return false; }
-  ibv_device* dev = nullptr;
-  if (dev_name && *dev_name) {
-    for (int i = 0; i < n; ++i)
-      if (std::strcmp(ibv_get_device_name(list[i]), dev_name) == 0) { dev = list[i]; break; }
-  } else {
-    dev = list[0];
-  }
-  if (!dev) { ibv_free_device_list(list); return false; }
-  ctx_ = ibv_open_device(dev);
-  ibv_free_device_list(list);
-  if (!ctx_) return false;
+  // Shared per-device ibv_context + PD (refcounted): the first connection on a
+  // device opens it, the rest reuse it -- avoids the per-connection
+  // ibv_open_device thrash that stalled high fan-out. Only the QP/CQ/MRs below
+  // are per-connection.
+  auto shared = AcquireSharedDevice(dev_name);
+  ctx_ = shared.first;
+  pd_ = shared.second;
+  if (!ctx_ || !pd_) { Close(); return false; }
 
-  pd_ = ibv_alloc_pd(ctx_);
-  if (!pd_) { Close(); return false; }
   chan_ = ibv_create_comp_channel(ctx_);
   if (!chan_) { Close(); return false; }
   int cqe = static_cast<int>(depth_ * 2 + 4);

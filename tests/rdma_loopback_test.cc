@@ -156,6 +156,27 @@ TEST(RdmaLoopback, SingleZeroCopyPutGet) {
 // inside it resolves to that one MR with no per-op ibv_reg_mr. Verified directly
 // at the endpoint: two distinct sub-buffers return the SAME MR; an outside buffer
 // registers ad-hoc (a different MR).
+// Many endpoints on the same device must all Open via the shared per-device
+// ibv_context+PD registry (#6 fix: no per-connection ibv_open_device thrash).
+// Opening + closing N in waves exercises the refcount get-or-create/free path;
+// a leak or double-free here would surface as an Open failure or crash.
+TEST(RdmaLoopback, ManyEndpointsShareDeviceContext) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  constexpr int N = 24;  // > typical t16; well past the 1-2 conn happy path
+  {
+    std::vector<std::unique_ptr<rdma::RcEndpoint>> eps;
+    for (int i = 0; i < N; ++i) {
+      eps.push_back(std::make_unique<rdma::RcEndpoint>());
+      ASSERT_TRUE(eps.back()->Open(nullptr, 64 * 1024, 1)) << "endpoint " << i;
+    }
+    eps.clear();  // all close -> registry refcount returns to 0, frees ctx+pd
+  }
+  // A fresh endpoint after the registry drained must still open (re-creates the
+  // shared device cleanly).
+  rdma::RcEndpoint again;
+  ASSERT_TRUE(again.Open(nullptr, 64 * 1024, 1));
+}
+
 TEST(RdmaLoopback, PoolMrSharedAcrossBuffers) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   rdma::RcEndpoint ep;
