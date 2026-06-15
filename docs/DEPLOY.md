@@ -37,6 +37,13 @@ ldd build/dfkv_server | grep ibverbs                      # 确认链接了 RDMA
 依赖：`libibverbs-dev`（构建期）+ 运行节点装 `rdma-core`。无 RDMA 也可去掉 `-DDFKV_WITH_RDMA` 构建纯 TCP 版。
 > QP 信息走 TCP bootstrap 交换（非 librdmacm），所以只依赖 libibverbs，不需要 librdmacm。
 
+> ⚠️ **glibc 下限 = 构建机的 glibc**。在新发行版（如 Ubuntu 24.04 / glibc 2.39）上构建的二进制，拿到老节点（glibc 2.35）会 `version GLIBC_2.3x not found` 起不来。
+> **要部署到 glibc 2.35 的节点（如 hd03 GPU 节点），就在 glibc ≤ 2.35 的环境构建**（Ubuntu 22.04 / RHEL9）。仓库根的 `Dockerfile` 已固定 `ubuntu:22.04` + RDMA + 静态 libstdc++，**一次构建、glibc≥2.35 处处可跑**：
+> ```bash
+> docker build -t dfkv-build --target build . && id=$(docker create dfkv-build) && docker cp $id:/out ./dist && docker rm $id   # dist/bin/* dist/lib/libdfkv.so
+> ```
+> `DFKV_STATIC_LIBSTDCXX` 把 libstdc++/libgcc 静态进产物（这些不是 glibc）；libibverbs 无法静态（运行时 dlopen 驱动），运行节点仍需装 rdma-core。
+
 ## 2. 每节点：分发 + 缓存目录
 
 ```bash

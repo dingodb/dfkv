@@ -65,6 +65,17 @@ int main(int argc, char** argv) {
   std::fflush(stdout);
   DFKV_LOG_INFO("dfkv_server listening on port " + std::to_string(srv.port()) + ", dir=" + dir);
 
+  // Announce the transport build mode loudly so a TCP-only binary (built without
+  // -DDFKV_WITH_RDMA=ON) can never be mistaken for an RDMA one at deploy time.
+#ifdef DFKV_WITH_RDMA
+  DFKV_LOG_INFO("dfkv build: transport=RDMA (libibverbs) + TCP fallback");
+#else
+  DFKV_LOG_INFO("dfkv build: transport=TCP-only (built WITHOUT -DDFKV_WITH_RDMA=ON)");
+  if (rdma_port >= 0 || !rdma_dev.empty())
+    DFKV_LOG_WARN("--rdma-port/--rdma-dev IGNORED: this binary has no RDMA support; "
+                  "rebuild with -DDFKV_WITH_RDMA=ON (needs libibverbs-dev)");
+#endif
+
 #ifdef DFKV_WITH_RDMA
   std::unique_ptr<dfkv::RdmaServer> rsrv;
   if (rdma_port >= 0) {
