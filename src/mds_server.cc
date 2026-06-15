@@ -100,7 +100,11 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out) {
     if (DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) && one.size() == 1)
       members.push_back(one[0]);
   }
-  *out = EncodeMembers(members, static_cast<uint64_t>(r->revision));
+  // Epoch = content hash of the member set, NOT etcd's global revision: the
+  // revision bumps on every cluster write (including unrelated groups), which
+  // would make clients rebuild their ring needlessly. The hash changes iff THIS
+  // group's membership content changes.
+  *out = EncodeMembers(members, MembersEpoch(members));
   return Status::kOk;
 }
 
