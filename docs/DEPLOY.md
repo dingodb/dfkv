@@ -32,9 +32,10 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j
 # 产物：build/dfkv_server  build/dfkv_mds  build/libdfkv.so
 #        build/dfkv_smoke  build/dfkvctl  build/dfkv_bench
-ldd build/dfkv_server | grep -E 'ibverbs|rdmacm'          # 确认链接了 RDMA 库
+ldd build/dfkv_server | grep ibverbs                      # 确认链接了 RDMA 库
 ```
-依赖：`libibverbs-dev librdmacm-dev`（构建期）+ 运行节点装 `rdma-core`。无 RDMA 也可去掉 `-DDFKV_WITH_RDMA` 构建纯 TCP 版。
+依赖：`libibverbs-dev`（构建期）+ 运行节点装 `rdma-core`。无 RDMA 也可去掉 `-DDFKV_WITH_RDMA` 构建纯 TCP 版。
+> QP 信息走 TCP bootstrap 交换（非 librdmacm），所以只依赖 libibverbs，不需要 librdmacm。
 
 ## 2. 每节点：分发 + 缓存目录
 

@@ -1,5 +1,5 @@
 # Build a portable dfkv image (TCP transport). For RDMA add libibverbs-dev
-# librdmacm-dev and -DDFKV_WITH_RDMA=ON.
+# and -DDFKV_WITH_RDMA=ON.
 FROM ubuntu:24.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build g++ git ca-certificates && rm -rf /var/lib/apt/lists/*

@@ -12,7 +12,7 @@ add_compile_options(-Wall -Wextra)
 
 option(DFKV_BUILD_TESTS "Build dfkv tests" ON)
 option(DFKV_STATIC_LIBSTDCXX "Statically link libstdc++/libgcc for portable artifacts" OFF)
-option(DFKV_WITH_RDMA "Build the RDMA transport (needs libibverbs + librdmacm)" OFF)
+option(DFKV_WITH_RDMA "Build the RDMA transport (needs libibverbs)" OFF)
 if(DFKV_STATIC_LIBSTDCXX)
   add_link_options(-static-libstdc++ -static-libgcc)
 endif()
@@ -43,7 +43,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(dfkv_core PUBLIC Threads::Threads)
 if(DFKV_WITH_RDMA)
   target_compile_definitions(dfkv_core PUBLIC DFKV_WITH_RDMA)
-  target_link_libraries(dfkv_core PUBLIC ibverbs rdmacm)
+  target_link_libraries(dfkv_core PUBLIC ibverbs)
 endif()
 
 # C ABI shared lib for the Python (ctypes) plugin
@@ -53,7 +53,7 @@ target_compile_definitions(dfkv PRIVATE _GNU_SOURCE)  # O_DIRECT/fallocate in kv
 target_link_libraries(dfkv PUBLIC Threads::Threads)
 if(DFKV_WITH_RDMA)
   target_compile_definitions(dfkv PUBLIC DFKV_WITH_RDMA)
-  target_link_libraries(dfkv PUBLIC ibverbs rdmacm)
+  target_link_libraries(dfkv PUBLIC ibverbs)
 endif()
 
 # standalone cache-node daemon + CLI tools
