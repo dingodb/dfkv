@@ -33,6 +33,28 @@ beat a small-object penalty?
 **Decision:** do not add key-coalescing now. Use depth pipelining (#1). Revisit only
 if a future model is MHA with small pages (small-object, message-rate-bound).
 
+## #1 — write pipelining: measured on hd03 (depth flat; multi-connection is the lever)
+
+Empirical (hd03, 3-node, 1 MiB PUT, single writer thread, batch 64):
+
+| knob | PUT GB/s |
+|------|----------|
+| `DFKV_RDMA_DEPTH` 1 / 8 / 16 (1 connection) | 2.50 / 2.55 / 2.50 — **flat** |
+| `batch_concurrency` 1 / 8 / 16 | 1.34 / **3.35** / 3.28 — **2.5x at 8, saturates** |
+
+- **Depth pipelining does NOT raise PUT.** The server's per-connection serve loop
+  processes requests serially (each does the O_DIRECT disk write inline), so a
+  client that pipelines `depth` PUTs just queues them at the server. Depth is kept
+  as an opt-in knob (`rdma_depth` extra_config / `DFKV_RDMA_DEPTH`) — it can help on
+  a network-latency-bound link — but on hd03's disk-bound path it is flat.
+- **Multi-connection fan-out is the real write lever**: splitting a batch across N
+  connections hits N parallel server serve threads. `batch_concurrency` **defaults
+  to 8** in the client, so the SGLang plugin's single-writer (MLA rank0) path
+  **already parallelizes writes 8-way** with no extra config. It saturates at ~8 on
+  this hardware, so there is no large untapped win here; the write ceiling is the
+  single-rank r0 path + server serial-per-connection writes, already mitigated by
+  the 8-way fan-out.
+
 ## One-sided RDMA WRITE/READ vs two-sided SEND/RECV
 
 A colleague noted one-sided (READ/WRITE) often beats two-sided (SEND/RECV). True in
