@@ -7,11 +7,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <utility>
 
-#include "net_util.h"   // PutU32/GetU32/PutU64 little-endian codec
+#include "net_util.h"   // PutU32/GetU32/PutU64 host-endian codec
 #include "numa_util.h"  // best-effort NUMA buffer placement
 
 namespace dfkv {
@@ -198,7 +199,15 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   mtu_ = pa.active_mtu;
   local_.lid = pa.lid;
   local_.qpn = qp_->qp_num;
-  local_.psn = qp_->qp_num & 0xFFFFFF;  // deterministic, unique per QP
+  // Random 24-bit starting PSN, not derived from the QPN. The kernel recycles
+  // QP numbers, so a QPN-derived PSN repeats whenever a QPN is reused; a stale
+  // packet from a torn-down QP could then fall inside the new QP's expected PSN
+  // window and be wrongly accepted. A random PSN per Open makes that astronomically
+  // unlikely. (PSN is 24 bits on the wire.)
+  {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    local_.psn = rng() & 0xFFFFFF;
+  }
 
   // Pick the source GID. On IB the LID is used for addressing (GID is along for
   // the ride), but on RoCE (Ethernet link layer, lid==0) the QP is addressed by
