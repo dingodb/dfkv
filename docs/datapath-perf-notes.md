@@ -33,9 +33,9 @@ beat a small-object penalty?
 **Decision:** do not add key-coalescing now. Use depth pipelining (#1). Revisit only
 if a future model is MHA with small pages (small-object, message-rate-bound).
 
-## #1 — write pipelining: measured on hd03 (depth flat; multi-connection is the lever)
+## #1 — write pipelining: measured on an 8x400G IB testbed (depth flat; multi-connection is the lever)
 
-Empirical (hd03, 3-node, 1 MiB PUT, single writer thread, batch 64):
+Empirical (8x400G IB testbed, 3-node, 1 MiB PUT, single writer thread, batch 64):
 
 | knob | PUT GB/s |
 |------|----------|
@@ -46,7 +46,7 @@ Empirical (hd03, 3-node, 1 MiB PUT, single writer thread, batch 64):
   processes requests serially (each does the O_DIRECT disk write inline), so a
   client that pipelines `depth` PUTs just queues them at the server. Depth is kept
   as an opt-in knob (`rdma_depth` extra_config / `DFKV_RDMA_DEPTH`) — it can help on
-  a network-latency-bound link — but on hd03's disk-bound path it is flat.
+  a network-latency-bound link — but on a disk-bound path it is flat.
 - **Multi-connection fan-out is the real write lever**: splitting a batch across N
   connections hits N parallel server serve threads. `batch_concurrency` **defaults
   to 8** in the client, so the SGLang plugin's single-writer (MLA rank0) path
@@ -72,6 +72,6 @@ small-message IOPS). For dfkv specifically:
   modest on 2.6 MiB **bandwidth-bound** transfers (large for IOPS-bound small objects).
 
 **Decision:** candidate for a future A/B (WRITE_WITH_IMM GET response prototype, measured
-on hd03 real RDMA), but **not a blind rewrite** — the data we have (large, bandwidth-bound,
+on real RDMA hardware), but **not a blind rewrite** — the data we have (large, bandwidth-bound,
 already zero-copy) does not justify rewriting the datapath on "should be faster". Measure
 first.

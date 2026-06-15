@@ -181,7 +181,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
                 os.environ["DFKV_RDMA_DEV"] = saved
 
     def test_rail_affinity_8rails_rank_i_to_rail_i(self):
-        # hd03 (rails==ranks): block=1 -> rank i pins to ib7s400p{i} (NUMA-aligned).
+        # 8 rails == 8 ranks: block=1 -> rank i pins to ib7s400p{i} (NUMA-aligned).
         members, _, _ = self._node("rail8")
         rails = "ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7"
         dev, numa = self._rail_for(members, rails, tp_rank=3, tp_size=8)
@@ -189,7 +189,7 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(numa, "1")
 
     def test_rail_affinity_2rails_numa_block(self):
-        # hd04 (2 rails, 8 ranks): block=4 -> ranks 0-3 -> rail0(NUMA0),
+        # 2 rails, 8 ranks: block=4 -> ranks 0-3 -> rail0(NUMA0),
         # ranks 4-7 -> rail1(NUMA1). Modulo would put rank5 on rail1 too but rank2
         # on rail0; block keeps each socket's ranks on one rail.
         members, _, _ = self._node("rail2")

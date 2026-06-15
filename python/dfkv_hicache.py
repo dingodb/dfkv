@@ -129,10 +129,10 @@ class DfkvHiCache(HiCacheStorage):
             # NUMA-grouped BLOCK mapping (not modulo): contiguous blocks of ranks
             # share a rail, so with a NUMA-ordered rail list (NUMA0 rails first)
             # each rank lands on a rail on its own socket. Correct for both
-            # rails==ranks (hd03 8x400G: block=1 -> rank i -> rail i, p0-3=NUMA0/
-            # GPU0-3, p4-7=NUMA1/GPU4-7) and rails<ranks (hd04 2x400G: block=4 ->
-            # ranks 0-3 -> rail0, ranks 4-7 -> rail1). Modulo would scatter a
-            # socket's ranks across both NUMA rails when rails<ranks.
+            # rails==ranks (e.g. 8x400G: block=1 -> rank i -> rail i, rails 0-3
+            # = NUMA0 / GPU0-3, rails 4-7 = NUMA1 / GPU4-7) and rails<ranks (e.g.
+            # 2x400G: block=4 -> ranks 0-3 -> rail0, ranks 4-7 -> rail1). Modulo
+            # would scatter a socket's ranks across both NUMA rails when rails<ranks.
             if cfg.get("rail_affinity"):
                 rails = [d for d in os.environ.get("DFKV_RDMA_DEV", "").split(",") if d]
                 if rails:

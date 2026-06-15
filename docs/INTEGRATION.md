@@ -126,6 +126,6 @@ from the portable `.cc` + `dingofs_transport.cc`, linking
 ## 8. RDMA (deferred for the dingo-cache fusion path)
 Out of scope for the brpc/dingo-cache fusion path (no env). The standalone
 `dfkv_server` already has a production-validated native-verbs RDMA transport
-(built with `-DDFKV_WITH_RDMA=ON`, validated at 400G on hd03). For the fusion
+(built with `-DDFKV_WITH_RDMA=ON`, validated at 400G InfiniBand). For the fusion
 path, an RDMA `Transport` can be added later (brpc rdma or ibverbs one-sided +
 GPUDirect, mirroring Mooncake), keeping value_header/key_map/plugin unchanged.

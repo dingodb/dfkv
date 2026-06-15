@@ -96,7 +96,7 @@ docs/       DEPLOY.md (standalone rollout) · INTEGRATION.md (fuse into dingo-ca
   selected **by name** (`DFKV_RDMA_DEV=ib7s400p0`, comma-list = multi-rail), QP
   bootstrapped over a tiny TCP channel so the 400G data fabric needs no IP and may
   be separate from the IP network. **Automatic TCP fallback** when no device or
-  `DFKV_RDMA` unset. Validated on hd03 400G.
+  `DFKV_RDMA` unset. Validated on 400G InfiniBand.
 - **Zero-copy GET both ends**: the server reads the block straight into the send
   buffer; the client scatters the payload directly into the caller's buffer (e.g.
   a SGLang HiCache registered host page) — no intermediate copies.

@@ -3,7 +3,7 @@
 # Why ubuntu:22.04 (glibc 2.35): a dynamically-linked binary's glibc floor = the
 # glibc it was BUILT against. Building on a newer host (e.g. ubuntu:24.04 / glibc
 # 2.39) makes artifacts that FAIL on older nodes with "GLIBC_2.3x not found".
-# 2.35 runs on RHEL9/Ubuntu22.04+ and the hd03 GPU nodes. Build once here, deploy
+# 2.35 runs on RHEL9/Ubuntu22.04+ and most current GPU nodes. Build once here, deploy
 # on any node with glibc >= 2.35 -- no per-node rebuild.
 #
 # DFKV_STATIC_LIBSTDCXX folds libstdc++/libgcc into the artifacts (those are NOT
