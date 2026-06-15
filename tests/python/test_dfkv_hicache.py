@@ -5,6 +5,7 @@ numpy host buffers (CPU), and asserts MLA single-object keying, backup_skip,
 batch_exists longest-prefix, and header-mismatch => miss.
 """
 import ctypes
+import logging
 import os
 import subprocess
 import sys
@@ -24,6 +25,7 @@ SERVER_BIN = os.path.join(BUILD, "dfkv_server")
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig  # noqa: E402
 import dfkv_hicache  # noqa: E402  (RED until implemented)
+import dfkv_access_log as alog  # noqa: E402
 
 
 class FakeMlaPool:
@@ -258,6 +260,212 @@ class DingoFSHiCacheTest(unittest.TestCase):
             self.assertEqual(ex.page_bytes_at(i), expe[i])
         r = st.batch_exists_v2(keys, [PoolTransfer(name="extra", host_indices=hi, keys=keys)])
         self.assertEqual(r.kv_hit_pages, 3)
+
+
+def _reset_access_log():
+    """Reset the process-global access-log state for test isolation.
+
+    configure() is idempotent per process, so without this every test after the
+    first would inherit the first config. Tests legitimately reach into the
+    module internals here (there is no production reset API by design)."""
+    alog._stop_listener(alog._listener)
+    logging.getLogger("dfkv.access").handlers.clear()
+    alog._ENABLED = False
+    alog._THRESHOLD_US = 0
+    alog._logger = None
+    alog._listener = None
+    alog._configured = False
+
+
+class DfkvAccessLogTest(unittest.TestCase):
+    """Access log on the inherited interface methods: toggle, path, format."""
+
+    PAGE_SIZE = 64
+    PAGE_BYTES = 4096
+
+    @classmethod
+    def setUpClass(cls):
+        cls.procs = []
+
+    @classmethod
+    def tearDownClass(cls):
+        for p in cls.procs:
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+
+    def setUp(self):
+        _reset_access_log()
+        self.tmp = tempfile.mkdtemp(prefix="dfkv_alog_")
+
+    def tearDown(self):
+        _reset_access_log()
+
+    def _node(self, tag):
+        p, d, port = _spawn_node(tag)
+        self.procs.append(p)
+        return f"{tag}=127.0.0.1:{port}"
+
+    def _cfg(self, members, alog_extra, tp_rank=0):
+        ec = {
+            "members": members, "model_hash": 0x51,
+            "dtype_tag": 0x46384534, "page_size": self.PAGE_SIZE,
+            "layer_num": 78, "head_num": 1, "head_dim": 576,
+            "interface_v1": 1,
+        }
+        ec.update(alog_extra)
+        return HiCacheStorageConfig(
+            tp_rank=tp_rank, tp_size=8, is_mla_model=True,
+            is_page_first_layout=False, model_name="glm-5.1", extra_config=ec)
+
+    def _plugin(self, cfg, pool=None):
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        if pool is not None:
+            st.register_mem_pool_host(pool)
+        return st
+
+    def _flush(self):
+        # Drain the async queue so emitted lines hit the file before we read it.
+        if alog._listener is not None:
+            alog._listener.stop()
+            alog._listener = None
+
+    def _read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_disabled_by_default_writes_no_file(self):
+        members = self._node("ad")
+        path = os.path.join(self.tmp, "acc.{rank}.log")
+        # access_log absent -> disabled even though a path is supplied.
+        cfg = self._cfg(members, {"access_log_path": path})
+        pool = FakeMlaPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        st = self._plugin(cfg, pool)
+        st.batch_set_v1(["d0", "d1"], list(range(2 * self.PAGE_SIZE)))
+        self._flush()
+        self.assertFalse(alog.is_enabled())
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "acc.0.log")))
+
+    def test_enabled_writes_one_line_per_op(self):
+        members = self._node("aw")
+        path = os.path.join(self.tmp, "acc.{rank}.log")
+        cfg = self._cfg(members, {"access_log": 1, "access_log_path": path})
+        pool = FakeMlaPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        st = self._plugin(cfg, pool)
+        self.assertTrue(alog.is_enabled())
+        hi = list(range(2 * self.PAGE_SIZE))
+        st.batch_set_v1(["w0", "w1"], hi)
+        st.batch_get_v1(["w0", "w1"], hi)
+        st.batch_exists(["w0", "w1", "w_miss"])  # 2 present, 1 missing
+        self._flush()
+        txt = self._read(os.path.join(self.tmp, "acc.0.log"))
+        self.assertIn("init(r0 glm-5.1 tp=0/8 mla=1) : ok static", txt)
+        self.assertIn("batch_set_v1(r0 2 keys) : ok 2/2", txt)
+        self.assertIn("batch_get_v1(r0 2 keys) : hits=2/2", txt)
+        self.assertIn("batch_exists(r0 3 keys) : prefix=2/3", txt)
+        self.assertIn("<0.", txt)  # duration token present
+
+    def test_generic_get_set_exists_logged(self):
+        members = self._node("ag")
+        path = os.path.join(self.tmp, "acc.{rank}.log")
+        cfg = self._cfg(members, {"access_log": 1, "access_log_path": path})
+        st = self._plugin(cfg)
+        payload = bytes((i * 3) & 0xFF for i in range(self.PAGE_BYTES))
+        self.assertTrue(st.set("g0", payload))
+        self.assertIs(st.get("g0", FlatBuf(self.PAGE_BYTES)).__class__, FlatBuf)
+        self.assertTrue(st.exists("g0"))
+        self.assertFalse(st.exists("g_missing"))
+        self.assertIsNone(st.get("g_missing", FlatBuf(self.PAGE_BYTES)))
+        self._flush()
+        txt = self._read(os.path.join(self.tmp, "acc.0.log"))
+        self.assertIn("set(r0 g0, 4.00KiB) : ok", txt)
+        self.assertIn(": hit", txt)        # get hit
+        self.assertIn(": miss", txt)       # get miss
+        self.assertIn("exists(r0 g0) : found", txt)
+        self.assertIn("exists(r0 g_missing) : not_found", txt)
+
+    def test_auto_rank_suffix_and_backup_skip(self):
+        members = self._node("as")
+        # no {rank} placeholder -> path is auto-suffixed .r{rank}
+        path = os.path.join(self.tmp, "acc.log")
+        cfg = self._cfg(members, {"access_log": 1, "access_log_path": path},
+                        tp_rank=3)  # MLA + rank!=0 -> backup_skip
+        pool = FakeMlaPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        st = self._plugin(cfg, pool)
+        self.assertEqual(st.batch_set_v1(["s0", "s1"], list(range(2 * self.PAGE_SIZE))),
+                         [True, True])  # value unchanged by logging
+        self._flush()
+        suffixed = os.path.join(self.tmp, "acc.log.r3")
+        self.assertTrue(os.path.exists(suffixed))
+        self.assertIn("batch_set_v1(r3 2 keys) : backup_skip", self._read(suffixed))
+
+    def test_path_placeholder_substituted(self):
+        members = self._node("ap")
+        path = os.path.join(self.tmp, "acc.{rank}.log")
+        cfg = self._cfg(members, {"access_log": 1, "access_log_path": path},
+                        tp_rank=5)
+        pool = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
+        st = self._plugin(cfg, pool)
+        st.batch_set_v1(["x0"], list(range(self.PAGE_SIZE)))
+        self._flush()
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "acc.5.log")))
+
+    def test_threshold_filters_fast_ops(self):
+        members = self._node("at")
+        path = os.path.join(self.tmp, "acc.{rank}.log")
+        cfg = self._cfg(members, {"access_log": 1, "access_log_path": path,
+                                  "access_log_threshold_us": 10_000_000})  # 10s
+        pool = FakeMlaPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        st = self._plugin(cfg, pool)
+        hi = list(range(2 * self.PAGE_SIZE))
+        st.batch_set_v1(["t0", "t1"], hi)
+        st.batch_get_v1(["t0", "t1"], hi)
+        self._flush()
+        p = os.path.join(self.tmp, "acc.0.log")
+        txt = self._read(p) if os.path.exists(p) else ""
+        self.assertNotIn("batch_set_v1", txt)
+        self.assertNotIn("batch_get_v1", txt)
+
+    def test_env_var_fallback_enables(self):
+        members = self._node("ae")
+        envp = os.path.join(self.tmp, "env.{rank}.log")
+        keys = ("DFKV_ACCESS_LOG_ENABLED", "DFKV_ACCESS_LOG_PATH")
+        old = {k: os.environ.get(k) for k in keys}
+        os.environ["DFKV_ACCESS_LOG_ENABLED"] = "1"
+        os.environ["DFKV_ACCESS_LOG_PATH"] = envp
+        try:
+            cfg = self._cfg(members, {})  # no extra_config access_log keys
+            pool = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
+            st = self._plugin(cfg, pool)
+            self.assertTrue(alog.is_enabled())
+            st.batch_get_v1(["z0"], list(range(self.PAGE_SIZE)))
+            self._flush()
+            self.assertTrue(os.path.exists(os.path.join(self.tmp, "env.0.log")))
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_failures_are_logged_and_reraised(self):
+        members = self._node("af")
+        path = os.path.join(self.tmp, "acc.{rank}.log")
+        cfg = self._cfg(members, {"access_log": 1, "access_log_path": path})
+        st = self._plugin(cfg)
+        self.assertFalse(st.set("f0", None))  # value None -> "fail none"
+
+        def _boom(*a, **k):
+            raise RuntimeError("boom")
+        st._lib.dfkv_put = _boom  # fresh per-plugin CDLL, isolated to this test
+        with self.assertRaises(RuntimeError):
+            st.set("f1", b"x" * 16)  # exception must propagate, not be swallowed
+        self._flush()
+        txt = self._read(os.path.join(self.tmp, "acc.0.log"))
+        self.assertIn("set(r0 f0, 0B) : fail none", txt)
+        self.assertIn("FAIL RuntimeError: boom", txt)
 
 
 if __name__ == "__main__":
