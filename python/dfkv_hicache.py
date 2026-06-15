@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageC
 from dfkv_access_log import (access_log, configure as _configure_access_log,
                             fmt_bytes as _fmt_bytes, fmt_pools as _fmt_pools,
                             fmt_pool_results as _fmt_pool_results)
+from dfkv_metrics import Metrics as _Metrics
 
 _FLAG_IS_MLA = 0x1
 
@@ -98,6 +99,9 @@ class DfkvHiCache(HiCacheStorage):
         # here so tp_rank/model are available for the {rank} path placeholder.
         _configure_access_log(cfg, tp_rank=self.tp_rank, model=self.model)
         self._alog_tag = f"r{self.tp_rank}"
+        # Client-side read/write counters (Prometheus when available). Lets ops
+        # confirm SGLang->dfkv volume from /metrics instead of parsing access logs.
+        self._metrics = _Metrics(self.tp_rank)
         # Log the open/discovery setup (the access log is live from here on; the
         # earlier interface_v1 check raises before config is resolved).
         with access_log("init", lambda: f"{self._alog_tag} {self.model} "
@@ -240,6 +244,7 @@ class DfkvHiCache(HiCacheStorage):
             self._lib.dfkv_batch_put(self._h, karr, parr, sarr, len(sks), out)
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"ok {sum(res)}/{n}"
+            self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=sum(ss))
             return res
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
@@ -251,6 +256,7 @@ class DfkvHiCache(HiCacheStorage):
             self._lib.dfkv_batch_get(self._h, karr, parr, sarr, len(sks), out)
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"hits={sum(res)}/{n}"
+            self._metrics.on_get(pages=n, hit_pages=sum(res), nbytes=sum(ss))
             return res
 
     def batch_exists(self, keys, extra_info=None) -> int:

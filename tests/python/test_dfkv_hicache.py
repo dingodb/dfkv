@@ -204,6 +204,25 @@ class DingoFSHiCacheTest(unittest.TestCase):
         for i in range(3):
             self.assertEqual(pool.page_bytes_at(i), expected[i])
 
+    def test_client_metrics_count_set_and_get(self):
+        # #5: plugin counts client-side read/write volume (pages/bytes/hits).
+        members, _, _ = self._node("metrics")
+        pool = FakeMlaPool(3, self.PAGE_BYTES, self.PAGE_SIZE)
+        st = self._plugin(self._cfg(members), pool)
+        keys = ["m0", "m1", "m2"]
+        host_indices = list(range(3 * self.PAGE_SIZE))
+        st.batch_set_v1(keys, host_indices)
+        st.batch_get_v1(keys, host_indices)
+        m = st._metrics.snapshot()
+        self.assertEqual(m["set_calls"], 1)
+        self.assertEqual(m["set_pages"], 3)
+        self.assertEqual(m["set_ok_pages"], 3)
+        self.assertEqual(m["set_bytes"], 3 * self.PAGE_BYTES)
+        self.assertEqual(m["get_calls"], 1)
+        self.assertEqual(m["get_pages"], 3)
+        self.assertEqual(m["get_hit_pages"], 3)
+        self.assertEqual(m["get_bytes"], 3 * self.PAGE_BYTES)
+
     def test_mla_writes_single_object_per_page(self):
         members, port, ndir = self._node("mla")
         pool = FakeMlaPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
