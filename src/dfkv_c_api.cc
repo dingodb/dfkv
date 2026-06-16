@@ -1,5 +1,6 @@
 #include "dfkv_c_api.h"
 
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -167,6 +168,18 @@ int dfkv_start_mds_discovery(dfkv_client_t c, const char* mds_endpoints,
   static_cast<KVClient*>(c)->StartMdsDiscovery(std::move(eps), group,
                                                poll_ms > 0 ? poll_ms : 3000);
   return 0;
+}
+
+uint64_t dfkv_stats_snapshot(dfkv_client_t c, char* buf, uint64_t cap) {
+  if (!c) return 0;
+  std::string text = static_cast<KVClient*>(c)->MetricsSnapshot();
+  uint64_t full = static_cast<uint64_t>(text.size());
+  if (buf && cap > 0) {
+    uint64_t n = full < cap ? full : cap - 1;  // leave room for NUL
+    std::memcpy(buf, text.data(), static_cast<size_t>(n));
+    buf[n] = '\0';
+  }
+  return full;
 }
 
 void dfkv_close(dfkv_client_t c) { delete static_cast<KVClient*>(c); }

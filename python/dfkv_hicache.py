@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageC
 from dfkv_access_log import (access_log, configure as _configure_access_log,
                             fmt_bytes as _fmt_bytes, fmt_pools as _fmt_pools,
                             fmt_pool_results as _fmt_pool_results)
-from dfkv_metrics import Metrics as _Metrics
+from dfkv_metrics import Metrics as _Metrics, ClientStatsPoller as _ClientStatsPoller
 
 _FLAG_IS_MLA = 0x1
 
@@ -58,9 +58,21 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_refresh_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.dfkv_start_mds_discovery.restype = ctypes.c_int
     lib.dfkv_start_mds_discovery.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    lib.dfkv_stats_snapshot.restype = ctypes.c_uint64
+    lib.dfkv_stats_snapshot.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64]
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [ctypes.c_void_p]
     return lib
+
+
+def _read_snapshot(lib, h) -> str:
+    """Read the C client's Prometheus metrics snapshot (size query, then fetch)."""
+    need = int(lib.dfkv_stats_snapshot(h, None, 0))
+    if need <= 0:
+        return ""
+    buf = ctypes.create_string_buffer(need + 1)
+    lib.dfkv_stats_snapshot(h, buf, need + 1)
+    return buf.value.decode("utf-8", "replace")
 
 
 def _arrays(subkeys, ptrs, sizes):
@@ -151,7 +163,29 @@ class DfkvHiCache(HiCacheStorage):
             self.mem_pool_host = None
             r.result = "ok mds-discovery" if mds else "ok static"
 
+        # Background mirror of the C client's metrics snapshot onto Prometheus
+        # (sleeping daemon thread; off the request path). client_stats_poll_s<=0
+        # disables it. extra_config wins, then env, then 10s default.
+        self._poller = None
+        try:
+            poll_s = cfg.get("client_stats_poll_s")
+            if poll_s is None:
+                poll_s = os.environ.get("DFKV_CLIENT_STATS_POLL_S", 10)
+            poll_s = float(poll_s)
+        except (TypeError, ValueError):
+            poll_s = 10.0
+        if poll_s > 0:
+            self._poller = _ClientStatsPoller(
+                lambda: _read_snapshot(self._lib, self._h), self.tp_rank, poll_s)
+            self._poller.start()
+
     def __del__(self):
+        try:
+            if getattr(self, "_poller", None):
+                self._poller.stop()
+                self._poller = None
+        except Exception:
+            pass
         try:
             if getattr(self, "_h", None):
                 self._lib.dfkv_close(self._h)

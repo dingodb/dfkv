@@ -91,6 +91,10 @@ class KVClient {
   // MDS — point at any live node. Returns true if a non-empty list was applied.
   bool RefreshMembers(const std::string& seed_addr);
 
+  // Client-side Prometheus metrics text (ops served, IO errors, peer health
+  // transitions, per-peer errors). Surfaced to the plugin via the C ABI.
+  std::string MetricsSnapshot() const { return health_.Render(); }
+
  private:
   std::string Route(const std::string& key) const;
   uint64_t NowMs() const;

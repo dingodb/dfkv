@@ -61,6 +61,13 @@ int dfkv_batch_get_auto(dfkv_client_t c, const char** keys, void** ptrs,
                         uint64_t* out_len);
 int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist);
 
+// Client-side Prometheus metrics snapshot (ops served, IO errors, peer health
+// transitions, per-peer errors). Writes up to `cap` bytes (NUL-terminated when
+// it fits) into buf and returns the FULL text length (excluding NUL). Pass cap=0
+// (buf may be NULL) to size the buffer first. The plugin polls this and mirrors
+// the deltas onto its Prometheus counters.
+uint64_t dfkv_stats_snapshot(dfkv_client_t c, char* buf, uint64_t cap);
+
 void dfkv_close(dfkv_client_t c);
 
 #ifdef __cplusplus
