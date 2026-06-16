@@ -11,6 +11,7 @@
 #include "etcd_client.h"
 #include "http_client.h"
 #include "kv_store.h"
+#include "mds_metrics.h"
 #include "membership.h"
 
 namespace dfkv {
@@ -28,6 +29,7 @@ class MdsServer {
   Status Start(int port);
   void Stop();
   int port() const { return port_; }
+  std::string MetricsText() const { return metrics_.Render(); }
 
   static constexpr int kTtlSeconds = 30;
 
@@ -49,6 +51,7 @@ class MdsServer {
   std::vector<std::thread> conn_threads_;
   std::mutex lease_mu_;
   std::map<std::string, int64_t> leases_;
+  MdsMetrics metrics_;
 };
 
 }  // namespace dfkv

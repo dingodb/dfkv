@@ -97,8 +97,9 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
   // which expires on its own via the TTL; same-key heartbeats are serial in
   // practice (one node, one connection), so this is rare and harmless.
   auto lid = etcd_.LeaseGrant(kTtlSeconds);
-  if (!lid) return Status::kIOError;
-  if (!etcd_.Put(key, val, *lid)) return Status::kIOError;
+  if (!lid) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
+  metrics_.lease_grants.fetch_add(1, std::memory_order_relaxed);
+  if (!etcd_.Put(key, val, *lid)) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
   {
     std::lock_guard<std::mutex> lk(lease_mu_);
     leases_[key] = *lid;
@@ -107,9 +108,10 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
 }
 
 Status MdsServer::ListMembers(const std::string& group, std::string* out) {
+  metrics_.list_requests.fetch_add(1, std::memory_order_relaxed);
   std::string prefix = "/dfkv/v1/groups/" + group + "/members/";
   auto r = etcd_.RangePrefix(prefix);
-  if (!r) return Status::kIOError;
+  if (!r) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
   std::vector<MemberInfo> members;
   for (const auto& kv : r->kvs) {
     std::vector<MemberInfo> one;
@@ -121,6 +123,7 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out) {
   // revision bumps on every cluster write (including unrelated groups), which
   // would make clients rebuild their ring needlessly. The hash changes iff THIS
   // group's membership content changes.
+  metrics_.members_last_list.store(members.size(), std::memory_order_relaxed);
   *out = EncodeMembers(members, MembersEpoch(members));
   return Status::kOk;
 }
@@ -138,6 +141,10 @@ void MdsServer::Handle(int fd) {
     Status st = Status::kInvalid;
     WireOp op = static_cast<WireOp>(rq.op);
     if (op == WireOp::kRegister || op == WireOp::kHeartbeat) {
+      if (op == WireOp::kRegister)
+        metrics_.register_requests.fetch_add(1, std::memory_order_relaxed);
+      else
+        metrics_.keepalives.fetch_add(1, std::memory_order_relaxed);
       std::string group;
       MemberInfo m;
       if (DecodeMemberReq(payload.data(), rq.payload_len, &group, &m))
