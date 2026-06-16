@@ -197,6 +197,16 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   换 RDMA 后命中收益才完全释放）。
 - `chunk_size=16` 时每 chunk ≈4 MiB（旧 dingofs 上限），dfkv 正常存取——**任意块大小已验证**。
 
+**纯传输对比（并发 1、output 1、100% 命中）**——去掉排队与 decode，单请求只测「从 dfkv 加载一个
+16000-token prompt（≈4 GB KV）」的 TTFT：
+
+| 传输 | Mean TTFT(ms) | Median TTFT(ms) | P99 TTFT(ms) | 时长(s) | 输入吞吐(tok/s) |
+|---|---|---|---|---|---|
+| TCP | 3842 | 4033 | 4059 | 76.9 | 4166 |
+| **RDMA** | **1211** | **1259** | **1311** | **24.2** | **13212** |
+
+即单请求 KV 加载 RDMA ≈1.2s vs TCP ≈3.8s，**TTFT −68%（约 3.2×）**，两者均 20/20 成功、100% 命中。
+
 ---
 
 ## 已知问题 / 排查
