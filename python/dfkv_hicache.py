@@ -118,28 +118,19 @@ class DfkvHiCache(HiCacheStorage):
             # its own env -- client depth must be <= server depth.
             if cfg.get("rdma_depth"):
                 os.environ["DFKV_RDMA_DEPTH"] = str(int(cfg["rdma_depth"]))
-            # Per-TP-rank RDMA rail affinity. SGLang's ranks all inherit one
-            # DFKV_RDMA_DEV; with rail_affinity each rank narrows to a single rail
-            # so the readers (every rank reads in MLA) spread deterministically
-            # across the available rails with NUMA locality, instead of each rank
-            # round-robining all rails. Writes are MLA rank0-only so unaffected;
-            # this lifts READ aggregate bandwidth. Also pins the client's buffers/
-            # serve-threads to that rail's NUMA node.
-            #
-            # NUMA-grouped BLOCK mapping (not modulo): contiguous blocks of ranks
-            # share a rail, so with a NUMA-ordered rail list (NUMA0 rails first)
-            # each rank lands on a rail on its own socket. Correct for both
-            # rails==ranks (e.g. 8x400G: block=1 -> rank i -> rail i, rails 0-3
-            # = NUMA0 / GPU0-3, rails 4-7 = NUMA1 / GPU4-7) and rails<ranks (e.g.
-            # 2x400G: block=4 -> ranks 0-3 -> rail0, ranks 4-7 -> rail1). Modulo
-            # would scatter a socket's ranks across both NUMA rails when rails<ranks.
+            # rail_affinity (per-tp_rank narrowing) is DEPRECATED and now a no-op:
+            # it keyed off tp_rank, which is always 0 under DP-attention (every rank
+            # is its own attention TP group of size 1), so it collapsed all ranks to
+            # one rail. NUMA-aware rail selection now lives in the C++ client: keep
+            # the full multi-rail DFKV_RDMA_DEV and set DFKV_RDMA_NUMA=1, and the
+            # client picks a NUMA-local rail per connection (works for TP and DP).
             if cfg.get("rail_affinity"):
-                rails = [d for d in os.environ.get("DFKV_RDMA_DEV", "").split(",") if d]
-                if rails:
-                    block = max(1, self.tp_size // len(rails))
-                    idx = min(self.tp_rank // block, len(rails) - 1)
-                    os.environ["DFKV_RDMA_DEV"] = rails[idx]
-                    os.environ.setdefault("DFKV_RDMA_NUMA", "1")
+                import sys as _sys
+                print("[dfkv] WARNING: 'rail_affinity' is deprecated and ignored; "
+                      "set DFKV_RDMA_NUMA=1 + multi-rail DFKV_RDMA_DEV for NUMA-aware "
+                      "rail selection in the client.", file=_sys.stderr, flush=True)
+            if cfg.get("rdma_numa"):
+                os.environ.setdefault("DFKV_RDMA_NUMA", "1")
             self._lib = _load_lib(cfg.get("lib_path"))
             flags = _FLAG_IS_MLA if self.is_mla else 0
             model_hash = int(cfg.get("model_hash", 0)) & 0xFFFFFFFFFFFFFFFF
