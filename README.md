@@ -109,6 +109,10 @@ docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
   buffer; the client scatters the payload directly into the caller's buffer (e.g.
   a SGLang HiCache registered host page) — no intermediate copies.
 - **Optional pipelining** (`DFKV_RDMA_DEPTH=K`): K requests in flight per connection.
+- **NUMA-aware rail selection** (`DFKV_RDMA_NUMA=1`): pins buffers/serve-threads to
+  the rail's NUMA node AND, with a multi-rail `DFKV_RDMA_DEV`, picks a NUMA-local
+  rail per connection (falls back to round-robin over all rails when no local rail
+  exists). Off by default; vendor-neutral (sysfs + `sched_getcpu`, no libnuma/CUDA).
 - **HiCache v2** (PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
 

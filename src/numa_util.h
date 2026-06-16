@@ -6,8 +6,10 @@
  * thread — to the NUMA node of its RDMA device, so each rail stays local.
  *
  * Opt-in via env DFKV_RDMA_NUMA (off by default; only meaningful on multi-socket
- * hosts). All ops are best-effort: unknown node / sysfs absent => no-op. Uses raw
- * syscalls + sysfs so there is no libnuma build dependency. */
+ * hosts). When on it ALSO drives NUMA-aware rail selection: the client prefers a
+ * rail on the calling thread's NUMA node (see rail_select.h / PickRail). All ops
+ * are best-effort: unknown node / sysfs absent => no-op / round-robin all rails.
+ * Uses raw syscalls + sysfs so there is no libnuma build dependency. */
 #ifndef DFKV_NUMA_UTIL_H_
 #define DFKV_NUMA_UTIL_H_
 
