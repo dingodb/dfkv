@@ -269,6 +269,9 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(m["get_pages"], 3)
         self.assertEqual(m["get_hit_pages"], 3)
         self.assertEqual(m["get_bytes"], 3 * self.PAGE_BYTES)
+        # latency histograms observed one duration per batch call
+        self.assertEqual(m["set_observations"], 1)
+        self.assertEqual(m["get_observations"], 1)
 
     def test_mla_writes_single_object_per_page(self):
         members, port, ndir = self._node("mla")

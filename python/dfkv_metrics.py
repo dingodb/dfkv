@@ -24,10 +24,24 @@ Metric names (labels: tp_rank):
 import threading
 
 try:
-    from prometheus_client import Counter as _PromCounter
+    from prometheus_client import Counter as _PromCounter, Histogram as _PromHistogram
     _HAVE_PROM = True
 except Exception:  # prometheus_client absent -> in-process counters only
     _HAVE_PROM = False
+
+# Latency buckets (seconds) for the set/get batch-call duration histograms.
+_HIST_BUCKETS = (0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0)
+_HIST = {}
+if _HAVE_PROM:
+    try:
+        _HIST["set"] = _PromHistogram("dfkv_client_set_seconds",
+                                      "batch_set_v1 call duration seconds",
+                                      ["tp_rank"], buckets=_HIST_BUCKETS)
+        _HIST["get"] = _PromHistogram("dfkv_client_get_seconds",
+                                      "batch_get_v1 call duration seconds",
+                                      ["tp_rank"], buckets=_HIST_BUCKETS)
+    except Exception:
+        _HIST = {}
 
 _SPECS = [
     ("set_calls", "dfkv_client_set_calls_total", "batch_set_v1 calls that wrote"),
@@ -60,6 +74,7 @@ class Metrics:
         self._rank = str(int(tp_rank))
         self._lock = threading.Lock()
         self._c = {attr: 0 for attr, _, _ in _SPECS}
+        self._obs = {"set": 0, "get": 0}  # histogram observation counts (tests/debug)
 
     def _add(self, **deltas):
         with self._lock:
@@ -70,15 +85,28 @@ class Metrics:
                 if v:
                     _PROM[k].labels(self._rank).inc(v)
 
-    def on_set(self, pages, ok_pages, nbytes):
-        self._add(set_calls=1, set_pages=pages, set_ok_pages=ok_pages, set_bytes=nbytes)
+    def _observe(self, op, seconds):
+        with self._lock:
+            self._obs[op] += 1
+        if _HAVE_PROM and op in _HIST:
+            _HIST[op].labels(self._rank).observe(seconds)
 
-    def on_get(self, pages, hit_pages, nbytes):
+    def on_set(self, pages, ok_pages, nbytes, seconds=None):
+        self._add(set_calls=1, set_pages=pages, set_ok_pages=ok_pages, set_bytes=nbytes)
+        if seconds is not None:
+            self._observe("set", seconds)
+
+    def on_get(self, pages, hit_pages, nbytes, seconds=None):
         self._add(get_calls=1, get_pages=pages, get_hit_pages=hit_pages, get_bytes=nbytes)
+        if seconds is not None:
+            self._observe("get", seconds)
 
     def snapshot(self):
         with self._lock:
-            return dict(self._c)
+            snap = dict(self._c)
+            snap.update({"set_observations": self._obs["set"],
+                         "get_observations": self._obs["get"]})
+            return snap
 
 
 # --- client-side snapshot mirroring (from the C client via dfkv_stats_snapshot) ---

@@ -92,8 +92,9 @@ class KVClient {
   bool RefreshMembers(const std::string& seed_addr);
 
   // Client-side Prometheus metrics text (ops served, IO errors, peer health
-  // transitions, per-peer errors). Surfaced to the plugin via the C ABI.
-  std::string MetricsSnapshot() const { return health_.Render(); }
+  // transitions, per-peer errors) plus transport-level counters (RDMA per-rail
+  // connections, MR regions). Surfaced to the plugin via the C ABI.
+  std::string MetricsSnapshot() const { return health_.Render() + t_->MetricsText(); }
 
  private:
   std::string Route(const std::string& key) const;

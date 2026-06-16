@@ -82,6 +82,7 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   // (destroy+recreate every op), which fails the bootstrap under load. Default
   // 256 covers typical fan-out; raise via DFKV_RDMA_POOL_MAX for more threads.
   pool_max_ = static_cast<size_t>(EnvInt("DFKV_RDMA_POOL_MAX", 256));
+  rail_conns_ = std::make_unique<std::atomic<uint64_t>[]>(devs_.size());  // 0-initialized
 }
 
 RdmaTransport::~RdmaTransport() {
@@ -113,8 +114,8 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   // Pick a device for this connection: NUMA-aware when DFKV_RDMA_NUMA is on
   // (prefer a rail on the calling thread's NUMA node), else round-robin all.
   size_t tick = rr_.fetch_add(1, std::memory_order_relaxed);
-  const std::string& dev =
-      devs_[rdma::PickRail(dev_node_, numa::CurrentNode(), numa::Enabled(), tick)];
+  size_t ridx = rdma::PickRail(dev_node_, numa::CurrentNode(), numa::Enabled(), tick);
+  const std::string& dev = devs_[ridx];
 
   auto* c = new Conn();
   if (!c->ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, depth_)) {
@@ -138,6 +139,8 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   if (!net::ReadAll(fd, &ready, 1) || ready != 1) { ::close(fd); delete c; return nullptr; }
   ::close(fd);  // bootstrap done; QP is RTS
   c->ep.EnsurePoolMrs(pools);  // register the declared host-pool regions on this PD
+  conns_opened_.fetch_add(1, std::memory_order_relaxed);
+  if (ridx < devs_.size()) rail_conns_[ridx].fetch_add(1, std::memory_order_relaxed);
   return c;
 }
 
@@ -146,8 +149,29 @@ void RdmaTransport::RegisterMemory(void* base, size_t size) {
   std::lock_guard<std::mutex> lk(mu_);
   for (const auto& p : pools_) if (p.first == base) return;  // dedup by base
   pools_.push_back({base, size});
+  mr_regions_.fetch_add(1, std::memory_order_relaxed);
   // Connections register this lazily on their next Acquire (EnsurePoolMrs); call
   // before traffic so every connection's PD has the whole pool registered once.
+}
+
+std::string RdmaTransport::MetricsText() const {
+  std::string s;
+  s += "# HELP dfkv_rdma_client_conns_opened_total RDMA client connections opened\n";
+  s += "# TYPE dfkv_rdma_client_conns_opened_total counter\n";
+  s += "dfkv_rdma_client_conns_opened_total " +
+       std::to_string(conns_opened_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_mr_regions Declared host MR regions\n";
+  s += "# TYPE dfkv_rdma_client_mr_regions gauge\n";
+  s += "dfkv_rdma_client_mr_regions " +
+       std::to_string(mr_regions_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_rail_conns_total Connections opened per rail (device)\n";
+  s += "# TYPE dfkv_rdma_client_rail_conns_total counter\n";
+  for (size_t i = 0; i < devs_.size(); ++i) {
+    const std::string& d = devs_[i].empty() ? std::string("default") : devs_[i];
+    s += "dfkv_rdma_client_rail_conns_total{dev=\"" + d + "\"} " +
+         std::to_string(rail_conns_[i].load(std::memory_order_relaxed)) + "\n";
+  }
+  return s;
 }
 
 void RdmaTransport::Release(const std::string& node, Conn* c) {

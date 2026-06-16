@@ -56,6 +56,13 @@ class RdmaServer {
   // arrive — previously this grew without bound until Stop().
   size_t live_conn_count();
 
+  // RDMA completion counters (relaxed atomics, incremented in the serve loop).
+  uint64_t Completions() const { return completions_.load(std::memory_order_relaxed); }
+  uint64_t CompletionErrors() const { return completion_errors_.load(std::memory_order_relaxed); }
+  uint64_t ActiveConns() const { return active_conns_.load(std::memory_order_relaxed); }
+  uint64_t IdleReclaims() const { return idle_reclaims_.load(std::memory_order_relaxed); }
+  std::string MetricsText() const;  // Prometheus text (dfkv_rdma_*)
+
  private:
   void AcceptLoop();
   void Serve(int boot_fd);
@@ -84,6 +91,8 @@ class RdmaServer {
   std::mutex conn_mu_;
   std::vector<Conn> conns_;
   std::unordered_set<rdma::RcEndpoint*> live_eps_;
+  std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},
+      idle_reclaims_{0};
 };
 
 }  // namespace dfkv

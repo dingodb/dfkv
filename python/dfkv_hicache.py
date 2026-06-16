@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import time
 from typing import List, Optional
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
@@ -288,10 +289,12 @@ class DfkvHiCache(HiCacheStorage):
             ptrs, sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
+            t0 = time.perf_counter()
             self._lib.dfkv_batch_put(self._h, karr, parr, sarr, len(sks), out)
+            dur = time.perf_counter() - t0
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"ok {sum(res)}/{n}"
-            self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=sum(ss))
+            self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=sum(ss), seconds=dur)
             return res
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
@@ -300,10 +303,12 @@ class DfkvHiCache(HiCacheStorage):
             ptrs, sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
+            t0 = time.perf_counter()
             self._lib.dfkv_batch_get(self._h, karr, parr, sarr, len(sks), out)
+            dur = time.perf_counter() - t0
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"hits={sum(res)}/{n}"
-            self._metrics.on_get(pages=n, hit_pages=sum(res), nbytes=sum(ss))
+            self._metrics.on_get(pages=n, hit_pages=sum(res), nbytes=sum(ss), seconds=dur)
             return res
 
     def batch_exists(self, keys, extra_info=None) -> int:

@@ -95,6 +95,38 @@ TEST(RdmaLoopback, PutGetExistMissOverRdma) {
   EXPECT_FALSE(c.Exist("absent"));
 }
 
+// Observability counters: the server tallies request completions and the client
+// transport tallies connections opened (+ per-rail) and MR regions.
+TEST(RdmaLoopback, MetricsCountersTrackOps) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("mco");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  std::vector<char> pool(64 * 1024);
+  c.RegisterMemory(pool.data(), pool.size());
+  std::string v(2048, 'z');
+  ASSERT_TRUE(c.Put("m1", v.data(), v.size()));
+  std::string out(v.size(), '\0');
+  ASSERT_TRUE(c.Get("m1", &out[0], out.size()));
+
+  // server: at least the PUT + GET requests were completed
+  EXPECT_GE(node.rsrv->Completions(), 2u);
+  std::string srv_text = node.rsrv->MetricsText();
+  EXPECT_NE(srv_text.find("dfkv_rdma_completions_total"), std::string::npos) << srv_text;
+
+  // client transport: a connection was opened and the MR region declared
+  std::string cli_text = rt.MetricsText();
+  EXPECT_NE(cli_text.find("dfkv_rdma_client_conns_opened_total"), std::string::npos) << cli_text;
+  EXPECT_NE(cli_text.find("dfkv_rdma_client_rail_conns_total{dev="), std::string::npos) << cli_text;
+  EXPECT_NE(cli_text.find("dfkv_rdma_client_mr_regions 1"), std::string::npos) << cli_text;
+
+  // and the client snapshot folds transport metrics in after the health metrics
+  std::string snap = c.MetricsSnapshot();
+  EXPECT_NE(snap.find("dfkv_client_ops_served_total"), std::string::npos) << snap;
+  EXPECT_NE(snap.find("dfkv_rdma_client_conns_opened_total"), std::string::npos) << snap;
+}
+
 TEST(RdmaLoopback, BatchZeroCopyRoundtrip) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   RdmaNode node("bzc");

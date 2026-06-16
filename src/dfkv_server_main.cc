@@ -68,16 +68,9 @@ int main(int argc, char** argv) {
   std::printf("PORT %d\n", srv.port());
   std::fflush(stdout);
 
-  // Optional Prometheus /metrics endpoint on a dedicated port/thread (off the
-  // datapath). Absent --metrics-port => no listener, behavior unchanged.
+  // Optional Prometheus /metrics endpoint (declared here, started after the RDMA
+  // server below so its render callback can fold in the RDMA server counters).
   std::unique_ptr<dfkv::MetricsHttpServer> mhttp;
-  if (metrics_port >= 0) {
-    mhttp = std::make_unique<dfkv::MetricsHttpServer>([&srv] { return srv.MetricsText(); });
-    if (mhttp->Start(metrics_port) == Status::kOk)
-      DFKV_LOG_INFO("dfkv_server /metrics on port " + std::to_string(mhttp->port()));
-    else
-      DFKV_LOG_WARN("dfkv_server /metrics failed to start on port " + std::to_string(metrics_port));
-  }
   DFKV_LOG_INFO("dfkv_server listening on port " + std::to_string(srv.port()) + ", dir=" + dir);
 
   // Announce the transport build mode loudly so a TCP-only binary (built without
@@ -113,6 +106,22 @@ int main(int argc, char** argv) {
       DFKV_LOG_WARN("dfkv_server RDMA listener failed to start (no device?)");
   }
 #endif
+
+  // Start /metrics now that the (optional) RDMA server exists: the render
+  // callback combines the cache-node metrics with the RDMA server counters.
+  if (metrics_port >= 0) {
+    mhttp = std::make_unique<dfkv::MetricsHttpServer>([&] {
+      std::string s = srv.MetricsText();
+#ifdef DFKV_WITH_RDMA
+      if (rsrv) s += rsrv->MetricsText();
+#endif
+      return s;
+    });
+    if (mhttp->Start(metrics_port) == Status::kOk)
+      DFKV_LOG_INFO("dfkv_server /metrics on port " + std::to_string(mhttp->port()));
+    else
+      DFKV_LOG_WARN("dfkv_server /metrics failed to start on port " + std::to_string(metrics_port));
+  }
 
   std::unique_ptr<dfkv::MdsRegistrar> registrar;
   if (!mds.empty()) {

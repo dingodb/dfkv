@@ -247,14 +247,20 @@ void RdmaServer::Serve(int boot_fd) {
   std::vector<ibv_wc> wcs(K);
   bool fail = false;
   const int idle_ms = ServerIdleMs();
+  active_conns_.fetch_add(1, std::memory_order_relaxed);
   while (running_ && !fail) {
     int g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
-    if (g <= 0) break;  // <0: error / Stop()'s Wake().  0: idle_ms elapsed -> reclaim.
+    if (g == 0) { idle_reclaims_.fetch_add(1, std::memory_order_relaxed); break; }  // idle -> reclaim
+    if (g < 0) break;  // error / Stop()'s Wake()
     for (int w = 0; w < g && !fail; ++w) {
       const ibv_wc& wc = wcs[w];
-      if (wc.status != IBV_WC_SUCCESS) { fail = true; break; }
+      if (wc.status != IBV_WC_SUCCESS) {
+        completion_errors_.fetch_add(1, std::memory_order_relaxed);
+        fail = true; break;
+      }
       if (wc.opcode == IBV_WC_SEND) { free_send.push_back(static_cast<size_t>(wc.wr_id)); continue; }
       if (wc.opcode != IBV_WC_RECV || wc.byte_len < kReqPrefix) { fail = true; break; }
+      completions_.fetch_add(1, std::memory_order_relaxed);  // a request RECV
       size_t r = static_cast<size_t>(wc.wr_id);
       ReqFields rq;
       if (!DecodeReq(ep.rbuf(r), &rq)) { fail = true; break; }  // bad protocol version
@@ -273,8 +279,28 @@ void RdmaServer::Serve(int boot_fd) {
       if (!sent) { fail = true; break; }
     }
   }
+  active_conns_.fetch_sub(1, std::memory_order_relaxed);
   { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
   // ep dtor tears down the QP; the peer observes the drop as an error completion.
+}
+
+std::string RdmaServer::MetricsText() const {
+  auto m = [](std::string& s, const char* name, const char* type, const char* help,
+              uint64_t v) {
+    s += "# HELP "; s += name; s += " "; s += help; s += "\n";
+    s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
+    s += name; s += " "; s += std::to_string(v); s += "\n";
+  };
+  std::string s;
+  m(s, "dfkv_rdma_completions_total", "counter", "RDMA request completions served",
+    Completions());
+  m(s, "dfkv_rdma_completion_errors_total", "counter", "RDMA error completions",
+    CompletionErrors());
+  m(s, "dfkv_rdma_active_conns", "gauge", "RDMA connections currently serving",
+    ActiveConns());
+  m(s, "dfkv_rdma_idle_reclaims_total", "counter", "RDMA connections reclaimed on idle timeout",
+    IdleReclaims());
+  return s;
 }
 
 }  // namespace dfkv

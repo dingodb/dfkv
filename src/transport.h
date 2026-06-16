@@ -46,6 +46,11 @@ class Transport {
     (void)node; (void)out; return Status::kInvalid;
   }
 
+  // Transport-level Prometheus metrics (e.g. RDMA per-rail connections, MR
+  // registrations). Default empty; the RDMA transport overrides it. Folded into
+  // the client snapshot. Off the datapath (rendered on demand).
+  virtual std::string MetricsText() const { return ""; }
+
   // Register a large caller memory region (e.g. the whole SGLang host KV pool) for
   // zero-copy transfer. A pipelined (RDMA) transport registers it once per
   // connection so the Get/Put datapath never does a per-op MR registration —

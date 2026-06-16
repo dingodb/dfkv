@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -40,6 +41,7 @@ class RdmaTransport : public Transport {
   Status Members(const std::string& node, std::string* out) override;
 
   void RegisterMemory(void* base, size_t size) override;
+  std::string MetricsText() const override;  // dfkv_rdma_client_* (conns, per-rail)
 
   bool pipelined() const override { return true; }
   // Pipelined: up to `depth_` requests in flight on a single connection.
@@ -79,6 +81,11 @@ class RdmaTransport : public Transport {
   std::vector<std::string> devs_;     // RDMA devices (multi-rail); "" = first
   std::vector<int> dev_node_;         // NUMA node per devs_ entry (-1 unknown)
   std::atomic<size_t> rr_{0};         // round-robin selector across devs_
+  // observability (relaxed): connections opened total + per-rail breakdown +
+  // declared MR regions. Connection opens are infrequent (pooled), off the op path.
+  std::atomic<uint64_t> conns_opened_{0};
+  std::atomic<uint64_t> mr_regions_{0};
+  std::unique_ptr<std::atomic<uint64_t>[]> rail_conns_;  // sized to devs_.size()
 };
 
 }  // namespace dfkv
