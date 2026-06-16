@@ -69,6 +69,18 @@ TEST(ConHash, AddingNodeRemapsOnlyAFraction) {
   EXPECT_GT(frac, 0.05);
 }
 
+TEST(ConHash, NodePointCountsReflectWeightAndSumToRing) {
+  ConHash ring;
+  ring.AddNode("light", 1);
+  ring.AddNode("heavy", 3);
+  ring.Build();
+  auto pc = ring.NodePointCounts();
+  ASSERT_EQ(pc.size(), 2u);
+  // points sum to the realized ring size; heavy (weight 3) owns more vnodes
+  EXPECT_EQ(pc["light"] + pc["heavy"], ring.RingSize());
+  EXPECT_GT(pc["heavy"], pc["light"] * 2);
+}
+
 TEST(ConHash, WeightShiftsShareProportionally) {
   ConHash ring;
   ring.AddNode("light", 1);

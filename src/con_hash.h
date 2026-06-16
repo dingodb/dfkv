@@ -18,6 +18,10 @@ class ConHash {
   // Returns false when the ring is empty.
   bool Lookup(const std::string& key, std::string* node) const;
   size_t NodeCount() const { return nodes_.size(); }
+  size_t RingSize() const { return ring_.size(); }
+  // Ring points owned per node (the realized vnode distribution after hash
+  // collisions). Used by `dfkvctl ring` to show routing share. Off the datapath.
+  std::map<std::string, size_t> NodePointCounts() const;
 
  private:
   std::vector<std::pair<std::string, int>> nodes_;  // (name, weight)

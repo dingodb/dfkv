@@ -28,6 +28,12 @@ void ConHash::Build() {
   }
 }
 
+std::map<std::string, size_t> ConHash::NodePointCounts() const {
+  std::map<std::string, size_t> counts;
+  for (const auto& [point, name] : ring_) counts[name]++;
+  return counts;
+}
+
 bool ConHash::Lookup(const std::string& key, std::string* node) const {
   if (ring_.empty()) return false;
   uint32_t h = Md5_32(key);
