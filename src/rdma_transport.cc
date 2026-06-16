@@ -8,6 +8,8 @@
 
 #include "net_util.h"     // Dial / WriteAll / ReadAll / Put*/Get*
 #include "rdma_verbs.h"   // RcEndpoint, QpInfo
+#include "numa_util.h"     // numa::DeviceNode / CurrentNode / Enabled
+#include "rail_select.h"   // rdma::PickRail
 
 namespace dfkv {
 
@@ -68,6 +70,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     i = c + 1;
   }
   if (devs_.empty()) devs_.push_back("");  // first available device
+  for (const auto& d : devs_)
+    dev_node_.push_back(numa::DeviceNode(d.empty() ? nullptr : d.c_str()));
   const char* d = std::getenv("DFKV_RDMA_DEPTH");  // pipeline depth (must be <= server's)
   if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
   connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);
@@ -106,8 +110,11 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   int fd = net::Dial(node, connect_ms_, io_ms_);
   if (fd < 0) return nullptr;
 
-  // Round-robin a device for this connection (multi-rail spreads load over ports).
-  const std::string& dev = devs_[rr_.fetch_add(1, std::memory_order_relaxed) % devs_.size()];
+  // Pick a device for this connection: NUMA-aware when DFKV_RDMA_NUMA is on
+  // (prefer a rail on the calling thread's NUMA node), else round-robin all.
+  size_t tick = rr_.fetch_add(1, std::memory_order_relaxed);
+  const std::string& dev =
+      devs_[rdma::PickRail(dev_node_, numa::CurrentNode(), numa::Enabled(), tick)];
 
   auto* c = new Conn();
   if (!c->ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, depth_)) {
