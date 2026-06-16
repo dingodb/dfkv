@@ -94,12 +94,18 @@ docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
 - **Connection pooling + keep-alive** (TCP_NODELAY): ~250× lower latency vs dial-per-call.
 - **Batch APIs** with concurrent fan-out across nodes (`BatchPut/Get/Exist`, C ABI + plugin).
 - **Connect/IO timeouts + stale-connection retry**: a hung node fails fast, never hangs.
-- **Metrics**: server counters + Prometheus text (`dfkvctl stat <node>` / `kStats` op).
+- **Observability** ([docs/METRICS.md](docs/METRICS.md)): opt-in embedded Prometheus
+  `/metrics` on `dfkv_server` and `dfkv_mds` (`--metrics-port`); sampled op-latency
+  histogram, eviction/error/per-disk/RDMA counters server-side; client-side counters
+  (peer health, IO errors) via `dfkv_stats_snapshot` + a plugin poller. **Opt-in and
+  off the datapath** — no `--metrics-port` ⇒ no listener, behavior unchanged.
 - **Dynamic membership**: MDS discovery (`dfkv_start_mds_discovery`) polls the MDS
   tier and rebuilds the weighted Ketama ring on each etcd-epoch change. Legacy
   `SetMembers()` hot-swap and `dfkv_refresh_members` (single-seed query) are still
   supported.
-- **CLI tools**: `dfkv_smoke` (roundtrip check), `dfkvctl` (put/get/exist/stat).
+- **CLI tools**: `dfkv_smoke` (roundtrip check), `dfkvctl` — per-node ops
+  (`put/get/exist/stat`) plus cluster views: `dfkvctl ring` (membership + ring vnode
+  share) and `dfkvctl stat --all` (per-node metrics + cluster aggregate) via MDS.
 - **RDMA transport** (gated `-DDFKV_WITH_RDMA=ON`, native libibverbs RC): device
   selected **by name** (`DFKV_RDMA_DEV=ib7s400p0`, comma-list = multi-rail), QP
   bootstrapped over a tiny TCP channel so the 400G data fabric needs no IP and may
