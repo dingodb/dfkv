@@ -79,3 +79,101 @@ class Metrics:
     def snapshot(self):
         with self._lock:
             return dict(self._c)
+
+
+# --- client-side snapshot mirroring (from the C client via dfkv_stats_snapshot) ---
+#
+# The C++ KVClient accumulates client-observed counters (ops served, IO errors,
+# peer-health transitions) that the Python layer can't see. A sleeping daemon
+# thread polls the snapshot text and mirrors the aggregate counters onto
+# Prometheus Counters by delta, so they aggregate across the per-TP-rank
+# processes in SGLang's multiprocess metrics mode. Off the request hot path.
+
+_CLIENT_NAMES = [
+    "dfkv_client_ops_served_total",
+    "dfkv_client_io_errors_total",
+    "dfkv_client_unhealthy_skips_total",
+    "dfkv_client_peer_marked_bad_total",
+    "dfkv_client_peer_recovered_total",
+]
+
+_CLIENT_PROM = {}
+if _HAVE_PROM:
+    for _n in _CLIENT_NAMES:
+        try:
+            _CLIENT_PROM[_n] = _PromCounter(_n, _n, ["tp_rank"])
+        except Exception:
+            _CLIENT_PROM = {}
+            break
+
+
+class ClientStatsPoller:
+    """Polls a Prometheus-text snapshot provider and mirrors the aggregate client
+    counters onto Prometheus Counters by delta. One sleeping daemon thread."""
+
+    def __init__(self, get_text, tp_rank, interval_s=10.0):
+        self._get_text = get_text
+        self._rank = str(int(tp_rank))
+        self._interval = float(interval_s)
+        self._last = {n: 0 for n in _CLIENT_NAMES}
+        self._totals = {n: 0 for n in _CLIENT_NAMES}  # in-process mirror (tests/debug)
+        self._stop = threading.Event()
+        self._thread = None
+
+    @staticmethod
+    def _parse(text):
+        out = {}
+        for line in text.splitlines():
+            if not line or line[0] == "#":
+                continue
+            sp = line.rfind(" ")
+            if sp <= 0:
+                continue
+            name = line[:sp]
+            brace = name.find("{")
+            if brace != -1:
+                name = name[:brace]
+            if name in _CLIENT_NAMES:
+                try:
+                    out[name] = out.get(name, 0) + int(line[sp + 1:])
+                except ValueError:
+                    pass
+        return out
+
+    def poll_once(self):
+        vals = self._parse(self._get_text() or "")
+        for n in _CLIENT_NAMES:
+            v = vals.get(n, 0)
+            d = v - self._last[n]
+            if d > 0:
+                self._last[n] = v
+                self._totals[n] += d
+                if _HAVE_PROM and n in _CLIENT_PROM:
+                    _CLIENT_PROM[n].labels(self._rank).inc(d)
+
+    def totals(self):
+        return dict(self._totals)
+
+    def _loop(self):
+        while not self._stop.wait(self._interval):
+            try:
+                self.poll_once()
+            except Exception:
+                pass  # never let a transient snapshot error kill the thread
+
+    def start(self):
+        if self._interval <= 0:
+            return  # disabled
+        try:
+            self.poll_once()  # immediate first read
+        except Exception:
+            pass
+        self._thread = threading.Thread(target=self._loop, name="dfkv-client-stats",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None

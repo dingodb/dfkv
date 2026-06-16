@@ -6,6 +6,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+#include <string>
+#include <vector>
+
 namespace {
 dfkv_client_t OpenEmpty() {
   // members="" => discovery-only; ring stays empty until MDS discovery runs.
@@ -34,6 +38,25 @@ TEST(CApiGuard, RejectsNullArraysWithPositiveN) {
   EXPECT_EQ(dfkv_put(c, nullptr, "v", 1), -1);
   EXPECT_EQ(dfkv_get(c, nullptr, nullptr, 0), 0);
   EXPECT_EQ(dfkv_exist(c, nullptr), 0);
+  dfkv_close(c);
+}
+
+TEST(CApiStats, SnapshotSizingAndContent) {
+  dfkv_client_t c = OpenEmpty();
+  ASSERT_NE(c, nullptr);
+  // a few ops against the empty ring exercise the health/metrics chokepoint
+  EXPECT_EQ(dfkv_get(c, "k", nullptr, 0), 0);
+  // size query: cap=0 returns the full length without writing
+  uint64_t need = dfkv_stats_snapshot(c, nullptr, 0);
+  EXPECT_GT(need, 0u);
+  // full read: NUL-terminated, contains the client metric family
+  std::vector<char> buf(need + 1, 'X');
+  uint64_t n = dfkv_stats_snapshot(c, buf.data(), buf.size());
+  EXPECT_EQ(n, need);
+  EXPECT_EQ(buf[need], '\0');
+  EXPECT_NE(std::string(buf.data()).find("dfkv_client_ops_served_total"), std::string::npos);
+  // null-client snapshot is 0, no crash
+  EXPECT_EQ(dfkv_stats_snapshot(nullptr, buf.data(), buf.size()), 0u);
   dfkv_close(c);
 }
 

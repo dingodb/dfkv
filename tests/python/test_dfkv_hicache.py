@@ -618,5 +618,60 @@ class DfkvAccessLogRotationTest(unittest.TestCase):
         self.assertFalse(os.path.exists(base + ".1"))  # 128MiB default not reached
 
 
+class ClientStatsPollerTest(unittest.TestCase):
+    """Mirrors the C client's Prometheus snapshot onto delta counters. Pure
+    module-level: feeds a fake snapshot provider, no node / libdfkv.so."""
+
+    def _poller(self, texts):
+        from dfkv_metrics import ClientStatsPoller
+        # get_text returns successive snapshots from `texts`, repeating the last
+        seq = {"i": 0}
+
+        def get_text():
+            i = min(seq["i"], len(texts) - 1)
+            seq["i"] += 1
+            return texts[i]
+
+        return ClientStatsPoller(get_text, tp_rank=0, interval_s=0.01)
+
+    def test_parse_handles_bare_and_labeled(self):
+        from dfkv_metrics import ClientStatsPoller
+        text = ("# TYPE dfkv_client_ops_served_total counter\n"
+                "dfkv_client_ops_served_total 7\n"
+                "dfkv_client_peer_errors_total{peer=\"1.2.3.4:1\"} 3\n")
+        vals = ClientStatsPoller._parse(text)
+        self.assertEqual(vals.get("dfkv_client_ops_served_total"), 7)
+        # per-peer series is not in the mirrored aggregate set
+        self.assertNotIn("dfkv_client_peer_errors_total", vals)
+
+    def test_poll_once_accumulates_deltas(self):
+        p = self._poller([
+            "dfkv_client_ops_served_total 5\ndfkv_client_io_errors_total 1\n",
+            "dfkv_client_ops_served_total 8\ndfkv_client_io_errors_total 1\n",
+        ])
+        p.poll_once()  # first read: delta 5 (from 0)
+        t1 = p.totals()
+        self.assertEqual(t1["dfkv_client_ops_served_total"], 5)
+        self.assertEqual(t1["dfkv_client_io_errors_total"], 1)
+        p.poll_once()  # cumulative 8 -> delta +3
+        t2 = p.totals()
+        self.assertEqual(t2["dfkv_client_ops_served_total"], 8)
+        self.assertEqual(t2["dfkv_client_io_errors_total"], 1)  # unchanged
+
+    def test_disabled_interval_starts_no_thread(self):
+        from dfkv_metrics import ClientStatsPoller
+        p = ClientStatsPoller(lambda: "", tp_rank=0, interval_s=0)
+        p.start()
+        self.assertIsNone(p._thread)
+        p.stop()  # must not crash
+
+    def test_start_stop_lifecycle(self):
+        p = self._poller(["dfkv_client_ops_served_total 1\n"])
+        p.start()
+        self.assertIsNotNone(p._thread)
+        p.stop()
+        self.assertIsNone(p._thread)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
