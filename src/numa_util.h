@@ -83,6 +83,47 @@ inline void PinThreadToNode(int node) {
   if (CPU_COUNT(&set) > 0) ::sched_setaffinity(0, sizeof(set), &set);
 }
 
+// True if cpu id is present in a sysfs cpulist like "0-3,8-11" or "5".
+inline bool CpuInList(const char* list, int cpu) {
+  if (!list) return false;
+  const char* p = list;
+  while (*p) {
+    int lo = -1, hi = -1, consumed = 0;
+    if (std::sscanf(p, "%d-%d%n", &lo, &hi, &consumed) >= 2) {
+      if (cpu >= lo && cpu <= hi) return true;
+    } else if (std::sscanf(p, "%d%n", &lo, &consumed) >= 1) {
+      if (cpu == lo) return true;
+    } else {
+      break;
+    }
+    p += consumed;
+    while (*p == ',' || *p == ' ' || *p == '\n') ++p;
+  }
+  return false;
+}
+
+// NUMA node of the calling thread's current CPU (sysfs), or -1 if unknown/single.
+inline int CurrentNode() {
+  int cpu = ::sched_getcpu();
+  if (cpu < 0) return -1;
+  for (int node = 0; node < 256; ++node) {
+    char path[256];
+    std::snprintf(path, sizeof(path),
+                  "/sys/devices/system/node/node%d/cpulist", node);
+    FILE* f = std::fopen(path, "r");
+    if (!f) continue;
+    char buf[8192] = {0};
+    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    // If the list filled the buffer it was likely truncated mid-token; skip
+    // this node rather than risk parsing a severed range (degrades to -1 ->
+    // round-robin all rails, never a wrong NUMA classification).
+    if (n == sizeof(buf) - 1) continue;
+    if (n && CpuInList(buf, cpu)) return node;
+  }
+  return -1;
+}
+
 }  // namespace numa
 }  // namespace dfkv
 
