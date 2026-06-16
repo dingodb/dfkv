@@ -152,31 +152,53 @@ jobs:
   portable-static-build:
     name: portable static artifacts
     runs-on: ubuntu-latest
+    # Build inside ubuntu:22.04 (glibc 2.35) so the dynamically-linked artifacts
+    # have a low glibc floor and run on any node with glibc >= 2.35. Building on
+    # the runner's ubuntu-latest (glibc 2.39) bakes in GLIBC_2.3x symbols that
+    # FAIL on older deploy nodes. RDMA-enabled + static libstdc++/libgcc;
+    # libibverbs stays dynamic (it dlopen()s provider drivers at runtime).
+    container: ubuntu:22.04
     steps:
-      - uses: actions/checkout@v6
-      - name: Install deps
+      # Bare container: install the toolchain (incl. git, for checkout) first.
+      - name: Install build deps
         run: |
-          # Drop preinstalled third-party apt sources (google-chrome, microsoft):
-          # their mirrors intermittently fail `apt-get update` with a size mismatch
-          # ("File has unexpected size ... Mirror sync in progress"), which has
-          # nothing to do with our deps (all from the Ubuntu archive).
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-                     /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ git ca-certificates
-      - name: Build static-libstdc++ artifacts (no tests)
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ binutils git ca-certificates libibverbs-dev xz-utils tar
+      - uses: actions/checkout@v6
+      - name: Build portable RDMA artifacts (static libstdc++, no tests)
         run: |
           cmake -S . -B build-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DDFKV_BUILD_TESTS=OFF -DDFKV_STATIC_LIBSTDCXX=ON
+            -DDFKV_BUILD_TESTS=OFF -DDFKV_WITH_RDMA=ON -DDFKV_STATIC_LIBSTDCXX=ON
           cmake --build build-static -j
-      - name: Show artifact deps
+          strip build-static/dfkv_server build-static/dfkv_mds build-static/dfkv_bench \
+                build-static/dfkv_smoke build-static/dfkvctl build-static/libdfkv.so || true
+      - name: Verify portability (glibc floor + RDMA linked + static libstdc++)
         run: |
-          ldd build-static/dfkv_server || true
-          ls -la build-static/dfkv_server build-static/libdfkv.so
+          echo "== glibc floor (must be <= 2.35) =="
+          objdump -T build-static/dfkv_server build-static/libdfkv.so \
+            | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -3
+          echo "== libdfkv.so deps (expect libibverbs, NOT libstdc++) =="
+          ldd build-static/libdfkv.so
+          if ldd build-static/libdfkv.so | grep -q 'libstdc++'; then
+            echo 'ERROR: libstdc++ is not statically linked'; exit 1; fi
+          if objdump -T build-static/dfkv_server build-static/libdfkv.so \
+               | grep -qoE 'GLIBC_2\.(3[6-9]|[4-9][0-9])'; then
+            echo 'ERROR: glibc floor exceeds 2.35'; exit 1; fi
+      - name: Package portable tarball
+        run: |
+          V=$(cat VERSION)
+          PKG="dfkv-${V}-linux-x86_64"
+          mkdir -p "$PKG/bin" "$PKG/lib" "$PKG/python"
+          cp build-static/dfkv_server build-static/dfkv_mds build-static/dfkv_bench \
+             build-static/dfkv_smoke build-static/dfkvctl "$PKG/bin/"
+          cp build-static/libdfkv.so "$PKG/lib/"
+          cp python/dfkv_hicache.py python/dfkv_access_log.py python/dfkv_metrics.py "$PKG/python/"
+          cp README.md VERSION LICENSE "$PKG/"
+          tar czf "${PKG}.tar.gz" "$PKG"
+          sha256sum "${PKG}.tar.gz"
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: dfkv-linux-x86_64
-          path: |
-            build-static/dfkv_server
-            build-static/libdfkv.so
+          path: dfkv-*-linux-x86_64.tar.gz
