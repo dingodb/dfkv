@@ -212,6 +212,28 @@ bool KVClient::GetAuto(const std::string& key, std::string* out, size_t max_byte
   return true;
 }
 
+bool KVClient::GetAuto(const std::string& key, void* out, size_t cap, size_t* out_len) {
+  std::string node = Route(key);
+  if (node.empty()) return false;
+  uint64_t now = NowMs();
+  if (!health_.Healthy(node, now)) return false;
+  // Read [header | up-to-cap payload]; the header tells us the true payload_len.
+  std::string raw;
+  Status st = t_->Range(node, ToBlockKey(key), 0, ValueHeader::kSize + cap, &raw);
+  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
+  health_.MarkGood(node);
+  if (st != Status::kOk) return false;
+  if (raw.size() < ValueHeader::kSize) return false;
+  ValueHeader h;
+  if (!ValueHeader::Parse(raw.data(), raw.size(), &h)) return false;
+  if (!HeaderMatches(self_hdr_, h)) return false;        // geometry drift => miss
+  if (h.payload_len > cap) return false;                 // won't fit caller buffer
+  if (raw.size() < ValueHeader::kSize + h.payload_len) return false;
+  if (h.payload_len) std::memcpy(out, raw.data() + ValueHeader::kSize, h.payload_len);
+  if (out_len) *out_len = h.payload_len;
+  return true;
+}
+
 bool KVClient::Exist(const std::string& key) {
   std::string node = Route(key);
   if (node.empty()) return false;
@@ -313,6 +335,62 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
       hit[idx[m]] = 1;
     }
   });
+  return std::vector<bool>(hit.begin(), hit.end());
+}
+
+std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
+                                         std::vector<size_t>* out_lens) {
+  const size_t N = items.size();
+  std::vector<char> hit(N, 0);
+  std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
+  if (!t_->pipelined()) {  // TCP: parallelize per item with our own threads.
+    RunParallel(N, batch_concurrency_, [&](size_t i) {
+      size_t got = 0;
+      if (GetAuto(items[i].key, items[i].out, items[i].n, &got)) { hit[i] = 1; lens[i] = got; }
+    });
+    if (out_lens) *out_lens = std::move(lens);
+    return std::vector<bool>(hit.begin(), hit.end());
+  }
+  // RDMA: group by (node, cap) so each group shares the Range length, then
+  // pipeline. Same zero-copy datapath as BatchGet; the only difference is we
+  // accept any payload_len <= cap (instead of == n) and report the true length.
+  std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
+  for (size_t i = 0; i < N; ++i) {
+    std::string node = Route(items[i].key);
+    if (node.empty()) continue;
+    by[{node, items[i].n}].push_back(i);
+  }
+  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups(by.begin(), by.end());
+  RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
+    const std::string& node = groups[g].first.first;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) return;
+    const size_t cap = groups[g].first.second;
+    const std::vector<size_t>& idx = groups[g].second;
+    std::vector<BlockKey> keys;
+    std::vector<RangeDst> dsts;
+    keys.reserve(idx.size());
+    dsts.reserve(idx.size());
+    for (size_t k : idx) {
+      keys.push_back(ToBlockKey(items[k].key));
+      dsts.push_back(RangeDst{items[k].out, cap});
+    }
+    std::vector<std::string> hdrs;
+    std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
+    bool resp = false, ioerr = false;
+    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    for (size_t m = 0; m < idx.size(); ++m) {
+      if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
+      ValueHeader h;
+      if (!ValueHeader::Parse(hdrs[m].data(), hdrs[m].size(), &h)) continue;
+      if (!HeaderMatches(self_hdr_, h)) continue;
+      if (h.payload_len > cap) continue;  // doesn't fit caller buffer => miss
+      lens[idx[m]] = h.payload_len;
+      hit[idx[m]] = 1;
+    }
+  });
+  if (out_lens) *out_lens = std::move(lens);
   return std::vector<bool>(hit.begin(), hit.end());
 }
 

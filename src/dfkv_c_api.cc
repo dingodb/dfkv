@@ -54,6 +54,16 @@ int dfkv_get(dfkv_client_t c, const char* key, void* ptr, uint64_t n) {
   return static_cast<KVClient*>(c)->Get(key, ptr, static_cast<size_t>(n)) ? 1 : 0;
 }
 
+int dfkv_get_auto(dfkv_client_t c, const char* key, void* ptr, uint64_t cap,
+                  uint64_t* out_len) {
+  if (out_len) *out_len = 0;
+  if (!c || !key) return 0;  // 0 == miss
+  size_t got = 0;
+  bool hit = static_cast<KVClient*>(c)->GetAuto(key, ptr, static_cast<size_t>(cap), &got);
+  if (out_len) *out_len = static_cast<uint64_t>(got);
+  return hit ? 1 : 0;
+}
+
 int dfkv_exist(dfkv_client_t c, const char* key) {
   if (!c || !key) return 0;
   return static_cast<KVClient*>(c)->Exist(key) ? 1 : 0;
@@ -98,6 +108,28 @@ int dfkv_batch_get(dfkv_client_t c, const char** keys, void** ptrs,
   }
   auto r = static_cast<KVClient*>(c)->BatchGet(items);
   for (int i = 0; i < n; ++i) out_hit[i] = (keys[i] && r[i]) ? 1 : 0;
+  return 0;
+}
+
+int dfkv_batch_get_auto(dfkv_client_t c, const char** keys, void** ptrs,
+                        const uint64_t* caps, int n, int* out_hit,
+                        uint64_t* out_len) {
+  if (!c || n < 0) return -1;
+  if (n > 0 && (!keys || !ptrs || !caps || !out_hit || !out_len)) return -1;
+  std::vector<dfkv::KvGetItem> items(n);
+  for (int i = 0; i < n; ++i) {
+    const char* k = keys[i];
+    // items[i].n carries the buffer CAPACITY for the variable-size read.
+    items[i] = {k ? std::string(k) : std::string(), k ? ptrs[i] : nullptr,
+                k ? static_cast<size_t>(caps[i]) : 0};
+  }
+  std::vector<size_t> lens;
+  auto r = static_cast<KVClient*>(c)->BatchGetAuto(items, &lens);
+  for (int i = 0; i < n; ++i) {
+    bool hit = keys[i] && r[i];
+    out_hit[i] = hit ? 1 : 0;
+    out_len[i] = hit ? static_cast<uint64_t>(lens[i]) : 0;
+  }
   return 0;
 }
 

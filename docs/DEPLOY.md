@@ -199,7 +199,7 @@ sglang serve ... \
 > `interface_v1:1` 触发零拷贝 `batch_set_v1/get_v1` —— GET payload 经 RDMA 散射**直落 HiCache 宿主页**（client 端零拷贝），server 端 O_DIRECT 直读入已注册 direct buffer 并 scatter-send（server 端无 payload memcpy），两端零拷贝。
 > MLA 下插件自动单对象、无 rank 后缀、`backup_skip`（仅 tp_rank0 写）。decode 共享前缀配同 members。
 > 多池模型（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
-> 排查命中率/慢操作：可开启 access log（`access_log`/`access_log_path` 或 `DFKV_ACCESS_LOG_*`），见 [access_log.md](access_log.md)。
+> 排查命中率/慢操作：可开启 access log（`access_log`/`access_log_path` 或 `DFKV_ACCESS_LOG_*`），见 [access_log.md](hicache/access_log.md)。
 
 ## 6. 上线顺序 + 冒烟（无需 GPU）
 

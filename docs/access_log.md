@@ -41,7 +41,7 @@
 
 ### 方式 A — SGLang 启动 JSON（推荐，贴合 dfkv 现有 `extra_config` 约定）
 
-在 [DEPLOY.md](DEPLOY.md) 的 `--hicache-storage-backend-extra-config` JSON 里加 access_log 三个键：
+在 [DEPLOY.md](../DEPLOY.md) 的 `--hicache-storage-backend-extra-config` JSON 里加 access_log 三个键：
 
 ```bash
 sglang serve ... \

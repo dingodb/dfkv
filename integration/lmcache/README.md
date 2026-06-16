@@ -1,0 +1,71 @@
+# dfkv connector for LMCache
+
+An LMCache `RemoteConnector` that stores KV-cache chunks in a **dfkv** cluster.
+It talks to dfkv through the C ABI (`libdfkv.so`) via Python **ctypes** — there
+is no native CPython extension to compile, so the wheel is pure Python.
+
+Ported from the dingofs LMCache connector with two changes:
+
+1. **Arbitrary block size.** The dingofs connector hard-capped a block at 4 MiB
+   (its cache node used fixed io_uring buffers). dfkv has no such cap; this
+   connector handles whatever `full_chunk_size_bytes` LMCache computes and reads
+   back variable-size ("unfull") chunks at their true stored length via the
+   `dfkv_get_auto` / `dfkv_batch_get_auto` C ABI (which the dfkv build adds).
+2. **ctypes backend.** Replaces the dingofs pybind11 `_dingofs_native` module
+   with direct `libdfkv.so` calls dispatched to a thread-pool executor (ctypes
+   releases the GIL during foreign calls, and one `dfkv_open` handle is
+   thread-safe to share).
+
+See [docs/lmcache/](../../docs/lmcache/) for the design, implementation, and
+deployment guides.
+
+## Build & install
+
+```bash
+# 1) Build libdfkv.so (RDMA transport) from the top-level dfkv CMake.
+make lib                       # -> ../../build-rdma/libdfkv.so
+export DFKV_LIB=$(pwd)/../../build-rdma/libdfkv.so
+
+# 2) Install the connector into the same venv as vLLM + LMCache.
+make install                   # or: make install-dev   (editable)
+```
+
+## Configure LMCache (plugin mode)
+
+```yaml
+chunk_size: 16
+local_cpu: false
+save_chunk_meta: false
+remote_storage_plugins: ["dfkv"]
+extra_config:
+  remote_storage_plugin.dfkv.module_path: dfkv_connector.adapter
+  remote_storage_plugin.dfkv.class_name:  DfkvConnectorAdapter
+  remote_storage_plugin.dfkv.url:         dfkv://<mds_ip:port,...>/<group>
+  remote_storage_plugin.dfkv.membership:  mds            # or "static"
+  remote_storage_plugin.dfkv.lib:         /path/to/libdfkv.so
+```
+
+- **mds membership** (default): the URL host part is a comma-separated list of
+  dfkv MDS `ip:port` endpoints; the ring is discovered for `<group>`.
+- **static membership**: the URL host part is a literal member string,
+  `dfkv://n1=10.0.0.1:12000,n2=10.0.0.2:12000/unused`.
+
+The library is found via (highest first) `remote_storage_plugin.dfkv.lib` →
+env `DFKV_LIB` → `$DFKV_BUILD/libdfkv.so`.
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DFKV_LIB` | `$DFKV_BUILD/libdfkv.so` | path to `libdfkv.so` |
+| `DFKV_CONNECTOR_GET_PARALLELISM` | 1 | concurrent batched-get groups (executor workers) |
+| `DFKV_CONNECTOR_BATCH_MAX_KEYS` | 512 | max keys per native batch call |
+| `DFKV_CONNECTOR_ASSUME_EXISTS` | 0 | skip remote contains checks (debug) |
+| `DFKV_ACCESS_LOG_ENABLED` | 0 | per-op access log |
+| `DFKV_ACCESS_LOG_PATH` | (stderr) | access-log file path |
+
+## Limitations
+
+- No L2-adapter path (the dingofs L2 adapter was bound to the native eventfd
+  model dfkv doesn't have). Only the `remote_storage_plugin` path is supported.
+- No `remove` / enumeration (`list()` returns `[]`) — dfkv has no such RPC.

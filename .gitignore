@@ -7,3 +7,9 @@ __pycache__/
 *.pyc
 compile_commands.json
 /build-*/
+
+# Python build artifacts
+*.egg-info/
+integration/lmcache/build/
+integration/lmcache/dist/
+.cache/

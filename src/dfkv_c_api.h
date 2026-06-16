@@ -23,6 +23,12 @@ dfkv_client_t dfkv_open(const char* members, uint64_t model_hash,
 
 int dfkv_put(dfkv_client_t c, const char* key, const void* ptr, uint64_t n);  // 0=ok
 int dfkv_get(dfkv_client_t c, const char* key, void* ptr, uint64_t n);        // 1=hit,0=miss
+// Variable-size get: writes the stored payload (whatever length it was put with)
+// into ptr (which has capacity `cap`) and reports the actual byte length via
+// *out_len. Unlike dfkv_get, the caller does NOT need to know the exact stored
+// size; a stored payload larger than cap is a miss. 1=hit, 0=miss.
+int dfkv_get_auto(dfkv_client_t c, const char* key, void* ptr, uint64_t cap,
+                  uint64_t* out_len);
 int dfkv_exist(dfkv_client_t c, const char* key);                            // 1/0
 // Register a large host memory region (e.g. the whole SGLang host KV pool) so
 // put/get into any buffer inside it never do a per-op RDMA MR registration — the
@@ -45,6 +51,14 @@ int dfkv_batch_put(dfkv_client_t c, const char** keys, const void** ptrs,
                    const uint64_t* sizes, int n, int* out_ok);
 int dfkv_batch_get(dfkv_client_t c, const char** keys, void** ptrs,
                    const uint64_t* sizes, int n, int* out_hit);
+// Variable-size batched get. caps[i] is the buffer capacity of ptrs[i]; the
+// stored payload (any size <= caps[i]) is written into ptrs[i]. out_hit[i] is
+// 1/0; out_len[i] (caller array, len n) receives the actual payload byte length
+// per item (0 on miss). Keeps the RDMA zero-copy datapath for full-size items.
+// Return 0 on call success.
+int dfkv_batch_get_auto(dfkv_client_t c, const char** keys, void** ptrs,
+                        const uint64_t* caps, int n, int* out_hit,
+                        uint64_t* out_len);
 int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist);
 
 void dfkv_close(dfkv_client_t c);

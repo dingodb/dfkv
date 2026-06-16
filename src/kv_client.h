@@ -42,11 +42,26 @@ class KVClient {
   // Variable-size get: learns payload length from the stored header. For CLI/
   // tooling where the caller doesn't know the page size up front.
   bool GetAuto(const std::string& key, std::string* out, size_t max_bytes = (64u << 20));
+  // Variable-size get into a caller buffer of capacity `cap`. On hit, writes the
+  // stored payload (whatever length it was Put with) and reports its true length
+  // via *out_len; returns false (miss) on geometry mismatch, route/health failure,
+  // or if the stored payload would not fit in `cap`. Unlike Get(), it does NOT
+  // require the caller to know the exact stored size — the LMCache connector uses
+  // it to read back variable-size (unfull) chunks.
+  bool GetAuto(const std::string& key, void* out, size_t cap, size_t* out_len);
   bool Exist(const std::string& key);
 
   // Batched, concurrently fanned out across owning nodes. Per-item results.
   std::vector<bool> BatchPut(const std::vector<KvPutItem>& items);
   std::vector<bool> BatchGet(const std::vector<KvGetItem>& items);  // hit/miss
+  // Variable-size batched get. items[i].n is the buffer CAPACITY (not the exact
+  // payload size); out_lens (if non-null) receives the actual stored payload
+  // length per item. Per-item hit/miss like BatchGet, but it accepts any stored
+  // size that fits in the buffer instead of requiring payload_len == n — so it
+  // reads back unfull/variable chunks. Keeps the RDMA zero-copy datapath for
+  // full-size items (same RangeInto path as BatchGet).
+  std::vector<bool> BatchGetAuto(const std::vector<KvGetItem>& items,
+                                 std::vector<size_t>* out_lens);
   std::vector<bool> BatchExist(const std::vector<std::string>& keys);
 
   void set_batch_concurrency(size_t n) { batch_concurrency_ = n ? n : 1; }

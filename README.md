@@ -78,9 +78,17 @@ Full rollout runbook (etcd + MDS + systemd units): `docs/DEPLOY.md`.
 ```
 src/        portable C++ core (headers + .cc) + dfkv_server_main.cc + dfkv_mds_main.cc
 python/     dfkv_hicache.py  (SGLang dynamic backend plugin)
+integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libdfkv.so)
 tests/      gtest suites + tests/python (unittest + no-torch sglang shim)
 docs/       DEPLOY.md (standalone rollout) · INTEGRATION.md (fuse into dingo-cache)
+docs/hicache/  SGLang HiCache plugin docs (access_log, module README)
+docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
 ```
+
+## Engine integrations
+- **SGLang HiCache**: `python/dfkv_hicache.py` — see `docs/hicache/` and `docs/DEPLOY.md`.
+- **LMCache**: `integration/lmcache/` (`dfkv_connector`) — see `docs/lmcache/DESIGN.md`,
+  `docs/lmcache/IMPLEMENTATION.md`, `docs/lmcache/DEPLOY.md`.
 
 ## Operability & performance features
 - **Connection pooling + keep-alive** (TCP_NODELAY): ~250× lower latency vs dial-per-call.
