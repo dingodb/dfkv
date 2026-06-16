@@ -40,6 +40,12 @@ class DiskCacheGroup {
   uint64_t UsedBytes() const;   // summed across disks
   size_t Count() const;         // summed across disks
   size_t DiskCount() const { return disks_.size(); }
+  uint64_t Evictions() const;     // summed across disks
+  uint64_t EvictedBytes() const;  // summed across disks
+  // Per-disk views for fine-grained metrics (i in [0, DiskCount)).
+  const std::string& DiskPath(size_t i) const { return disks_[i]->Dir(); }
+  uint64_t DiskUsedBytes(size_t i) const { return disks_[i]->UsedBytes(); }
+  size_t DiskObjects(size_t i) const { return disks_[i]->Count(); }
 
  private:
   KVStore* Route(const BlockKey& key) const;

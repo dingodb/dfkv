@@ -141,6 +141,9 @@ TEST_F(KVStoreTest, LruEvictsLeastRecentlyUsedWhenOverCapacity) {
   EXPECT_FALSE(s.IsCached(BlockKey{2, 0, 1}));
   EXPECT_TRUE(s.IsCached(BlockKey{3, 0, 1}));
   EXPECT_LE(s.UsedBytes(), 2200u);
+  // eviction counters tracked the one evicted 1000-byte object
+  EXPECT_EQ(s.Evictions(), 1u);
+  EXPECT_EQ(s.EvictedBytes(), 1000u);
 }
 
 // All-hot eviction: every resident entry is marked referenced right before each
