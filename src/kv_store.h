@@ -65,6 +65,9 @@ class KVStore {
 
   uint64_t UsedBytes() const;
   size_t Count() const;
+  uint64_t Evictions() const { return evictions_.load(std::memory_order_relaxed); }
+  uint64_t EvictedBytes() const { return evicted_bytes_.load(std::memory_order_relaxed); }
+  const std::string& Dir() const { return opt_.cache_dir; }
 
  private:
   struct Entry {
@@ -94,6 +97,8 @@ class KVStore {
   Options opt_;
   std::vector<std::unique_ptr<Shard>> shards_;  // fixed after construction
   std::atomic<uint64_t> tmp_seq_{0};  // unique suffix for concurrent lock-free writes
+  // Eviction counters (relaxed): incremented in EvictLocked across shards.
+  std::atomic<uint64_t> evictions_{0}, evicted_bytes_{0};
 };
 
 }  // namespace dfkv

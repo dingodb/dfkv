@@ -69,4 +69,16 @@ size_t DiskCacheGroup::Count() const {
   return t;
 }
 
+uint64_t DiskCacheGroup::Evictions() const {
+  uint64_t t = 0;
+  for (const auto& d : disks_) t += d->Evictions();
+  return t;
+}
+
+uint64_t DiskCacheGroup::EvictedBytes() const {
+  uint64_t t = 0;
+  for (const auto& d : disks_) t += d->EvictedBytes();
+  return t;
+}
+
 }  // namespace dfkv

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "disk_cache_group.h"
+#include "latency_hist.h"
 
 namespace dfkv {
 
@@ -77,6 +78,11 @@ class KvNodeServer {
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
+  // depth metrics: errors by op, live connections, sampled op latency
+  std::atomic<size_t> put_io_err_{0}, get_io_err_{0}, invalid_ops_{0};
+  std::atomic<size_t> open_connections_{0};
+  Sampler lat_sampler_{64};        // 1-in-64 latency sampling (near-zero hot-path cost)
+  LatencyHist get_lat_, put_lat_;  // server-side op latency (sampled)
   std::string members_;  // advertised cluster membership (kMembers)
   std::string node_id_, node_group_;       // identity for Prometheus labels (optional)
   std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();

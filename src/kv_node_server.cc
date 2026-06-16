@@ -1,5 +1,6 @@
 #include "kv_node_server.h"
 
+#include <chrono>
 #include <string>
 
 #include <vector>
@@ -8,6 +9,15 @@
 #include "transport.h"
 
 namespace dfkv {
+
+namespace {
+// Monotonic seconds; only read on the ~1/64 sampled ops, so the cost is amortized
+// away on the hot path.
+inline double NowSec() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
 
 KvNodeServer::KvNodeServer(const std::string& cache_dir, uint64_t capacity_bytes)
     : group_(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) {}
@@ -74,11 +84,18 @@ void KvNodeServer::Stop() {
 #endif
 
 std::string KvNodeServer::MetricsText() const {
-  // Label suffix from node identity; empty (unlabeled) when identity is unset so
-  // a single-node scrape and older tooling keep the bare `metric N` form.
-  std::string lbl;
+  // Node identity as an inner label set (no braces), empty when unset so a
+  // single-node scrape and older tooling keep the bare `metric N` form.
+  std::string idlabels;
   if (!node_id_.empty() || !node_group_.empty())
-    lbl = "{node=\"" + node_id_ + "\",group=\"" + node_group_ + "\"}";
+    idlabels = "node=\"" + node_id_ + "\",group=\"" + node_group_ + "\"";
+  // braces(extra): merge `extra` label set with the identity labels.
+  auto braces = [&](const std::string& extra) {
+    std::string in = extra;
+    if (!idlabels.empty()) in += (in.empty() ? "" : ",") + idlabels;
+    return in.empty() ? std::string() : "{" + in + "}";
+  };
+  const std::string lbl = braces("");
   std::string s;
   auto metric = [&](const char* name, const char* type, const char* help,
                     uint64_t v) {
@@ -86,6 +103,7 @@ std::string KvNodeServer::MetricsText() const {
     s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
     s += name; s += lbl; s += " "; s += std::to_string(v); s += "\n";
   };
+  auto rd = [](const std::atomic<size_t>& a) { return a.load(std::memory_order_relaxed); };
   // build/version + uptime
   s += "# HELP dfkv_build_info Build and version info (constant 1)\n";
   s += "# TYPE dfkv_build_info gauge\n";
@@ -108,10 +126,45 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_bytes_read_total", "counter", "Payload bytes read",
          bytes_read_.load(std::memory_order_relaxed));
   metric("dfkv_accepts_total", "counter", "TCP connections accepted", AcceptCount());
+  metric("dfkv_evictions_total", "counter", "Objects evicted (capacity pressure)",
+         group_.Evictions());
+  metric("dfkv_evicted_bytes_total", "counter", "Bytes evicted", group_.EvictedBytes());
   // gauges
   metric("dfkv_objects", "gauge", "Cached objects on this node", group_.Count());
   metric("dfkv_used_bytes", "gauge", "Bytes used on disk", group_.UsedBytes());
   metric("dfkv_disks", "gauge", "Backing NVMe disks", group_.DiskCount());
+  metric("dfkv_open_connections", "gauge", "Currently open client connections",
+         rd(open_connections_));
+  // errors by op+status (one HELP/TYPE, multiple labeled series)
+  s += "# HELP dfkv_errors_total Failed ops by op and status\n";
+  s += "# TYPE dfkv_errors_total counter\n";
+  s += "dfkv_errors_total" + braces("op=\"put\",status=\"io\"") + " " +
+       std::to_string(rd(put_io_err_)) + "\n";
+  s += "dfkv_errors_total" + braces("op=\"get\",status=\"io\"") + " " +
+       std::to_string(rd(get_io_err_)) + "\n";
+  s += "dfkv_errors_total" + braces("op=\"any\",status=\"invalid\"") + " " +
+       std::to_string(rd(invalid_ops_)) + "\n";
+  // per-disk gauges (one HELP/TYPE, one series per disk)
+  s += "# HELP dfkv_disk_used_bytes Bytes used per backing disk\n";
+  s += "# TYPE dfkv_disk_used_bytes gauge\n";
+  for (size_t i = 0; i < group_.DiskCount(); ++i)
+    s += "dfkv_disk_used_bytes" + braces("disk=\"" + group_.DiskPath(i) + "\"") + " " +
+         std::to_string(group_.DiskUsedBytes(i)) + "\n";
+  s += "# HELP dfkv_disk_objects Objects per backing disk\n";
+  s += "# TYPE dfkv_disk_objects gauge\n";
+  for (size_t i = 0; i < group_.DiskCount(); ++i)
+    s += "dfkv_disk_objects" + braces("disk=\"" + group_.DiskPath(i) + "\"") + " " +
+         std::to_string(group_.DiskObjects(i)) + "\n";
+  // sampled op latency histograms (op label merged with identity); one HELP/TYPE,
+  // two label sets (get/put).
+  {
+    std::string get_lbl = std::string("op=\"get\"") + (idlabels.empty() ? "" : "," + idlabels);
+    std::string put_lbl = std::string("op=\"put\"") + (idlabels.empty() ? "" : "," + idlabels);
+    s += "# HELP dfkv_op_latency_seconds Sampled server op latency seconds\n";
+    s += "# TYPE dfkv_op_latency_seconds histogram\n";
+    s += get_lat_.RenderBody("dfkv_op_latency_seconds", get_lbl);
+    s += put_lat_.RenderBody("dfkv_op_latency_seconds", put_lbl);
+  }
   return s;
 }
 
@@ -122,10 +175,12 @@ void KvNodeServer::AcceptLoop() {
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));  // avoid Nagle stalls
     accept_count_.fetch_add(1, std::memory_order_relaxed);
+    open_connections_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(conn_mu_);
     conn_fds_.insert(fd);
     conn_threads_.emplace_back([this, fd] {
       Handle(fd);
+      open_connections_.fetch_sub(1, std::memory_order_relaxed);
       { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
       ::close(fd);
     });
@@ -141,22 +196,34 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
   BlockKey key{id, index, ksize};
   Status st = Status::kInvalid;
   switch (op) {
-    case WireOp::kCache:
+    case WireOp::kCache: {
+      bool samp = lat_sampler_.ShouldSample();
+      double t0 = samp ? NowSec() : 0.0;
       st = group_.Cache(key, payload, payload_len);
       if (st == Status::kOk) {
         cache_put_.fetch_add(1, std::memory_order_relaxed);
         bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
+      } else if (st == Status::kIOError) {
+        put_io_err_.fetch_add(1, std::memory_order_relaxed);
       }
+      if (samp) put_lat_.Observe(NowSec() - t0);
       break;
-    case WireOp::kRange:
+    }
+    case WireOp::kRange: {
+      bool samp = lat_sampler_.ShouldSample();
+      double t0 = samp ? NowSec() : 0.0;
       st = group_.Range(key, offset, length, out_data);
       if (st == Status::kOk) {
         cache_hit_.fetch_add(1, std::memory_order_relaxed);
         bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
       } else if (st == Status::kNotFound) {
         cache_miss_.fetch_add(1, std::memory_order_relaxed);
+      } else if (st == Status::kIOError) {
+        get_io_err_.fetch_add(1, std::memory_order_relaxed);
       }
+      if (samp) get_lat_.Observe(NowSec() - t0);
       break;
+    }
     case WireOp::kExist:
       if (group_.IsCached(key)) { st = Status::kOk; exist_hit_.fetch_add(1, std::memory_order_relaxed); }
       else { st = Status::kNotFound; exist_miss_.fetch_add(1, std::memory_order_relaxed); }
@@ -175,6 +242,7 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
       st = Status::kInvalid;  // MDS ops are not served by a cache node
       break;
   }
+  if (st == Status::kInvalid) invalid_ops_.fetch_add(1, std::memory_order_relaxed);
   return st;
 }
 
@@ -182,13 +250,18 @@ Status KvNodeServer::RangeInto(uint64_t id, uint32_t index, uint32_t ksize,
                                uint64_t offset, uint64_t length, char* dst,
                                size_t dst_cap, size_t* out_len) {
   BlockKey key{id, index, ksize};
+  bool samp = lat_sampler_.ShouldSample();
+  double t0 = samp ? NowSec() : 0.0;
   Status st = group_.RangeInto(key, offset, length, dst, dst_cap, out_len);
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
+  } else if (st == Status::kIOError) {
+    get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
+  if (samp) get_lat_.Observe(NowSec() - t0);
   return st;
 }
 
@@ -197,13 +270,18 @@ Status KvNodeServer::RangeDirect(uint64_t id, uint32_t index, uint32_t ksize,
                                  size_t io_cap, const char** out_data,
                                  size_t* out_len) {
   BlockKey key{id, index, ksize};
+  bool samp = lat_sampler_.ShouldSample();
+  double t0 = samp ? NowSec() : 0.0;
   Status st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data, out_len);
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
   } else if (st == Status::kNotFound) {
     cache_miss_.fetch_add(1, std::memory_order_relaxed);
+  } else if (st == Status::kIOError) {
+    get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
+  if (samp) get_lat_.Observe(NowSec() - t0);
   return st;
 }
 

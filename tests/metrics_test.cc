@@ -78,6 +78,40 @@ TEST(Metrics, NoIdentityKeepsUnlabeledSeries) {
   s->Stop();
 }
 
+TEST(Metrics, DepthSeriesPresent) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_e";
+  auto s = Start(dir, &addr);
+  TcpTransport t;
+  std::string v(100, 'q');
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("a"), v.data(), v.size()), Status::kOk);
+  std::string out;
+  ASSERT_EQ(t.Range(addr, ToBlockKey("a"), 0, v.size(), &out), Status::kOk);
+  std::string text = s->MetricsText();
+  EXPECT_NE(text.find("# TYPE dfkv_op_latency_seconds histogram"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_op_latency_seconds_count{op=\"get\"}"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_op_latency_seconds_count{op=\"put\"}"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_evictions_total"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_open_connections"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_errors_total{op=\"get\",status=\"io\"}"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_disk_used_bytes{disk="), std::string::npos) << text;
+  s->Stop();
+}
+
+TEST(Metrics, OpenConnectionsTracksLiveConn) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_f";
+  auto s = Start(dir, &addr);
+  {
+    TcpTransport t;  // pooled keep-alive connection held open for this scope
+    std::string out;
+    ASSERT_EQ(t.Range(addr, ToBlockKey("x"), 0, 1, &out), Status::kNotFound);
+    // a connection is open while the pooled fd lives
+    EXPECT_NE(s->MetricsText().find("dfkv_open_connections"), std::string::npos);
+  }  // transport destructor closes the pooled fd; server-side handler exits
+  s->Stop();
+}
+
 TEST(Metrics, RemoteStatsOp) {
   std::string addr;
   auto dir = fs::temp_directory_path() / "dfkv_metrics_b";

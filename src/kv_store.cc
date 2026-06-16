@@ -255,6 +255,8 @@ void KVStore::EvictLocked(Shard& sh) {
     std::error_code ec;
     fs::remove(it->second.path, ec);
     sh.used_bytes -= it->second.size;
+    evictions_.fetch_add(1, std::memory_order_relaxed);
+    evicted_bytes_.fetch_add(it->second.size, std::memory_order_relaxed);
     sh.ring.erase(cur);
     sh.index.erase(it);
   }
