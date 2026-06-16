@@ -64,22 +64,54 @@ void KvNodeServer::Stop() {
   for (auto& t : threads) if (t.joinable()) t.join();
 }
 
+#ifndef DFKV_VERSION
+#define DFKV_VERSION "dev"
+#endif
+#ifdef DFKV_WITH_RDMA
+#define DFKV_BUILD_TRANSPORT "rdma"
+#else
+#define DFKV_BUILD_TRANSPORT "tcp"
+#endif
+
 std::string KvNodeServer::MetricsText() const {
-  auto line = [](const char* k, size_t v) {
-    return std::string(k) + " " + std::to_string(v) + "\n";
-  };
+  // Label suffix from node identity; empty (unlabeled) when identity is unset so
+  // a single-node scrape and older tooling keep the bare `metric N` form.
+  std::string lbl;
+  if (!node_id_.empty() || !node_group_.empty())
+    lbl = "{node=\"" + node_id_ + "\",group=\"" + node_group_ + "\"}";
   std::string s;
-  s += line("dfkv_cache_put_total", m_cache_put());
-  s += line("dfkv_cache_hit_total", m_cache_hit());
-  s += line("dfkv_cache_miss_total", m_cache_miss());
-  s += line("dfkv_exist_hit_total", m_exist_hit());
-  s += line("dfkv_exist_miss_total", m_exist_miss());
-  s += line("dfkv_bytes_written_total", bytes_written_.load(std::memory_order_relaxed));
-  s += line("dfkv_bytes_read_total", bytes_read_.load(std::memory_order_relaxed));
-  s += line("dfkv_accepts_total", AcceptCount());
-  s += line("dfkv_objects", group_.Count());
-  s += line("dfkv_used_bytes", group_.UsedBytes());
-  s += line("dfkv_disks", group_.DiskCount());
+  auto metric = [&](const char* name, const char* type, const char* help,
+                    uint64_t v) {
+    s += "# HELP "; s += name; s += " "; s += help; s += "\n";
+    s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
+    s += name; s += lbl; s += " "; s += std::to_string(v); s += "\n";
+  };
+  // build/version + uptime
+  s += "# HELP dfkv_build_info Build and version info (constant 1)\n";
+  s += "# TYPE dfkv_build_info gauge\n";
+  s += std::string("dfkv_build_info{version=\"") + DFKV_VERSION +
+       "\",transport=\"" DFKV_BUILD_TRANSPORT "\"";
+  if (!node_id_.empty() || !node_group_.empty())
+    s += ",node=\"" + node_id_ + "\",group=\"" + node_group_ + "\"";
+  s += "} 1\n";
+  uint64_t up = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - start_time_).count();
+  metric("dfkv_uptime_seconds", "gauge", "Seconds since node start", up);
+  // counters
+  metric("dfkv_cache_put_total", "counter", "Cache (PUT) ops accepted", m_cache_put());
+  metric("dfkv_cache_hit_total", "counter", "Range (GET) ops that hit", m_cache_hit());
+  metric("dfkv_cache_miss_total", "counter", "Range (GET) ops that missed", m_cache_miss());
+  metric("dfkv_exist_hit_total", "counter", "Exist checks that hit", m_exist_hit());
+  metric("dfkv_exist_miss_total", "counter", "Exist checks that missed", m_exist_miss());
+  metric("dfkv_bytes_written_total", "counter", "Payload bytes written",
+         bytes_written_.load(std::memory_order_relaxed));
+  metric("dfkv_bytes_read_total", "counter", "Payload bytes read",
+         bytes_read_.load(std::memory_order_relaxed));
+  metric("dfkv_accepts_total", "counter", "TCP connections accepted", AcceptCount());
+  // gauges
+  metric("dfkv_objects", "gauge", "Cached objects on this node", group_.Count());
+  metric("dfkv_used_bytes", "gauge", "Bytes used on disk", group_.UsedBytes());
+  metric("dfkv_disks", "gauge", "Backing NVMe disks", group_.DiskCount());
   return s;
 }
 

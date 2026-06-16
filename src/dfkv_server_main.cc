@@ -15,6 +15,7 @@
 #include "kv_node_server.h"
 #include "log.h"
 #include "mds_registrar.h"
+#include "metrics_http.h"
 #ifdef DFKV_WITH_RDMA
 #include "rdma_server.h"
 #endif
@@ -29,7 +30,7 @@ int main(int argc, char** argv) {
   std::string dir = "/tmp/dfkv_node";
   std::string rdma_dev, mds, group = "default", node_id, advertise;
   int weight = 1;
-  int port = 0, rdma_port = -1;
+  int port = 0, rdma_port = -1, metrics_port = -1;
   unsigned long long cap = 1ull << 30;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!std::strcmp(argv[i], "--dir")) dir = argv[i + 1];
@@ -42,6 +43,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--id")) node_id = argv[i + 1];
     else if (!std::strcmp(argv[i], "--advertise")) advertise = argv[i + 1];
     else if (!std::strcmp(argv[i], "--weight")) weight = std::atoi(argv[i + 1]);
+    else if (!std::strcmp(argv[i], "--metrics-port")) metrics_port = std::atoi(argv[i + 1]);
   }
   (void)rdma_port;
   std::signal(SIGINT, OnSig);
@@ -57,12 +59,25 @@ int main(int argc, char** argv) {
   if (dirs.empty()) dirs.push_back(dir);
 
   KvNodeServer srv(dirs, cap);
+  // Identity for Prometheus labels: reuse the MDS --id/--group when present.
+  if (!node_id.empty() || group != "default") srv.set_identity(node_id, group);
   if (srv.Start(port) != Status::kOk) {
     std::fprintf(stderr, "failed to start on port %d\n", port);
     return 1;
   }
   std::printf("PORT %d\n", srv.port());
   std::fflush(stdout);
+
+  // Optional Prometheus /metrics endpoint on a dedicated port/thread (off the
+  // datapath). Absent --metrics-port => no listener, behavior unchanged.
+  std::unique_ptr<dfkv::MetricsHttpServer> mhttp;
+  if (metrics_port >= 0) {
+    mhttp = std::make_unique<dfkv::MetricsHttpServer>([&srv] { return srv.MetricsText(); });
+    if (mhttp->Start(metrics_port) == Status::kOk)
+      DFKV_LOG_INFO("dfkv_server /metrics on port " + std::to_string(mhttp->port()));
+    else
+      DFKV_LOG_WARN("dfkv_server /metrics failed to start on port " + std::to_string(metrics_port));
+  }
   DFKV_LOG_INFO("dfkv_server listening on port " + std::to_string(srv.port()) + ", dir=" + dir);
 
   // Announce the transport build mode loudly so a TCP-only binary (built without
@@ -125,6 +140,7 @@ int main(int argc, char** argv) {
 
   while (!g_stop) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
   DFKV_LOG_INFO("dfkv_server shutting down");
+  if (mhttp) mhttp->Stop();
   if (registrar) registrar->Stop();
 #ifdef DFKV_WITH_RDMA
   if (rsrv) rsrv->Stop();

@@ -50,6 +50,34 @@ TEST(Metrics, CountersTrackOps) {
   s->Stop();
 }
 
+TEST(Metrics, PrometheusFormatAndIdentity) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_c";
+  auto s = Start(dir, &addr);
+  s->set_identity("n1", "g1");
+  std::string text = s->MetricsText();
+  // HELP/TYPE metadata present
+  EXPECT_NE(text.find("# TYPE dfkv_cache_hit_total counter"), std::string::npos) << text;
+  EXPECT_NE(text.find("# TYPE dfkv_used_bytes gauge"), std::string::npos) << text;
+  // identity labels applied to series
+  EXPECT_NE(text.find("dfkv_cache_hit_total{node=\"n1\",group=\"g1\"} 0"), std::string::npos) << text;
+  // build_info + uptime present
+  EXPECT_NE(text.find("dfkv_build_info{"), std::string::npos) << text;
+  EXPECT_NE(text.find("version=\""), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_uptime_seconds"), std::string::npos) << text;
+  s->Stop();
+}
+
+TEST(Metrics, NoIdentityKeepsUnlabeledSeries) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_d";
+  auto s = Start(dir, &addr);  // no set_identity
+  std::string text = s->MetricsText();
+  // back-compat: bare metric line, no label braces
+  EXPECT_NE(text.find("dfkv_cache_hit_total 0"), std::string::npos) << text;
+  s->Stop();
+}
+
 TEST(Metrics, RemoteStatsOp) {
   std::string addr;
   auto dir = fs::temp_directory_path() / "dfkv_metrics_b";

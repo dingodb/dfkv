@@ -6,6 +6,7 @@
 #define DFKV_KV_NODE_SERVER_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,11 @@ class KvNodeServer {
   // Cluster member list this node advertises for discovery (kMembers wire op):
   // "name=ip:port,name=ip:port,...". Clients query any node to learn the cluster.
   void set_members(const std::string& members) { members_ = members; }
+  // Node identity for Prometheus labels. When unset, series are emitted unlabeled
+  // (back-compat with single-node scrapes / older tooling).
+  void set_identity(const std::string& id, const std::string& group) {
+    node_id_ = id; node_group_ = group;
+  }
   int port() const { return port_; }
   size_t Count() const { return group_.Count(); }
   uint64_t UsedBytes() const { return group_.UsedBytes(); }
@@ -72,6 +78,8 @@ class KvNodeServer {
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
   std::string members_;  // advertised cluster membership (kMembers)
+  std::string node_id_, node_group_;       // identity for Prometheus labels (optional)
+  std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
 
   DiskCacheGroup group_;
   int listen_fd_ = -1;
