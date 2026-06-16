@@ -547,5 +547,76 @@ class DfkvAccessLogTest(unittest.TestCase):
         self.assertIn("FAIL RuntimeError: boom", txt)
 
 
+class DfkvAccessLogRotationTest(unittest.TestCase):
+    """Size-based rotation of the access-log file (RotatingFileHandler).
+
+    Pure module-level: drives dfkv_access_log.configure + the logger directly, so
+    it needs no cache node / libdfkv.so (unlike DfkvAccessLogTest). Codifies that
+    an enabled access log no longer grows a single file unbounded."""
+
+    def setUp(self):
+        _reset_access_log()
+        self.tmp = tempfile.mkdtemp(prefix="dfkv_alog_rot_")
+
+    def tearDown(self):
+        _reset_access_log()
+
+    def _flush(self):
+        # stop() drains the queue (writing + rolling over remaining records) and
+        # joins the listener thread before we inspect the files.
+        if alog._listener is not None:
+            alog._listener.stop()
+            alog._listener = None
+
+    def _emit(self, n, nbytes=200):
+        line = "x" * nbytes
+        for _ in range(n):
+            alog._logger.info("%s", line)
+
+    def test_rotates_by_size_and_caps_backup_count(self):
+        path = os.path.join(self.tmp, "acc.{rank}.log")
+        alog.configure({"access_log": 1, "access_log_path": path,
+                        "access_log_max_bytes": 4096,
+                        "access_log_backup_count": 2}, tp_rank=0)
+        self.assertTrue(alog.is_enabled())
+        base = os.path.join(self.tmp, "acc.0.log")
+        self._emit(400)  # ~400 * ~225B = ~90KB >> 4KiB*3 cap -> many rollovers
+        self._flush()
+        # base + .1 + .2 only; .3 must never appear (backup_count=2 caps it)
+        self.assertTrue(os.path.exists(base))
+        self.assertTrue(os.path.exists(base + ".1"))
+        self.assertTrue(os.path.exists(base + ".2"))
+        self.assertFalse(os.path.exists(base + ".3"))
+        # disk is bounded: each retained file <= maxBytes (+ one line of slack)
+        for suffix in ("", ".1", ".2"):
+            self.assertLessEqual(os.path.getsize(base + suffix), 4096 + 512)
+
+    def test_max_bytes_zero_keeps_single_unbounded_file(self):
+        # Escape hatch: max_bytes=0 restores the legacy plain-FileHandler behavior
+        # (one file, no rotation) for anyone who wants it.
+        path = os.path.join(self.tmp, "acc.{rank}.log")
+        alog.configure({"access_log": 1, "access_log_path": path,
+                        "access_log_max_bytes": 0}, tp_rank=0)
+        base = os.path.join(self.tmp, "acc.0.log")
+        self._emit(200)
+        self._flush()
+        self.assertFalse(os.path.exists(base + ".1"))   # rotation disabled
+        self.assertGreater(os.path.getsize(base), 4096)  # grew past a rotation size
+
+    def test_defaults_enable_rotation(self):
+        # No explicit knobs -> rotation ON by default so disk is always bounded.
+        # The 128MiB default isn't reached here, so only the base file exists.
+        path = os.path.join(self.tmp, "acc.{rank}.log")
+        alog.configure({"access_log": 1, "access_log_path": path}, tp_rank=0)
+        import logging.handlers as _h
+        sink = alog._listener.handlers[0]  # capture before _flush() nulls listener
+        base = os.path.join(self.tmp, "acc.0.log")
+        self._emit(50)
+        self._flush()
+        self.assertIsInstance(sink, _h.RotatingFileHandler)
+        self.assertTrue(os.path.exists(base))
+        self.assertFalse(os.path.exists(base + ".1"))  # 128MiB default not reached
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -23,10 +23,20 @@ default:
     access_log (bool)         DFKV_ACCESS_LOG_ENABLED         off
     access_log_path (str)     DFKV_ACCESS_LOG_PATH            "" -> stderr
     access_log_threshold_us   DFKV_ACCESS_LOG_THRESHOLD_US    0 (log every call)
+    access_log_max_bytes      DFKV_ACCESS_LOG_MAX_BYTES       128*1024*1024 (128MiB)
+    access_log_backup_count   DFKV_ACCESS_LOG_BACKUP_COUNT    5
 
 ``access_log_path`` supports ``{rank}``/``{model}`` placeholders; if neither is
 present the path is auto-suffixed ``.r{rank}`` so the one-process-per-TP-rank
 SGLang layout never has two ranks corrupting a shared file.
+
+When a path is set the file is **size-rotated** via a ``RotatingFileHandler``:
+at ``max_bytes`` it rolls ``acc.log`` -> ``acc.log.1`` -> ... up to
+``backup_count`` backups, then overwrites the oldest. Disk per rank is therefore
+bounded by ``max_bytes * (backup_count + 1)`` (default ~768MiB), so an access log
+left on forever can never fill the disk. Set ``max_bytes=0`` to disable rotation
+and keep one unbounded file (the legacy behavior). Each TP rank owns its own file
+(and its own rotation), so there is no cross-process rollover race.
 
 Performance:
   - Disabled: ~tens of ns/call. A frozen _NoopLog singleton is returned, so the
@@ -121,9 +131,31 @@ def configure(cfg: Optional[dict], tp_rank: int = 0, model: str = "") -> None:
         _ENABLED = True
         return
 
+    # Size-based rotation so an enabled access log can never grow a single file
+    # unbounded. max_bytes=0 disables rotation (legacy single-file behavior, an
+    # escape hatch). Disk per rank is bounded by max_bytes * (backup_count + 1).
+    try:
+        max_bytes = int(_resolve(cfg, "access_log_max_bytes",
+                                 "DFKV_ACCESS_LOG_MAX_BYTES", 128 * 1024 * 1024))
+    except (TypeError, ValueError):
+        max_bytes = 128 * 1024 * 1024
+    try:
+        backup_count = int(_resolve(cfg, "access_log_backup_count",
+                                    "DFKV_ACCESS_LOG_BACKUP_COUNT", 5))
+    except (TypeError, ValueError):
+        backup_count = 5
+    if max_bytes < 0:
+        max_bytes = 0
+    if backup_count < 0:
+        backup_count = 0
+
     if path:
         try:
-            sink: logging.Handler = logging.FileHandler(path, mode="a")
+            if max_bytes > 0:
+                sink: logging.Handler = logging.handlers.RotatingFileHandler(
+                    path, mode="a", maxBytes=max_bytes, backupCount=backup_count)
+            else:
+                sink = logging.FileHandler(path, mode="a")  # rotation disabled
         except OSError as exc:
             sys.stderr.write(
                 f"[dfkv.access] cannot open {path!r}: {exc}; "

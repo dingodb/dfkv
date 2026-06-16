@@ -25,17 +25,30 @@
 
 ## 配置项
 
-三个开关。**优先级：`extra_config` 键 > 环境变量 > 默认值**（按每个开关独立解析）。
+**优先级：`extra_config` 键 > 环境变量 > 默认值**（按每个开关独立解析）。
 
 | 作用 | `extra_config` 键 | 环境变量 | 默认 |
 |---|---|---|---|
 | 开 / 关 | `access_log` | `DFKV_ACCESS_LOG_ENABLED` | 关 |
 | 日志路径 | `access_log_path` | `DFKV_ACCESS_LOG_PATH` | 空 → 写 stderr |
 | 慢操作阈值（微秒） | `access_log_threshold_us` | `DFKV_ACCESS_LOG_THRESHOLD_US` | `0`（全记） |
+| 单文件滚动大小（字节） | `access_log_max_bytes` | `DFKV_ACCESS_LOG_MAX_BYTES` | `134217728`（128MiB） |
+| 保留的滚动备份份数 | `access_log_backup_count` | `DFKV_ACCESS_LOG_BACKUP_COUNT` | `5` |
 
 - 开关取值接受 `1/true/yes/on`（大小写不敏感）或 JSON 里的 `1`/布尔。
 - `access_log_threshold_us` 设成比如 `1000`，则只记录耗时 ≥ 1ms 的操作，排查长尾很方便。
 - 配置在插件 `__init__` 里**运行时解析一次**（每进程首个实例生效，幂等）；不像 dingofs 在 import 时读 env。
+
+## 日志滚动与清理（自动，无需 logrotate）
+
+写文件时走 `RotatingFileHandler`，**按大小自动滚动并清理旧日志**，开着不管也不会撑爆盘：
+
+- 单文件写到 `access_log_max_bytes` 就滚动：`access.log` → `access.log.1` → `access.log.2` …，
+  超过 `access_log_backup_count` 份后**覆盖最旧的**。
+- 每个 TP rank 的磁盘占用上限 = `max_bytes × (backup_count + 1)`。默认 `128MiB × 6 ≈ 768MiB/rank`，到顶即循环覆盖。
+- 每个 rank 各写各的文件、各滚各的，**无跨进程滚动竞争**。
+- **逃生口**：`access_log_max_bytes=0` 关闭滚动，退化成单个无界文件（旧行为，需自己接 logrotate 清理）。
+- 滚动落盘动作在后台 `QueueListener` 线程里做，**不在热路径**。
 
 ## 使用方式
 
@@ -54,7 +67,8 @@ sglang serve ... \
     "layer_num":78, "head_num":1, "head_dim":576,
     "access_log":1,
     "access_log_path":"/var/log/dfkv/access.log",
-    "access_log_threshold_us":0 }'
+    "access_log_threshold_us":0,
+    "access_log_max_bytes":134217728, "access_log_backup_count":5 }'
 ```
 
 ### 方式 B — 环境变量（不想改启动 JSON 时，运维临时开启）
@@ -63,6 +77,8 @@ sglang serve ... \
 DFKV_ACCESS_LOG_ENABLED=1 \
 DFKV_ACCESS_LOG_PATH=/var/log/dfkv/access.log \
 DFKV_ACCESS_LOG_THRESHOLD_US=0 \
+DFKV_ACCESS_LOG_MAX_BYTES=134217728 \
+DFKV_ACCESS_LOG_BACKUP_COUNT=5 \
 sglang serve ...
 ```
 
@@ -109,11 +125,13 @@ SGLang 每个 TP rank 一个进程，会**同时写同一路径**。为避免互
 无需 GPU/torch，单测会拉起真实 `dfkv_server` 节点驱动插件：
 
 ```bash
-DFKV_BUILD=$(pwd)/build python3 tests/python/test_dfkv_hicache.py   # 含 8 个 access-log 用例
+DFKV_BUILD=$(pwd)/build python3 tests/python/test_dfkv_hicache.py   # 含 access-log + 滚动用例
+# 滚动用例不依赖 node/so，可单独快速跑：
+python3 -m unittest test_dfkv_hicache.DfkvAccessLogRotationTest -v
 ```
 
 ## 实现位置
 
 - [python/dfkv_access_log.py](../python/dfkv_access_log.py) — `configure()` / `access_log()` 上下文管理器、noop 单例、异步队列、格式化辅助。
 - [python/dfkv_hicache.py](../python/dfkv_hicache.py) — `__init__` 里调 `configure()`，并用 `with access_log(...)` 包住各继承接口。
-- [tests/python/test_dfkv_hicache.py](../tests/python/test_dfkv_hicache.py) — `DfkvAccessLogTest` 测试类。
+- [tests/python/test_dfkv_hicache.py](../tests/python/test_dfkv_hicache.py) — `DfkvAccessLogTest`（接口逐 op 日志）+ `DfkvAccessLogRotationTest`（滚动/清理）测试类。
