@@ -48,6 +48,7 @@ int dfkv_start_mds_discovery(dfkv_client_t c, const char* mds_endpoints,
 // Actual client transport selected at dfkv_open(), e.g. "rdma",
 // "tcp(rdma-not-requested)", or "injected". Returns "" for null clients.
 const char* dfkv_transport_mode(dfkv_client_t c);
+int dfkv_set_batch_concurrency(dfkv_client_t c, uint64_t n);
 
 // Batched, concurrently fanned out. n items; out_* arrays (len n) receive
 // per-item results (1/0). Return 0 on call success.

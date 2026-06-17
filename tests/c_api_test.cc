@@ -26,6 +26,7 @@ TEST(CApiGuard, RejectsNullClient) {
   EXPECT_EQ(dfkv_put(nullptr, "k", "v", 1), -1);
   EXPECT_EQ(dfkv_get(nullptr, "k", nullptr, 0), 0);
   EXPECT_EQ(dfkv_exist(nullptr, "k"), 0);
+  EXPECT_EQ(dfkv_set_batch_concurrency(nullptr, 8), -1);
 }
 
 TEST(CApiGuard, RejectsNullArraysWithPositiveN) {
@@ -50,6 +51,7 @@ TEST(CApiStats, SnapshotSizingAndContent) {
   ASSERT_NE(mode, nullptr);
   EXPECT_FALSE(std::string(mode).empty());
   EXPECT_STREQ(dfkv_transport_mode(nullptr), "");
+  EXPECT_EQ(dfkv_set_batch_concurrency(c, 4), 0);
   // size query: cap=0 returns the full length without writing
   uint64_t need = dfkv_stats_snapshot(c, nullptr, 0);
   EXPECT_GT(need, 0u);

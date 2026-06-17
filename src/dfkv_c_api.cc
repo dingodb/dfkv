@@ -185,6 +185,12 @@ const char* dfkv_transport_mode(dfkv_client_t c) {
   return static_cast<KVClient*>(c)->TransportMode().c_str();
 }
 
+int dfkv_set_batch_concurrency(dfkv_client_t c, uint64_t n) {
+  if (!c) return -1;
+  static_cast<KVClient*>(c)->set_batch_concurrency(static_cast<size_t>(n));
+  return 0;
+}
+
 uint64_t dfkv_stats_snapshot(dfkv_client_t c, char* buf, uint64_t cap) {
   if (!c) return 0;
   std::string text = static_cast<KVClient*>(c)->MetricsSnapshot();

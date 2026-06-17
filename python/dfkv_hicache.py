@@ -25,6 +25,12 @@ from dfkv_metrics import Metrics as _Metrics, ClientStatsPoller as _ClientStatsP
 _FLAG_IS_MLA = 0x1
 
 
+def _truthy(v) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(v)
+
+
 def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib_path = (path or os.environ.get("DFKV_LIB")
                 or os.path.join(os.environ.get("DFKV_BUILD", "/home/ketor/dfkv-dev/build"),
@@ -59,6 +65,10 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_refresh_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.dfkv_start_mds_discovery.restype = ctypes.c_int
     lib.dfkv_start_mds_discovery.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    lib.dfkv_transport_mode.restype = ctypes.c_char_p
+    lib.dfkv_transport_mode.argtypes = [ctypes.c_void_p]
+    lib.dfkv_set_batch_concurrency.restype = ctypes.c_int
+    lib.dfkv_set_batch_concurrency.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_stats_snapshot.restype = ctypes.c_uint64
     lib.dfkv_stats_snapshot.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64]
     lib.dfkv_close.restype = None
@@ -131,6 +141,10 @@ class DfkvHiCache(HiCacheStorage):
             # its own env -- client depth must be <= server depth.
             if cfg.get("rdma_depth"):
                 os.environ["DFKV_RDMA_DEPTH"] = str(int(cfg["rdma_depth"]))
+            if _truthy(cfg.get("require_rdma")):
+                os.environ["DFKV_REQUIRE_RDMA"] = "1"
+                if not _truthy(os.environ.get("DFKV_RDMA")):
+                    os.environ["DFKV_RDMA"] = "1"
             # rail_affinity (per-tp_rank narrowing) is DEPRECATED and now a no-op:
             # it keyed off tp_rank, which is always 0 under DP-attention (every rank
             # is its own attention TP group of size 1), so it collapsed all ranks to
@@ -155,6 +169,22 @@ class DfkvHiCache(HiCacheStorage):
                 int(cfg.get("head_dim", 0)))
             if not self._h:
                 raise RuntimeError("dfkv_open failed")
+            mode_b = self._lib.dfkv_transport_mode(self._h)
+            self.transport_mode = (
+                mode_b.decode("utf-8", errors="replace") if mode_b else "unknown"
+            )
+            if (_truthy(cfg.get("require_rdma")) or
+                    _truthy(os.environ.get("DFKV_REQUIRE_RDMA"))):
+                if self.transport_mode != "rdma":
+                    self._lib.dfkv_close(self._h)
+                    self._h = None
+                    raise RuntimeError(
+                        "dfkv requires RDMA zero-copy transport, "
+                        f"got {self.transport_mode}"
+                    )
+            if cfg.get("batch_concurrency"):
+                self._lib.dfkv_set_batch_concurrency(
+                    self._h, ctypes.c_uint64(int(cfg["batch_concurrency"])))
             if mds:
                 group = cfg.get("mds_group", "default")
                 poll_ms = int(cfg.get("mds_poll_ms", 3000))
@@ -162,7 +192,8 @@ class DfkvHiCache(HiCacheStorage):
                 if rc != 0:
                     raise RuntimeError("dfkv_start_mds_discovery failed")
             self.mem_pool_host = None
-            r.result = "ok mds-discovery" if mds else "ok static"
+            mode = f" transport={self.transport_mode}"
+            r.result = ("ok mds-discovery" if mds else "ok static") + mode
 
         # Background mirror of the C client's metrics snapshot onto Prometheus
         # (sleeping daemon thread; off the request path). client_stats_poll_s<=0
@@ -239,6 +270,21 @@ class DfkvHiCache(HiCacheStorage):
                 return
             r.result = f"registered {n} region(s)" if n else "no backing buffer found"
 
+    def register_mem_host_pool_v2(self, host_pool, host_pool_name):
+        if not hasattr(self, "registered_pools"):
+            self.registered_pools = {}
+        name = str(host_pool_name)
+        self.registered_pools[name] = host_pool
+        with access_log("register_mem_host_pool_v2",
+                        lambda: f"{self._alog_tag} {name}") as r:
+            n = 0
+            try:
+                n = self._register_pool_buffers(host_pool)
+            except Exception as e:
+                r.result = f"skip ({type(e).__name__})"
+                return
+            r.result = f"registered {n} region(s)" if n else "no backing buffer found"
+
     def set_members(self, members: str):
         """Hot-swap cluster membership, e.g. 'n1=ip:12000,n2=ip:12000'."""
         self._lib.dfkv_set_members(self._h, members.encode())
@@ -277,6 +323,17 @@ class DfkvHiCache(HiCacheStorage):
     def _fold(self, flat_results, npages, sub):
         """A page succeeds iff all its sub-objects succeeded."""
         return [all(flat_results[i * sub + j] for j in range(sub)) for i in range(npages)]
+
+    def _batch_exist_flat(self, subkeys) -> List[bool]:
+        if not subkeys:
+            return []
+        kbuf = [s.encode() for s in subkeys]
+        karr = (ctypes.c_char_p * len(kbuf))(*kbuf)
+        out = (ctypes.c_int * len(kbuf))()
+        rc = self._lib.dfkv_batch_exist(self._h, karr, len(kbuf), out)
+        if rc != 0:
+            return [False] * len(kbuf)
+        return [out[i] == 1 for i in range(len(kbuf))]
 
     # --- zero-copy v1 batch path (the one the controller calls) ---
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
@@ -317,10 +374,7 @@ class DfkvHiCache(HiCacheStorage):
             # longest contiguous prefix of pages whose every sub-object exists
             sub = self._sub()
             sks = [sk for k in keys for sk in self._keys(k)]
-            karr = (ctypes.c_char_p * len(sks))(*[s.encode() for s in sks])
-            out = (ctypes.c_int * len(sks))()
-            self._lib.dfkv_batch_exist(self._h, karr, len(sks), out)
-            page_ok = self._fold([out[i] == 1 for i in range(len(sks))], total, sub)
+            page_ok = self._fold(self._batch_exist_flat(sks), total, sub)
             n = 0
             for ok in page_ok:
                 if not ok:
@@ -344,24 +398,32 @@ class DfkvHiCache(HiCacheStorage):
 
     def _v2_io(self, transfers, putting):
         results = {}
+        segments = []
+        sks, sp, ss = [], [], []
         for tr in transfers:
             name = str(tr.name)
+            keys = tr.keys or []
             # MLA backup_skip: only tp_rank 0 writes the replicated latent pools.
             if putting and self.is_mla and self.tp_rank != 0:
-                results[name] = [True] * len(tr.keys or [])
+                results[name] = [True] * len(keys)
                 continue
             pool = self.registered_pools[name]
             ptrs, sizes = pool.get_page_buffer_meta(tr.host_indices)
             sub = self._pool_sub(name)
-            keys = tr.keys or []
-            sks, sp, ss = [], [], []
+            start = len(sks)
             for i, k in enumerate(keys):
                 for j, sk in enumerate(self._pool_keys(name, k)):
                     sks.append(sk); sp.append(int(ptrs[i * sub + j])); ss.append(int(sizes[i * sub + j]))
+            segments.append((name, len(keys), sub, start, len(sks)))
+        if sks:
             karr, parr, sarr, out, _ = _arrays(sks, sp, ss)
             (self._lib.dfkv_batch_put if putting else self._lib.dfkv_batch_get)(
                 self._h, karr, parr, sarr, len(sks), out)
-            results[name] = self._fold([out[i] == 1 for i in range(len(sks))], len(keys), sub)
+            flat = [out[i] == 1 for i in range(len(sks))]
+        else:
+            flat = []
+        for name, nkeys, sub, start, end in segments:
+            results[name] = self._fold(flat[start:end], nkeys, sub)
         return results
 
     def batch_set_v2(self, transfers, extra_info=None) -> dict:
@@ -392,8 +454,10 @@ class DfkvHiCache(HiCacheStorage):
                 if final == 0:
                     break
                 name = str(tr.name)
-                present = [all(self._lib.dfkv_exist(self._h, sk.encode()) == 1
-                               for sk in self._pool_keys(name, k)) for k in keys[:kv_pages]]
+                sub = self._pool_sub(name)
+                sks = [sk for k in keys[:kv_pages]
+                       for sk in self._pool_keys(name, k)]
+                present = self._fold(self._batch_exist_flat(sks), kv_pages, sub)
                 if tr.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                     boundary = kv_pages if all(present) else 0
                 else:  # ALL_PAGES

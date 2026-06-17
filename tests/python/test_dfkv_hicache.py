@@ -82,6 +82,14 @@ class FlatBuf:
         return bytes(self.arr)
 
 
+class RegistrablePool(FakeMlaPool):
+    """Fake v2 pool with a tensor-like backing buffer attribute."""
+
+    def __init__(self, num_pages, page_bytes, page_size=64):
+        super().__init__(num_pages, page_bytes, page_size)
+        self.data_buffer = FlatBuf(num_pages * page_bytes)
+
+
 def _spawn_node(tag):
     d = tempfile.mkdtemp(prefix=f"dfkv_py_{tag}_")
     p = subprocess.Popen([SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30)],
@@ -210,6 +218,26 @@ class DingoFSHiCacheTest(unittest.TestCase):
             self.assertEqual(os.environ.get("DFKV_RDMA_NUMA"), "1")
         finally:
             os.environ.pop("DFKV_RDMA_NUMA", None)
+
+    def test_transport_mode_recorded(self):
+        members, _, _ = self._node("tmode")
+        saved_rdma = os.environ.get("DFKV_RDMA")
+        saved_req = os.environ.get("DFKV_REQUIRE_RDMA")
+        os.environ.pop("DFKV_RDMA", None)
+        os.environ.pop("DFKV_REQUIRE_RDMA", None)
+        try:
+            cfg = self._cfg(members)
+            st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+            self.assertTrue(st.transport_mode.startswith("tcp"), st.transport_mode)
+        finally:
+            if saved_rdma is None:
+                os.environ.pop("DFKV_RDMA", None)
+            else:
+                os.environ["DFKV_RDMA"] = saved_rdma
+            if saved_req is None:
+                os.environ.pop("DFKV_REQUIRE_RDMA", None)
+            else:
+                os.environ["DFKV_REQUIRE_RDMA"] = saved_req
 
     def test_generic_get_roundtrip(self):
         # Generic (non zero-copy) set/get round-trips a page through dfkv.
@@ -342,6 +370,20 @@ class DingoFSHiCacheTest(unittest.TestCase):
             self.assertEqual(ex.page_bytes_at(i), expe[i])
         r = st.batch_exists_v2(keys, [PoolTransfer(name="extra", host_indices=hi, keys=keys)])
         self.assertEqual(r.kv_hit_pages, 3)
+
+    def test_register_mem_host_pool_v2_registers_backing_buffer(self):
+        members, _, _ = self._node("v2reg")
+        cfg = self._cfg(members)
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        pool = RegistrablePool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        calls = []
+        st.register_memory = lambda base, size: calls.append((base, size)) or True
+        st.register_mem_host_pool_v2(pool, "extra")
+        self.assertIs(st.registered_pools["extra"], pool)
+        self.assertEqual(calls, [
+            (pool.data_buffer.data_ptr(),
+             pool.data_buffer.numel() * pool.data_buffer.element_size())
+        ])
 
 
 def _reset_access_log():
