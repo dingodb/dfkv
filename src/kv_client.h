@@ -94,7 +94,8 @@ class KVClient {
   // Client-side Prometheus metrics text (ops served, IO errors, peer health
   // transitions, per-peer errors) plus transport-level counters (RDMA per-rail
   // connections, MR regions). Surfaced to the plugin via the C ABI.
-  std::string MetricsSnapshot() const { return health_.Render() + t_->MetricsText(); }
+  std::string MetricsSnapshot() const;
+  const std::string& TransportMode() const { return transport_reason_; }
 
  private:
   std::string Route(const std::string& key) const;
@@ -106,6 +107,7 @@ class KVClient {
   ValueHeader self_hdr_;
   std::unique_ptr<Transport> owned_;
   Transport* t_;
+  std::string transport_reason_ = "unknown";
   size_t batch_concurrency_ = 8;
   std::unique_ptr<MdsMemberPoller> poller_;
   PeerHealth health_;

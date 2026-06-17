@@ -61,6 +61,11 @@ struct RdmaNode {
                char* io_buf, size_t cap, const char** out_data, size_t* out_len) {
           return srv->RangeDirect(id, idx, ks, off, len, io_buf, cap, out_data, out_len);
         });
+    rsrv->set_cache_direct_handler(
+        [this](uint64_t id, uint32_t idx, uint32_t ks, char* data, size_t len,
+               size_t cap) {
+          return srv->CacheDirect(id, idx, ks, data, len, cap);
+        });
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
   }

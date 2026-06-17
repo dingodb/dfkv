@@ -3,13 +3,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include "net_util.h"     // Dial / WriteAll / ReadAll / Put*/Get*
 #include "rdma_verbs.h"   // RcEndpoint, QpInfo
 #include "numa_util.h"     // numa::DeviceNode / CurrentNode / Enabled
 #include "rail_select.h"   // rdma::PickRail
+#include "value_header.h"
 
 namespace dfkv {
 
@@ -19,6 +22,34 @@ int EnvInt(const char* name, int dflt) {
   if (!v || !*v) return dflt;
   long x = std::strtol(v, nullptr, 10);
   return x > 0 ? static_cast<int>(x) : dflt;
+}
+
+size_t EnvBytes(const char* name, size_t dflt) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return dflt;
+  errno = 0;
+  char* end = nullptr;
+  unsigned long long x = std::strtoull(v, &end, 10);
+  if (errno != 0 || end == v || x == 0) return dflt;
+  constexpr unsigned long long kMaxSge =
+      static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max() -
+                                      ValueHeader::kSize - 2 * rdma::kDirectIoAlign);
+  if (x > kMaxSge) x = kMaxSge;
+  return static_cast<size_t>(x);
+}
+
+size_t ResolveMaxPayload(size_t configured) {
+  size_t n = configured ? configured : (64u << 20);
+  n = EnvBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n);
+  n = EnvBytes("DFKV_RDMA_MAX_MSG_BYTES", n);  // compatibility alias
+  return n;
+}
+
+size_t ControlCapFor(size_t max_payload) {
+  constexpr size_t kDefaultControlCap = 8u << 20;
+  constexpr size_t kMinControlCap = kReqPrefix + ValueHeader::kSize;
+  size_t cap = std::min(kDefaultControlCap, max_payload);
+  return cap < kMinControlCap ? kMinControlCap : cap;
 }
 
 // Post w requests (already built in ep.sbuf[j], send length slen[j]) with one
@@ -59,7 +90,9 @@ bool RdmaTransport::Available() {
 }
 
 RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
-    : max_msg_(max_msg), depth_(1) {
+    : max_payload_(ResolveMaxPayload(max_msg)),
+      control_cap_(ControlCapFor(max_payload_)),
+      depth_(1) {
   std::string list = dev_name;
   if (list.empty()) { const char* e = std::getenv("DFKV_RDMA_DEV"); if (e) list = e; }
   for (size_t i = 0; i <= list.size();) {  // split on commas (multi-rail)
@@ -118,7 +151,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   const std::string& dev = devs_[ridx];
 
   auto* c = new Conn();
-  if (!c->ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, depth_)) {
+  if (!c->ep.Open(dev.empty() ? nullptr : dev.c_str(), control_cap_, depth_)) {
     ::close(fd); delete c; return nullptr;
   }
   // Bootstrap: tell the server which device to open (same rail), then exchange QP.
@@ -187,7 +220,9 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
                                 const BlockKey& k, uint64_t offset,
                                 uint64_t length, const void* payload,
                                 uint64_t payload_len, std::string* out) {
-  if (kReqPrefix + payload_len > max_msg_) return Status::kInvalid;
+  if (payload_len > control_cap_ - kReqPrefix) return Status::kInvalid;
+  if (op == WireOp::kRange && length > control_cap_ - kRespPrefix)
+    return Status::kInvalid;
   for (int attempt = 0; attempt < 2; ++attempt) {
     bool from_pool = false;
     Conn* c = Acquire(node, &from_pool);
@@ -251,8 +286,12 @@ std::vector<Status> RdmaTransport::CacheMany(const std::string& node,
   const size_t n = items.size();
   std::vector<Status> res(n, Status::kIOError);
   if (n == 0) return res;
-  for (const auto& it : items)
-    if (kReqPrefix + it.len > max_msg_) return Transport::CacheMany(node, items);  // oversized: fall back
+  for (const auto& it : items) {
+    if (it.len > control_cap_ - kReqPrefix) {
+      std::fill(res.begin(), res.end(), Status::kInvalid);
+      return res;
+    }
+  }
 
   bool from_pool = false;
   Conn* c = Acquire(node, &from_pool);
@@ -288,8 +327,10 @@ std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
   outs->assign(n, std::string());
   std::vector<Status> res(n, Status::kIOError);
   if (n == 0) return res;
-  if (kRespPrefix + length > max_msg_)  // reply wouldn't fit the recv buffer
-    return Transport::RangeMany(node, keys, offset, length, outs);
+  if (length > control_cap_ - kRespPrefix) {  // reply wouldn't fit the recv buffer
+    std::fill(res.begin(), res.end(), Status::kInvalid);
+    return res;
+  }
 
   bool from_pool = false;
   Conn* c = Acquire(node, &from_pool);
@@ -332,7 +373,16 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
   std::vector<Status> res(n, Status::kIOError);
   if (n == 0) return res;
   const size_t hdr_bytes = kRespPrefix + header_size;  // resp prefix + value header
-  if (hdr_bytes > max_msg_) return Transport::RangeInto(node, keys, dsts, header_size, hdrs);
+  if (hdr_bytes > control_cap_) {
+    std::fill(res.begin(), res.end(), Status::kInvalid);
+    return res;
+  }
+  for (const auto& dst : dsts) {
+    if (dst.n > max_payload_) {
+      std::fill(res.begin(), res.end(), Status::kInvalid);
+      return res;
+    }
+  }
 
   bool from_pool = false;
   Conn* c = Acquire(node, &from_pool);
@@ -351,7 +401,7 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
       mrs[j] = ep.RegisterUser(dsts[base + j].payload, dsts[base + j].n);
       if (!mrs[j]) regok = false;
     }
-    if (!regok) { Release(node, c); return Transport::RangeInto(node, keys, dsts, header_size, hdrs); }
+    if (!regok) { Release(node, c); return res; }
     // Scatter recv [hdr -> rbuf | payload -> caller buffer], then send the Range req.
     // Empty (n==0) dsts use a plain recv (the reply is just resp-prefix + header).
     for (size_t j = 0; j < w && conn_ok; ++j) {
@@ -398,11 +448,14 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
   const size_t n = srcs.size();
   std::vector<Status> res(n, Status::kIOError);
   if (n == 0) return res;
-  // Oversized items fall back to the base copy path (it re-materializes the
-  // contiguous [header|payload] buffer and routes through CacheMany).
-  for (const auto& s : srcs)
-    if (kReqPrefix + s.header_len + s.payload_len > max_msg_)
-      return Transport::CacheFrom(node, srcs);
+  // Do not silently fall back to the base copy path: RDMA CacheFrom is the
+  // connector's zero-copy PUT route, so oversize/reg failures are explicit.
+  for (const auto& s : srcs) {
+    if (s.header_len > control_cap_ - kReqPrefix || s.payload_len > max_payload_) {
+      std::fill(res.begin(), res.end(), Status::kInvalid);
+      return res;
+    }
+  }
 
   bool from_pool = false;
   Conn* c = Acquire(node, &from_pool);
@@ -425,7 +478,7 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
       mrs[j] = ep.RegisterUser(const_cast<void*>(s.payload), s.payload_len);
       if (!mrs[j]) regok = false;
     }
-    if (!regok) { Release(node, c); return Transport::CacheFrom(node, srcs); }
+    if (!regok) { Release(node, c); return res; }
     // Build [req prefix | value header] into sbuf[j], scatter-send with the
     // payload coming straight from the caller's registered buffer. The wire
     // payload_len field is header_len + user payload_len (the full stored blob).

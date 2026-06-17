@@ -5,12 +5,29 @@
 #include "key_map.h"
 
 #include <gtest/gtest.h>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
 
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
+
+namespace {
+struct EnvSave {
+  explicit EnvSave(const char* n) : name(n) {
+    const char* v = std::getenv(name);
+    if (v) { had = true; old = v; }
+  }
+  ~EnvSave() {
+    if (had) ::setenv(name, old.c_str(), 1);
+    else ::unsetenv(name);
+  }
+  const char* name;
+  bool had = false;
+  std::string old;
+};
+}  // namespace
 
 TEST(Factory, ReturnsWorkingTransportWithTcpFallback) {
   auto dir = fs::temp_directory_path() / "dfkv_factory";
@@ -30,4 +47,16 @@ TEST(Factory, ReturnsWorkingTransportWithTcpFallback) {
   ASSERT_EQ(t->Range(addr, ToBlockKey("k"), 0, v.size(), &out), Status::kOk);
   EXPECT_EQ(out, v);
   srv.Stop();
+}
+
+TEST(Factory, RequireRdmaRejectsImplicitTcpFallback) {
+  EnvSave save_require("DFKV_REQUIRE_RDMA");
+  EnvSave save_rdma("DFKV_RDMA");
+  ::setenv("DFKV_REQUIRE_RDMA", "1", 1);
+  ::unsetenv("DFKV_RDMA");
+
+  std::string reason;
+  auto t = MakeClientTransport(&reason);
+  EXPECT_EQ(t, nullptr);
+  EXPECT_NE(reason.find("rdma-required"), std::string::npos) << reason;
 }

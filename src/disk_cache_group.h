@@ -28,6 +28,7 @@ class DiskCacheGroup {
   explicit DiskCacheGroup(Options opt);
 
   Status Cache(const BlockKey& key, const void* data, size_t len);
+  Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap);
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
                std::string* out);
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,

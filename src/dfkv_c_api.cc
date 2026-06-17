@@ -1,11 +1,13 @@
 #include "dfkv_c_api.h"
 
 #include <cstring>
+#include <exception>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "kv_client.h"
+#include "log.h"
 #include "value_header.h"
 
 using dfkv::KVClient;
@@ -34,15 +36,23 @@ dfkv_client_t dfkv_open(const char* members, uint64_t model_hash,
                         uint32_t page_size, uint32_t dtype_tag, uint32_t flags,
                         uint32_t tp_size, uint32_t tp_rank, uint32_t layer_num,
                         uint32_t head_num, uint32_t head_dim) {
-  auto mem = ParseMembers(members);
-  // Empty member list is valid: discovery-only client; ring gets populated by
-  // dfkv_start_mds_discovery. KVClient handles an empty member vector.
-  ValueHeader self = ValueHeader::Make(
-      model_hash, page_size, dtype_tag, static_cast<uint16_t>(flags),
-      static_cast<uint16_t>(tp_size), static_cast<uint16_t>(tp_rank),
-      static_cast<uint16_t>(layer_num), static_cast<uint16_t>(head_num),
-      static_cast<uint16_t>(head_dim));
-  return new KVClient(std::move(mem), self);
+  try {
+    auto mem = ParseMembers(members);
+    // Empty member list is valid: discovery-only client; ring gets populated by
+    // dfkv_start_mds_discovery. KVClient handles an empty member vector.
+    ValueHeader self = ValueHeader::Make(
+        model_hash, page_size, dtype_tag, static_cast<uint16_t>(flags),
+        static_cast<uint16_t>(tp_size), static_cast<uint16_t>(tp_rank),
+        static_cast<uint16_t>(layer_num), static_cast<uint16_t>(head_num),
+        static_cast<uint16_t>(head_dim));
+    return new KVClient(std::move(mem), self);
+  } catch (const std::exception& e) {
+    DFKV_LOG_ERROR(std::string("dfkv_open failed: ") + e.what());
+    return nullptr;
+  } catch (...) {
+    DFKV_LOG_ERROR("dfkv_open failed: unknown exception");
+    return nullptr;
+  }
 }
 
 int dfkv_put(dfkv_client_t c, const char* key, const void* ptr, uint64_t n) {
@@ -168,6 +178,11 @@ int dfkv_start_mds_discovery(dfkv_client_t c, const char* mds_endpoints,
   static_cast<KVClient*>(c)->StartMdsDiscovery(std::move(eps), group,
                                                poll_ms > 0 ? poll_ms : 3000);
   return 0;
+}
+
+const char* dfkv_transport_mode(dfkv_client_t c) {
+  if (!c) return "";
+  return static_cast<KVClient*>(c)->TransportMode().c_str();
 }
 
 uint64_t dfkv_stats_snapshot(dfkv_client_t c, char* buf, uint64_t cap) {

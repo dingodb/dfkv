@@ -22,8 +22,8 @@ beat a small-object penalty?
 - Coalescing N keys into one wire message is **not free**: each key is a separate
   server-side object/file with its own value header, so it needs a new multi-key
   wire op (server reads N files into N regions of one buffer → one big RDMA) plus
-  larger registered buffers (current slot cap = 8 MiB `max_msg`; 3×2.6 MiB already
-  overflows). Cost is real; gain on already-large, bandwidth-bound transfers is
+  larger registered direct buffers (`DFKV_RDMA_MAX_PAYLOAD_BYTES`, default 64 MiB,
+  while ordinary control buffers stay small). Cost is real; gain on already-large, bandwidth-bound transfers is
   marginal.
 - The genuine latency lever for multi-key batches is **pipelining (#1, `DFKV_RDMA_DEPTH`)**,
   which keeps `depth` pages in flight without any protocol change. That is implemented.

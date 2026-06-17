@@ -46,6 +46,10 @@ TEST(CApiStats, SnapshotSizingAndContent) {
   ASSERT_NE(c, nullptr);
   // a few ops against the empty ring exercise the health/metrics chokepoint
   EXPECT_EQ(dfkv_get(c, "k", nullptr, 0), 0);
+  const char* mode = dfkv_transport_mode(c);
+  ASSERT_NE(mode, nullptr);
+  EXPECT_FALSE(std::string(mode).empty());
+  EXPECT_STREQ(dfkv_transport_mode(nullptr), "");
   // size query: cap=0 returns the full length without writing
   uint64_t need = dfkv_stats_snapshot(c, nullptr, 0);
   EXPECT_GT(need, 0u);

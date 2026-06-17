@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -82,6 +83,24 @@ TEST_F(KVStoreTest, RangeDirectReturnsSliceInsideAlignedBuffer) {
   EXPECT_GE(data, io);
   EXPECT_LT(data, io + 16 * 1024);
   EXPECT_EQ(std::string(data, got), v.substr(123, 5000));
+  std::free(raw);
+}
+
+TEST_F(KVStoreTest, CacheDirectWritesAlignedBuffer) {
+  KVStore s(Opts());
+  BlockKey k{334, 0, 1};
+  std::string v(7000, '\0');
+  for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>((i * 17 + 9) & 0xFF);
+
+  void* raw = nullptr;
+  ASSERT_EQ(posix_memalign(&raw, 4096, 8192), 0);
+  char* io = static_cast<char*>(raw);
+  std::memcpy(io, v.data(), v.size());
+  ASSERT_EQ(s.CacheDirect(k, io, v.size(), 8192), Status::kOk);
+
+  std::string out;
+  ASSERT_EQ(s.Range(k, 0, v.size(), &out), Status::kOk);
+  EXPECT_EQ(out, v);
   std::free(raw);
 }
 

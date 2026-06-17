@@ -120,7 +120,7 @@ void RcEndpoint::Close() {
 }
 
 bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port,
-                      bool direct_io_buffers) {
+                      bool direct_io_buffers, size_t direct_io_cap) {
   cap_ = cap; depth_ = depth; ib_port_ = ib_port;
 
   int wp[2];
@@ -172,7 +172,8 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   sbuf_.resize(depth_, nullptr); rbuf_.resize(depth_, nullptr);
   smr_.resize(depth_, nullptr); rmr_.resize(depth_, nullptr);
   if (direct_io_buffers) {
-    dbuf_cap_ = cap_ + 2 * kDirectIoAlign;
+    const size_t dio_cap = direct_io_cap ? direct_io_cap : cap_;
+    dbuf_cap_ = dio_cap + 2 * kDirectIoAlign;
     dbuf_.resize(depth_, nullptr);
     dmr_.resize(depth_, nullptr);
   }

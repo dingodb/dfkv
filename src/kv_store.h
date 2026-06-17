@@ -47,6 +47,10 @@ class KVStore {
 
   // Synchronous, idempotent (skips if already present). No S3 upload.
   Status Cache(const BlockKey& key, const void* data, size_t len);
+  // Same semantics as Cache(), but `data` must point at a 4096-aligned
+  // buffer with at least `cap` bytes. The O_DIRECT write uses it directly, so the
+  // server PUT path avoids a payload-sized bounce-buffer copy.
+  Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap);
   // [offset, offset+length) from the local block; NotFound if absent.
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
                std::string* out);

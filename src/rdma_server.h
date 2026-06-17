@@ -40,11 +40,21 @@ class RdmaServer {
       uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
       uint64_t length, char* io_buf, size_t io_cap, const char** out_data,
       size_t* out_len)>;
+  // Optional direct PUT handler: `data` points at a 4096-aligned registered
+  // buffer containing the full stored blob [ValueHeader|payload]. `cap` is the
+  // usable direct-buffer capacity. The handler may zero O_DIRECT padding bytes
+  // after len and write data directly to disk.
+  using CacheDirectHandler = std::function<Status(
+      uint64_t id, uint32_t index, uint32_t ksize, char* data, size_t len,
+      size_t cap)>;
 
   // dev_name empty => env DFKV_RDMA_DEV, else first device.
-  explicit RdmaServer(Handler handler, size_t max_msg = (8u << 20),
+  explicit RdmaServer(Handler handler, size_t max_msg = (64u << 20),
                       const std::string& dev_name = "");
   void set_range_handler(RangeHandler h) { range_handler_ = std::move(h); }
+  void set_cache_direct_handler(CacheDirectHandler h) {
+    cache_direct_handler_ = std::move(h);
+  }
   ~RdmaServer();
 
   Status Start(int port);  // TCP bootstrap port
@@ -79,7 +89,9 @@ class RdmaServer {
 
   Handler handler_;
   RangeHandler range_handler_;
+  CacheDirectHandler cache_direct_handler_;
   size_t max_msg_;
+  size_t control_cap_;
   std::string dev_name_;
   int listen_fd_ = -1;
   int port_ = 0;

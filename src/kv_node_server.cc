@@ -265,6 +265,24 @@ Status KvNodeServer::RangeInto(uint64_t id, uint32_t index, uint32_t ksize,
   return st;
 }
 
+Status KvNodeServer::CacheDirect(uint64_t id, uint32_t index, uint32_t ksize,
+                                 char* data, size_t len, size_t cap) {
+  BlockKey key{id, index, ksize};
+  bool samp = lat_sampler_.ShouldSample();
+  double t0 = samp ? NowSec() : 0.0;
+  Status st = group_.CacheDirect(key, data, len, cap);
+  if (st == Status::kOk) {
+    cache_put_.fetch_add(1, std::memory_order_relaxed);
+    bytes_written_.fetch_add(len, std::memory_order_relaxed);
+  } else if (st == Status::kIOError) {
+    put_io_err_.fetch_add(1, std::memory_order_relaxed);
+  } else if (st == Status::kInvalid) {
+    invalid_ops_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (samp) put_lat_.Observe(NowSec() - t0);
+  return st;
+}
+
 Status KvNodeServer::RangeDirect(uint64_t id, uint32_t index, uint32_t ksize,
                                  uint64_t offset, uint64_t length, char* io_buf,
                                  size_t io_cap, const char** out_data,

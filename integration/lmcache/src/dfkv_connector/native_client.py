@@ -80,6 +80,8 @@ def load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_set_members.argtypes = [c_void_p, c_char_p]
     lib.dfkv_start_mds_discovery.restype = c_int
     lib.dfkv_start_mds_discovery.argtypes = [c_void_p, c_char_p, c_char_p, c_int]
+    lib.dfkv_transport_mode.restype = c_char_p
+    lib.dfkv_transport_mode.argtypes = [c_void_p]
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [c_void_p]
     return lib
@@ -147,6 +149,10 @@ class DfkvNativeClient:
             )
             if not self._h:
                 raise RuntimeError("dfkv_open failed")
+            mode_b = self._lib.dfkv_transport_mode(self._h)
+            self.transport_mode = (
+                mode_b.decode("utf-8", errors="replace") if mode_b else "unknown"
+            )
 
             if membership == "mds":
                 rc = self._lib.dfkv_start_mds_discovery(
@@ -173,7 +179,7 @@ class DfkvNativeClient:
                 max_workers=max(1, int(get_parallelism)),
                 thread_name_prefix="dfkv-io",
             )
-            r.result = f"ok regs={regs}"
+            r.result = f"ok regs={regs} transport={self.transport_mode}"
 
     # ------------------------------------------------------------------
     # blocking ctypes helpers (run in the executor)

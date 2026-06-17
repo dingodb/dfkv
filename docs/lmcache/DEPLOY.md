@@ -172,7 +172,9 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
 |---|---|---|
 | `DFKV_LIB` | — | `libdfkv.so` 路径（`lib` 键优先） |
 | `DFKV_RDMA` | 关 | 设为 `1` 走 RDMA（需 RDMA 版库 + 可达 IB 网络），否则 TCP |
+| `DFKV_REQUIRE_RDMA` | 关 | 设为 `1` 时禁止 TCP fallback；RDMA 不可用则 `dfkv_open` 失败 |
 | `DFKV_RDMA_DEV` | 空 | 客户端 RDMA 设备名；跨网卡时**留空** |
+| `DFKV_RDMA_MAX_PAYLOAD_BYTES` | 67108864 | RDMA 单 value payload 上限；普通控制 buffer 仍保持小尺寸 |
 | `DFKV_CONNECTOR_GET_PARALLELISM` | 1 | 并行 batched-get 组数（提高可降 TTFT） |
 | `DFKV_CONNECTOR_BATCH_MAX_KEYS` | 512 | 单次 native 批量最大 key 数 |
 | `DFKV_ACCESS_LOG_ENABLED` / `_PATH` | 0 / stderr | 逐操作访问日志 |

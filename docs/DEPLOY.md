@@ -159,7 +159,9 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
 export PYTHONPATH=/userdata/dfkv:$PYTHONPATH
 export DFKV_LIB=/userdata/dfkv/libdfkv.so
 export DFKV_RDMA=1                       # 启用 RDMA 数据面（否则 TCP）
+export DFKV_REQUIRE_RDMA=1               # 可选：禁止悄悄 TCP fallback
 export DFKV_RDMA_DEV=ib7s400p0           # 数据面设备；多轨用逗号列表 ib7s400p0,ib7s400p1,...
+export DFKV_RDMA_MAX_PAYLOAD_BYTES=67108864  # 可选：单 chunk payload 上限，默认 64MiB
 # 可选: DFKV_RDMA_DEPTH=16 (单连接 pipeline, K 个请求在途; 利于 PUT; client+server 两端都要设)
 ```
 > 写流水也可写进 extra_config 的 `"rdma_depth":16`（插件在 dfkv_open 前自动设 DFKV_RDMA_DEPTH，免去手动 export）；**dfkv_server 仍须在自己的 env 里设同值或更大**（client depth ≤ server depth）。MLA 单 rank 写是延迟受限，depth>1 让多个 PUT 在途、隐藏单 op 延迟，实测抬高写带宽。

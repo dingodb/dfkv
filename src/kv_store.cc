@@ -116,6 +116,41 @@ bool WriteFileDirect(const std::string& path, const void* data, size_t len) {
   return true;
 }
 
+// Same as WriteFileDirect(), but writes directly from a caller-owned aligned
+// buffer. The caller allows us to zero the O_DIRECT padding bytes in-place.
+bool WriteFileDirectAligned(const std::string& path, char* data, size_t len,
+                            size_t cap) {
+  Fd fd(::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644));
+  if (!fd.valid()) return false;
+  if (len == 0) return true;
+  if (!data) return false;
+  if ((reinterpret_cast<uintptr_t>(data) & (kDioAlign - 1)) != 0) return false;
+
+  uint64_t alen64 = 0;
+  if (!AlignUp(len, &alen64)) return false;
+  const size_t alen = static_cast<size_t>(alen64);
+  if (alen > cap) return false;
+
+  if (::fallocate(fd.get(), 0, 0, static_cast<off_t>(alen)) != 0 &&
+      errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
+    return false;
+  }
+
+  std::memset(data + len, 0, alen - len);
+  size_t done = 0;
+  while (done < alen) {
+    ssize_t w = ::pwrite(fd.get(), data + done, alen - done,
+                         static_cast<off_t>(done));
+    if (w < 0) { if (errno == EINTR) continue; return false; }
+    if (w == 0) return false;
+    done += static_cast<size_t>(w);
+    if (done < alen && (done % kDioAlign) != 0) return false;
+  }
+
+  if (::ftruncate(fd.get(), static_cast<off_t>(len)) != 0) return false;
+  return true;
+}
+
 // Reads the aligned superset of [offset, offset+n) from the already-open
 // O_DIRECT fd into `io_buf` (which must be kDioAlign-aligned). *out_data points
 // inside io_buf at the exact requested slice. Returns true on success.
@@ -285,6 +320,36 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
   std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
   if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first
   fs::rename(tmp, full, ec);  // atomic publish
+  if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
+  sh.ring.push_front(fname);
+  sh.index.try_emplace(fname, full.string(), len);
+  sh.used_bytes += len;
+  EvictLocked(sh);
+  return Status::kOk;
+}
+
+Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
+                            size_t cap) {
+  if (data == nullptr && len != 0) return Status::kInvalid;
+  const std::string fname = key.Filename();
+  Shard& sh = ShardFor(fname);
+  {
+    std::shared_lock<std::shared_mutex> rl(sh.mu);
+    if (sh.index.count(fname)) return Status::kOk;
+  }
+
+  fs::path full = fs::path(opt_.cache_dir) / key.StoreKey();
+  std::error_code ec;
+  fs::create_directories(full.parent_path(), ec);
+  fs::path tmp = full;
+  tmp += "." + std::to_string(tmp_seq_.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
+  if (!WriteFileDirectAligned(tmp.string(), data, len, cap)) {
+    fs::remove(tmp, ec);
+    return Status::kIOError;
+  }
+  std::lock_guard<std::shared_mutex> wl(sh.mu);
+  if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }
+  fs::rename(tmp, full, ec);
   if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
   sh.ring.push_front(fname);
   sh.index.try_emplace(fname, full.string(), len);

@@ -60,9 +60,11 @@ class RcEndpoint {
   // Open device `dev_name` (nullptr/"" = first device), create RC QP in INIT,
   // allocate+register `depth` send & recv buffers of `cap` bytes. When
   // direct_io_buffers is true, also allocate one 4096-aligned registered buffer
-  // per send slot for O_DIRECT reads that are scatter-sent without a copy.
+  // per slot for O_DIRECT reads/writes that are scatter-transferred without a
+  // payload copy. direct_io_cap lets that buffer be larger than the ordinary
+  // control send/recv buffers.
   bool Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port = 1,
-            bool direct_io_buffers = false);
+            bool direct_io_buffers = false, size_t direct_io_cap = 0);
 
   QpInfo Local() const { return local_; }              // my QP info (after Open)
   bool Connect(const QpInfo& remote);                  // INIT -> RTR -> RTS

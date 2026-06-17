@@ -94,11 +94,16 @@ int main(int argc, char** argv) {
                uint64_t len, const char* pl, uint64_t pll, std::string* out) {
           return srv.ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
         },
-        /*max_msg=*/8u << 20, rdma_dev);
+        /*max_msg=*/64u << 20, rdma_dev);
     rsrv->set_range_handler(  // server-side direct GET: disk -> registered dbuf -> RDMA scatter
         [&srv](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
                char* io_buf, size_t cap, const char** out_data, size_t* out_len) {
           return srv.RangeDirect(id, idx, ks, off, len, io_buf, cap, out_data, out_len);
+        });
+    rsrv->set_cache_direct_handler(  // server-side direct PUT: RDMA dbuf -> O_DIRECT write
+        [&srv](uint64_t id, uint32_t idx, uint32_t ks, char* data, size_t len,
+               size_t cap) {
+          return srv.CacheDirect(id, idx, ks, data, len, cap);
         });
     if (rsrv->Start(rdma_port) == Status::kOk)
       DFKV_LOG_INFO("dfkv_server RDMA listening (TCP bootstrap) on port " +

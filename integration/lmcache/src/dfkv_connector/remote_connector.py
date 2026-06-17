@@ -132,12 +132,13 @@ class DfkvConnector(RemoteConnector):
             logger.info(
                 "DfkvConnector ready: membership=%s endpoint=%s group=%s "
                 "full_chunk=%d (%.2f MiB) geometry=%s rdma_pools=%d (%.1f MiB) "
-                "batch_max_keys=%d get_parallelism=%d assume_exists=%s",
+                "batch_max_keys=%d get_parallelism=%d assume_exists=%s transport=%s",
                 endpoint.membership, endpoint.raw_endpoint, endpoint.group,
                 self.full_chunk_size_bytes,
                 self.full_chunk_size_bytes / (1024 * 1024),
                 geometry, len(rdma_pools), total_pool_mib,
                 self._batch_max_keys, self._get_parallelism, self._assume_exists,
+                getattr(self._client, "transport_mode", "unknown"),
             )
             r.result = f"endpoint={endpoint.raw_endpoint} group={endpoint.group}"
 

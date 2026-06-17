@@ -45,6 +45,10 @@ int dfkv_refresh_members(dfkv_client_t c, const char* seed);
 int dfkv_start_mds_discovery(dfkv_client_t c, const char* mds_endpoints,
                              const char* group, int poll_ms);
 
+// Actual client transport selected at dfkv_open(), e.g. "rdma",
+// "tcp(rdma-not-requested)", or "injected". Returns "" for null clients.
+const char* dfkv_transport_mode(dfkv_client_t c);
+
 // Batched, concurrently fanned out. n items; out_* arrays (len n) receive
 // per-item results (1/0). Return 0 on call success.
 int dfkv_batch_put(dfkv_client_t c, const char** keys, const void** ptrs,

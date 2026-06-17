@@ -29,6 +29,13 @@ Status DiskCacheGroup::Cache(const BlockKey& key, const void* data, size_t len) 
   return d->Cache(key, data, len);
 }
 
+Status DiskCacheGroup::CacheDirect(const BlockKey& key, char* data, size_t len,
+                                   size_t cap) {
+  KVStore* d = Route(key);
+  if (d == nullptr) return Status::kInvalid;
+  return d->CacheDirect(key, data, len, cap);
+}
+
 Status DiskCacheGroup::Range(const BlockKey& key, uint64_t offset,
                              uint64_t length, std::string* out) {
   KVStore* d = Route(key);

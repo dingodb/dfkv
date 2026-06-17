@@ -5,10 +5,12 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
 #include "key_map.h"
+#include "log.h"
 #include "transport_factory.h"
 
 namespace dfkv {
@@ -37,9 +39,17 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
   SetMembers(std::move(members));
   if (transport) {
     t_ = transport;
+    transport_reason_ = "injected";
   } else {
-    owned_ = MakeClientTransport();  // RDMA if available+requested, else TCP
+    std::string reason;
+    owned_ = MakeClientTransport(&reason);  // RDMA if available+requested, else TCP
+    transport_reason_ = reason.empty() ? std::string("unknown") : reason;
+    if (!owned_) {
+      DFKV_LOG_ERROR("dfkv client transport unavailable: " + transport_reason_);
+      throw std::runtime_error("dfkv client transport unavailable: " + transport_reason_);
+    }
     t_ = owned_.get();
+    DFKV_LOG_INFO("dfkv client transport=" + transport_reason_);
   }
 }
 
@@ -83,6 +93,16 @@ void KVClient::StopMdsDiscovery() {
 }
 
 KVClient::~KVClient() { StopMdsDiscovery(); }
+
+std::string KVClient::MetricsSnapshot() const {
+  std::string s;
+  s += "# HELP dfkv_client_transport_info Client transport selected by dfkv_open\n";
+  s += "# TYPE dfkv_client_transport_info gauge\n";
+  s += "dfkv_client_transport_info{transport=\"" + transport_reason_ + "\"} 1\n";
+  s += health_.Render();
+  if (t_) s += t_->MetricsText();
+  return s;
+}
 
 uint64_t KVClient::NowMs() const {
   return std::chrono::duration_cast<std::chrono::milliseconds>(

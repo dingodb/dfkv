@@ -29,7 +29,7 @@ class RdmaTransport : public Transport {
 
   // dev_name empty => env DFKV_RDMA_DEV (comma-separated list = multi-rail; each
   // new connection round-robins across the devices), else first device.
-  explicit RdmaTransport(size_t max_msg = (8u << 20), const std::string& dev_name = "");
+  explicit RdmaTransport(size_t max_msg = (64u << 20), const std::string& dev_name = "");
   ~RdmaTransport() override;
 
   Status Cache(const std::string& node, const BlockKey& key, const void* data,
@@ -73,7 +73,8 @@ class RdmaTransport : public Transport {
   // Caller memory regions to register on every connection (the host KV pool).
   // Guarded by mu_; snapshotted in Acquire and registered on the connection.
   std::vector<std::pair<void*, size_t>> pools_;
-  size_t max_msg_;
+  size_t max_payload_;
+  size_t control_cap_;
   size_t depth_;
   int connect_ms_ = 3000;             // bootstrap TCP connect timeout (DFKV_RDMA_CONNECT_MS)
   int io_ms_ = 10000;                 // bootstrap TCP IO timeout (DFKV_RDMA_IO_MS)

@@ -6,8 +6,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,11 +19,45 @@
 #include "numa_util.h"    // pin serve thread to the device's NUMA node
 #include "rdma_verbs.h"   // RcEndpoint, QpInfo
 #include "transport.h"    // kReqPrefix, kRespPrefix
+#include "value_header.h"
 
 namespace dfkv {
 
+namespace {
+size_t EnvBytes(const char* name, size_t dflt) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return dflt;
+  errno = 0;
+  char* end = nullptr;
+  unsigned long long x = std::strtoull(v, &end, 10);
+  if (errno != 0 || end == v || x == 0) return dflt;
+  constexpr unsigned long long kMaxSge =
+      static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max() -
+                                      ValueHeader::kSize - 2 * rdma::kDirectIoAlign);
+  if (x > kMaxSge) x = kMaxSge;
+  return static_cast<size_t>(x);
+}
+
+size_t ResolveMaxPayload(size_t configured) {
+  size_t n = configured ? configured : (64u << 20);
+  n = EnvBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n);
+  n = EnvBytes("DFKV_RDMA_MAX_MSG_BYTES", n);
+  return n;
+}
+
+size_t ControlCapFor(size_t max_payload) {
+  constexpr size_t kDefaultControlCap = 8u << 20;
+  constexpr size_t kMinControlCap = kReqPrefix + ValueHeader::kSize;
+  size_t cap = std::min(kDefaultControlCap, max_payload);
+  return cap < kMinControlCap ? kMinControlCap : cap;
+}
+}  // namespace
+
 RdmaServer::RdmaServer(Handler handler, size_t max_msg, const std::string& dev_name)
-    : handler_(std::move(handler)), max_msg_(max_msg), dev_name_(dev_name) {
+    : handler_(std::move(handler)),
+      max_msg_(ResolveMaxPayload(max_msg)),
+      control_cap_(ControlCapFor(max_msg_)),
+      dev_name_(dev_name) {
   if (dev_name_.empty()) {
     const char* e = std::getenv("DFKV_RDMA_DEV");
     if (e && *e) dev_name_ = e;
@@ -111,8 +148,8 @@ void RdmaServer::AcceptLoop() {
 namespace {
 size_t ServerDepth() {
   // Pipeline depth (requests in flight per connection). Default 1 keeps per-conn
-  // buffer memory low (depth * max_msg * 2); set DFKV_RDMA_DEPTH>1 to enable
-  // pipelining (helps the latency-bound PUT path; GET scales via more conns).
+  // pinned memory low; set DFKV_RDMA_DEPTH>1 to enable pipelining (helps the
+  // latency-bound PUT path; GET scales via more conns).
   const char* e = std::getenv("DFKV_RDMA_DEPTH");
   if (e && *e) { long v = std::strtol(e, nullptr, 10); if (v >= 1 && v <= 256) return (size_t)v; }
   return 1;
@@ -150,8 +187,9 @@ void RdmaServer::Serve(int boot_fd) {
 
   rdma::RcEndpoint ep;
   const size_t K = ServerDepth();
-  if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), max_msg_, K,
-               /*ib_port=*/1, /*direct_io_buffers=*/true)) {
+  const size_t direct_cap = ValueHeader::kSize + max_msg_;
+  if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), control_cap_, K,
+               /*ib_port=*/1, /*direct_io_buffers=*/true, direct_cap)) {
     ::close(boot_fd); return;
   }
   numa::PinThreadToNode(ep.numa_node());  // keep this conn's serve thread NUMA-local to its NIC
@@ -163,10 +201,18 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd); return;
   }
   if (!ep.Connect(rdma::ParseQpInfo(peer))) { ::close(boot_fd); return; }
+  auto post_request_recv = [&](size_t slot) {
+    if (!ep.dbuf(slot) || !ep.dmr(slot) || ep.dbuf_cap() <= ValueHeader::kSize)
+      return ep.PostRecv(slot);
+    return ep.PostRecvScatter(slot, ep.dbuf(slot) + ValueHeader::kSize,
+                              ep.dbuf_cap() - ValueHeader::kSize, ep.dmr(slot),
+                              kReqPrefix + ValueHeader::kSize);
+  };
+
   // Post all K receives so the client may keep up to K requests in flight
   // (pipelining). recv buffers and send buffers are independent slot pools.
   bool armed = true;
-  for (size_t i = 0; i < K; ++i) armed = armed && ep.PostRecv(i);
+  for (size_t i = 0; i < K; ++i) armed = armed && post_request_recv(i);
   if (!armed) { ::close(boot_fd); return; }
   // Tell the client we are ready (recvs posted) so its first SENDs won't hit RNR.
   char ready = 1;
@@ -190,6 +236,8 @@ void RdmaServer::Serve(int boot_fd) {
 
   struct Reply {
     bool scatter = false;
+    bool defer_recv_rearm = false;
+    size_t recv_slot = 0;
     size_t first_len = 0;  // plain: full sbuf length; scatter: sbuf header length
     const void* payload = nullptr;
     size_t payload_len = 0;
@@ -197,35 +245,85 @@ void RdmaServer::Serve(int boot_fd) {
   };
 
   // Build the reply for one request. Generic ops are materialized in sbuf. For
-  // kRange with a direct range handler set, O_DIRECT reads into ep.dbuf[slot]
+  // kRange with a direct range handler set, O_DIRECT reads into ep.dbuf[recv_slot]
   // (4096-aligned + registered) and the wire reply is scatter-sent as
   // [resp-prefix from sbuf | value bytes from dbuf], with no payload memcpy.
-  auto build_reply = [&](size_t slot, const ReqFields& rq, const char* payload,
+  // For kCache with a direct cache handler set, the RDMA RECV has already placed
+  // the user payload into ep.dbuf[recv_slot]+ValueHeader::kSize; only the 48B
+  // value header is copied over so disk writes see one contiguous aligned blob.
+  auto copy_payload = [&](size_t recv_slot, const ReqFields& rq, uint32_t recv_bytes,
+                          std::string* payload) -> bool {
+    payload->clear();
+    if (rq.payload_len == 0) return true;
+    if (recv_bytes < kReqPrefix + rq.payload_len) return false;
+    if (rq.payload_len > static_cast<uint64_t>(ValueHeader::kSize + max_msg_))
+      return false;
+    payload->resize(static_cast<size_t>(rq.payload_len));
+    const size_t head = static_cast<size_t>(
+        std::min<uint64_t>(rq.payload_len, ValueHeader::kSize));
+    if (head) std::memcpy(payload->data(), ep.rbuf(recv_slot) + kReqPrefix, head);
+    const size_t rest = static_cast<size_t>(rq.payload_len) - head;
+    if (rest != 0) {
+      if (!ep.dbuf(recv_slot) || ep.dbuf_cap() < ValueHeader::kSize + rest) return false;
+      std::memcpy(payload->data() + head, ep.dbuf(recv_slot) + ValueHeader::kSize, rest);
+    }
+    return true;
+  };
+
+  auto build_reply = [&](size_t send_slot, size_t recv_slot, const ReqFields& rq,
+                         uint32_t recv_bytes,
                          Reply* reply) -> bool {
-    char* sb = ep.sbuf(slot);
+    char* sb = ep.sbuf(send_slot);
+    auto invalid_reply = [&] {
+      EncodeResp(sb, Status::kInvalid, 0);
+      reply->first_len = kRespPrefix;
+      return true;
+    };
     if (rq.op == static_cast<uint8_t>(WireOp::kRange) && range_handler_) {
-      if (!ep.dbuf(slot) || !ep.dmr(slot)) return false;
-      const uint64_t max_payload = ep.cap() > kRespPrefix ? ep.cap() - kRespPrefix : 0;
-      if (rq.length > max_payload) {
-        EncodeResp(sb, Status::kInvalid, 0);
-        reply->first_len = kRespPrefix;
-        return true;
-      }
+      if (!ep.dbuf(recv_slot) || !ep.dmr(recv_slot)) return false;
+      if (rq.length > static_cast<uint64_t>(ValueHeader::kSize + max_msg_))
+        return invalid_reply();
       const char* out_data = nullptr;
       size_t out_len = 0;
       Status st = range_handler_(rq.id, rq.index, rq.size, rq.offset, rq.length,
-                                 ep.dbuf(slot), ep.dbuf_cap(), &out_data, &out_len);
+                                 ep.dbuf(recv_slot), ep.dbuf_cap(), &out_data, &out_len);
       uint64_t dlen = (st == Status::kOk) ? out_len : 0;
       EncodeResp(sb, st, dlen);
       reply->first_len = kRespPrefix;
       if (st == Status::kOk && dlen != 0) {
         if (!out_data) return false;
         reply->scatter = true;
+        reply->defer_recv_rearm = true;
+        reply->recv_slot = recv_slot;
         reply->payload = out_data;
         reply->payload_len = out_len;
-        reply->payload_mr = ep.dmr(slot);
+        reply->payload_mr = ep.dmr(recv_slot);
       }
       return true;
+    }
+
+    if (rq.op == static_cast<uint8_t>(WireOp::kCache) && cache_direct_handler_) {
+      if (!ep.dbuf(recv_slot) || !ep.dmr(recv_slot)) return false;
+      if (rq.payload_len < ValueHeader::kSize ||
+          rq.payload_len > static_cast<uint64_t>(ValueHeader::kSize + max_msg_) ||
+          recv_bytes < kReqPrefix + rq.payload_len) {
+        return invalid_reply();
+      }
+      std::memcpy(ep.dbuf(recv_slot), ep.rbuf(recv_slot) + kReqPrefix,
+                  ValueHeader::kSize);
+      Status st = cache_direct_handler_(
+          rq.id, rq.index, rq.size, ep.dbuf(recv_slot),
+          static_cast<size_t>(rq.payload_len), ep.dbuf_cap());
+      EncodeResp(sb, st, 0);
+      reply->first_len = kRespPrefix;
+      return true;
+    }
+
+    std::string payload_buf;
+    const char* payload = nullptr;
+    if (rq.payload_len != 0) {
+      if (!copy_payload(recv_slot, rq, recv_bytes, &payload_buf)) return invalid_reply();
+      payload = payload_buf.data();
     }
     std::string data;
     Status st = handler_(rq.op, rq.id, rq.index, rq.size, rq.offset, rq.length,
@@ -245,6 +343,8 @@ void RdmaServer::Serve(int boot_fd) {
   // reorder. (An earlier parallel GET worker pool was removed for this reason —
   // it broke zero-copy correctness for marginal gain; GET scales via connections.)
   std::vector<ibv_wc> wcs(K);
+  constexpr size_t kNoSlot = static_cast<size_t>(-1);
+  std::vector<size_t> rearm_on_send(K, kNoSlot);
   bool fail = false;
   const int idle_ms = ServerIdleMs();
   active_conns_.fetch_add(1, std::memory_order_relaxed);
@@ -258,7 +358,15 @@ void RdmaServer::Serve(int boot_fd) {
         completion_errors_.fetch_add(1, std::memory_order_relaxed);
         fail = true; break;
       }
-      if (wc.opcode == IBV_WC_SEND) { free_send.push_back(static_cast<size_t>(wc.wr_id)); continue; }
+      if (wc.opcode == IBV_WC_SEND) {
+        size_t sid = static_cast<size_t>(wc.wr_id);
+        if (sid < rearm_on_send.size() && rearm_on_send[sid] != kNoSlot) {
+          if (!post_request_recv(rearm_on_send[sid])) { fail = true; break; }
+          rearm_on_send[sid] = kNoSlot;
+        }
+        free_send.push_back(sid);
+        continue;
+      }
       if (wc.opcode != IBV_WC_RECV || wc.byte_len < kReqPrefix) { fail = true; break; }
       completions_.fetch_add(1, std::memory_order_relaxed);  // a request RECV
       size_t r = static_cast<size_t>(wc.wr_id);
@@ -266,12 +374,14 @@ void RdmaServer::Serve(int boot_fd) {
       if (!DecodeReq(ep.rbuf(r), &rq)) { fail = true; break; }  // bad protocol version
       if (free_send.empty()) { fail = true; break; }
       size_t s = free_send.back(); free_send.pop_back();
-      const char* payload = (rq.payload_len && wc.byte_len >= kReqPrefix + rq.payload_len)
-                                ? ep.rbuf(r) + kReqPrefix : nullptr;
       Reply reply;
-      bool built = build_reply(s, rq, payload, &reply);   // consumes rbuf[r] for a PUT payload
-      if (!ep.PostRecv(r)) { fail = true; break; }  // re-arm (request consumed)
+      bool built = build_reply(s, r, rq, wc.byte_len, &reply);  // consumes rbuf/dbuf[r]
       if (!built) { fail = true; break; }
+      if (reply.defer_recv_rearm) {
+        rearm_on_send[s] = reply.recv_slot;
+      } else if (!post_request_recv(r)) {
+        fail = true; break;  // re-arm (request consumed)
+      }
       bool sent = reply.scatter
                       ? ep.PostSendScatter(s, reply.first_len, reply.payload,
                                            reply.payload_len, reply.payload_mr)
