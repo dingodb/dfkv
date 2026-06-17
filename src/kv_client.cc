@@ -415,9 +415,38 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
 }
 
 std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
-  std::vector<char> e(keys.size(), 0);
-  RunParallel(keys.size(), batch_concurrency_, [&](size_t i) {
-    e[i] = Exist(keys[i]) ? 1 : 0;
+  const size_t N = keys.size();
+  std::vector<char> e(N, 0);
+  if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
+    RunParallel(N, batch_concurrency_, [&](size_t i) {
+      e[i] = Exist(keys[i]) ? 1 : 0;
+    });
+    return std::vector<bool>(e.begin(), e.end());
+  }
+  // RDMA: group by node so each node's keys pipeline kExist on a single pooled
+  // connection (one Acquire/node) instead of one round trip — and one connection
+  // bootstrap under contention — per key. Nodes still fan out in parallel.
+  std::map<std::string, std::vector<size_t>> by_node;
+  for (size_t i = 0; i < N; ++i) {
+    std::string node = Route(keys[i]);
+    if (node.empty()) continue;
+    by_node[node].push_back(i);
+  }
+  std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
+  RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
+    const std::string& node = groups[g].first;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) return;
+    const std::vector<size_t>& idx = groups[g].second;
+    std::vector<BlockKey> bkeys;
+    bkeys.reserve(idx.size());
+    for (size_t k : idx) bkeys.push_back(ToBlockKey(keys[k]));
+    std::vector<char> ex;
+    std::vector<Status> sts = t_->ExistMany(node, bkeys, &ex);
+    bool resp = false, ioerr = false;
+    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    for (size_t m = 0; m < idx.size(); ++m) e[idx[m]] = (m < ex.size() && ex[m]) ? 1 : 0;
   });
   return std::vector<bool>(e.begin(), e.end());
 }

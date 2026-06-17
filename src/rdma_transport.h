@@ -53,6 +53,9 @@ class RdmaTransport : public Transport {
                                 const std::vector<BlockKey>& keys,
                                 uint64_t offset, uint64_t length,
                                 std::vector<std::string>* outs) override;
+  std::vector<Status> ExistMany(const std::string& node,
+                                const std::vector<BlockKey>& keys,
+                                std::vector<char>* exists) override;
   std::vector<Status> RangeInto(const std::string& node,
                                 const std::vector<BlockKey>& keys,
                                 const std::vector<RangeDst>& dsts,

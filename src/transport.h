@@ -85,6 +85,26 @@ class Transport {
     return r;
   }
 
+  // Batch existence probe for one node. Default = sequential loop; RDMA overrides
+  // it to pipeline kExist requests on a single connection (one Acquire/node)
+  // instead of one round trip per key. (*exists)[i] is 1 iff keys[i] is present;
+  // the returned Status[i] is the raw per-key outcome for caller-side health
+  // accounting (kIOError => transport failure; anything else => node responded).
+  virtual std::vector<Status> ExistMany(const std::string& node,
+                                        const std::vector<BlockKey>& keys,
+                                        std::vector<char>* exists) {
+    exists->assign(keys.size(), 0);
+    std::vector<Status> r;
+    r.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+      bool e = false;
+      Status st = Exist(node, keys[i], &e);
+      (*exists)[i] = (st == Status::kOk && e) ? 1 : 0;
+      r.push_back(st);
+    }
+    return r;
+  }
+
   // Zero-copy read: the payload for keys[i] lands directly in dsts[i].payload
   // (RDMA scatters [resp-prefix | first header_size bytes] into a scratch and the
   // rest into the caller buffer). hdrs[i] gets the first header_size value-header

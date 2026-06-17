@@ -5,6 +5,7 @@
 // no RDMA device is present. Built only when DFKV_WITH_RDMA is defined. Run under
 // ThreadSanitizer to exercise the worker-pool / QP concurrency.
 #include "kv_client.h"
+#include "key_map.h"
 #include "kv_node_server.h"
 #include "rdma_server.h"
 #include "rdma_transport.h"
@@ -78,7 +79,82 @@ struct RdmaNode {
 
 bool HaveRdma() { return RdmaTransport::Available(); }
 
+// Last value of a single-line Prometheus counter (skips the # HELP/# TYPE lines
+// via rfind, which lands on the value line emitted after them).
+long CounterVal(const std::string& text, const std::string& name) {
+  auto p = text.rfind(name);
+  if (p == std::string::npos) return -1;
+  auto sp = text.find(' ', p);
+  if (sp == std::string::npos) return -1;
+  try { return std::stol(text.substr(sp + 1)); } catch (...) { return -1; }
+}
+
 }  // namespace
+
+// Direct transport ExistMany: windowed batch existence probe on one connection.
+// Must be correct across multiple send windows (N > depth) with mixed hit/miss.
+TEST(RdmaLoopback, ExistManyWindowedMixedHitMiss) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
+  RdmaNode node("exm");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  const int N = 80;  // exceeds a single send window (depth) to exercise looping
+  for (int i = 0; i < N; ++i) {
+    std::string v = "v" + std::to_string(i);
+    ASSERT_TRUE(c.Put("p" + std::to_string(i), v.data(), v.size())) << i;
+  }
+  // Interleave present (even) and absent (odd) keys.
+  std::vector<BlockKey> keys;
+  for (int i = 0; i < N; ++i) {
+    keys.push_back(ToBlockKey("p" + std::to_string(i)));      // present
+    keys.push_back(ToBlockKey("absent" + std::to_string(i))); // miss
+  }
+  std::vector<char> exists;
+  auto sts = rt.ExistMany(node.addr, keys, &exists);
+  ASSERT_EQ(exists.size(), keys.size());
+  ASSERT_EQ(sts.size(), keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    bool want = (i % 2 == 0);
+    EXPECT_EQ(exists[i] != 0, want) << "i=" << i;
+  }
+}
+
+// Client BatchExist over RDMA must pipeline on the per-node pooled connection
+// instead of fanning out one round trip per key. Guards the perf fix: after a
+// warm-up that pools a connection, a large BatchExist opens no new connections.
+TEST(RdmaLoopback, BatchExistReusesPooledConn) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("bex");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  const int N = 64;  // > batch_concurrency (8): the old per-key fan-out opened many
+  for (int i = 0; i < N; ++i) {
+    std::string v = "v" + std::to_string(i);
+    ASSERT_TRUE(c.Put("e" + std::to_string(i), v.data(), v.size())) << i;
+  }
+  std::vector<std::string> probe;
+  for (int i = 0; i < N; ++i) {
+    probe.push_back("e" + std::to_string(i));        // present
+    probe.push_back("e" + std::to_string(i) + "_x"); // absent
+  }
+
+  // Warm the pool so exactly one connection is parked for the node.
+  EXPECT_TRUE(c.Exist("e0"));
+  long before = CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  ASSERT_GE(before, 1);
+
+  auto er = c.BatchExist(probe);
+  ASSERT_EQ(er.size(), probe.size());
+  for (size_t i = 0; i < probe.size(); ++i)
+    EXPECT_EQ((bool)er[i], (i % 2 == 0)) << probe[i];
+
+  long after = CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  EXPECT_LE(after - before, 1)
+      << "BatchExist opened " << (after - before)
+      << " new conns; pipelined path should reuse the pooled connection";
+}
 
 TEST(RdmaLoopback, PutGetExistMissOverRdma) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";

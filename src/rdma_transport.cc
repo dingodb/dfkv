@@ -363,6 +363,43 @@ std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
   return res;
 }
 
+std::vector<Status> RdmaTransport::ExistMany(const std::string& node,
+                                             const std::vector<BlockKey>& keys,
+                                             std::vector<char>* exists) {
+  const size_t n = keys.size();
+  exists->assign(n, 0);
+  std::vector<Status> res(n, Status::kIOError);
+  if (n == 0) return res;
+  // kExist carries no payload and gets a status-only reply, so each request is
+  // exactly kReqPrefix bytes and always fits the control buffer (no size guard).
+
+  bool from_pool = false;
+  Conn* c = Acquire(node, &from_pool);
+  if (!c) return res;
+  rdma::RcEndpoint& ep = c->ep;
+  const size_t W = ep.depth();
+  bool conn_ok = true;
+  for (size_t base = 0; base < n && conn_ok; base += W) {
+    const size_t w = std::min(W, n - base);
+    std::vector<size_t> slen(w);
+    for (size_t j = 0; j < w; ++j) {
+      EncodeReq(ep.sbuf(j), WireOp::kExist, keys[base + j], 0, 0, 0);
+      slen[j] = kReqPrefix;
+    }
+    std::vector<uint32_t> rbytes;
+    if (!RunWindow(ep, slen, &rbytes)) { conn_ok = false; break; }
+    for (size_t j = 0; j < w; ++j) {
+      if (rbytes[j] < kRespPrefix) continue;
+      Status st; uint64_t dl = 0;
+      if (!DecodeResp(ep.rbuf(j), &st, &dl)) continue;
+      res[base + j] = st;                              // kOk=present, kNotFound=absent
+      (*exists)[base + j] = (st == Status::kOk) ? 1 : 0;
+    }
+  }
+  if (conn_ok) Release(node, c); else Destroy(c);
+  return res;
+}
+
 std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
                                              const std::vector<BlockKey>& keys,
                                              const std::vector<RangeDst>& dsts,
