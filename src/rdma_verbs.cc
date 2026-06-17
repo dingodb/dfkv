@@ -4,6 +4,7 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -122,6 +123,7 @@ void RcEndpoint::Close() {
 bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port,
                       bool direct_io_buffers, size_t direct_io_cap) {
   cap_ = cap; depth_ = depth; ib_port_ = ib_port;
+  user_mr_cap_ = std::max(kMinUserMr, depth_);  // >= depth: no in-window MR eviction
 
   int wp[2];
   if (::pipe(wp) != 0) return false;  // self-pipe to interrupt WaitComp
@@ -331,7 +333,7 @@ ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
     user_lru_.erase(it->second.second);
     user_mr_.erase(it);
   }
-  while (user_mr_.size() >= kMaxUserMr && !user_lru_.empty()) {  // evict LRU
+  while (user_mr_.size() >= user_mr_cap_ && !user_lru_.empty()) {  // evict LRU
     uintptr_t victim = user_lru_.back();
     auto vit = user_mr_.find(victim);
     if (vit != user_mr_.end()) { ibv_dereg_mr(vit->second.first); user_mr_.erase(vit); }

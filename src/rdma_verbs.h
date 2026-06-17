@@ -70,6 +70,7 @@ class RcEndpoint {
   bool Connect(const QpInfo& remote);                  // INIT -> RTR -> RTS
 
   size_t depth() const { return depth_; }
+  size_t user_mr_cap() const { return user_mr_cap_; }  // >= depth (test/diagnostic)
   size_t cap() const { return cap_; }
   int numa_node() const { return numa_node_; }  // device's NUMA node, or -1
   char* sbuf(size_t slot) { return sbuf_[slot]; }
@@ -143,8 +144,13 @@ class RcEndpoint {
   std::vector<PoolMr> pool_mr_;
   // LRU-capped cache of caller-buffer MRs (addr -> {mr, lru-iterator}); front of
   // user_lru_ is MRU. Bounded so a workload with many distinct buffers can't leak
-  // registrations (a stable HiCache pool stays fully cached and always hits).
-  static constexpr size_t kMaxUserMr = 64;
+  // registrations (a stable HiCache pool stays fully cached and always hits). The
+  // cap MUST be >= pipeline depth: one window registers up to `depth` distinct
+  // out-of-pool buffers before posting their WRs, so a smaller cap could evict
+  // (ibv_dereg_mr) an MR still referenced by an in-flight WR in the same window
+  // (use-after-dereg). Set to max(kMinUserMr, depth) in Open().
+  static constexpr size_t kMinUserMr = 64;
+  size_t user_mr_cap_ = kMinUserMr;
   std::list<uintptr_t> user_lru_;
   std::unordered_map<uintptr_t, std::pair<ibv_mr*, std::list<uintptr_t>::iterator>> user_mr_;
   QpInfo local_;

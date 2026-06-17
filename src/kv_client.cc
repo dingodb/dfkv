@@ -270,7 +270,7 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
-    RunParallel(N, batch_concurrency_, [&](size_t i) {
+    RunParallel(N, batch_concurrency_.load(std::memory_order_relaxed), [&](size_t i) {
       ok[i] = Put(items[i].key, items[i].value, items[i].n) ? 1 : 0;
     });
     return std::vector<bool>(ok.begin(), ok.end());
@@ -289,7 +289,7 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     by_node[node].push_back(i);
   }
   std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
-  RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
+  RunParallel(groups.size(), batch_concurrency_.load(std::memory_order_relaxed), [&](size_t g) {
     const std::string& node = groups[g].first;
     uint64_t now = NowMs();
     if (!health_.Healthy(node, now)) return;
@@ -312,7 +312,7 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
-    RunParallel(N, batch_concurrency_, [&](size_t i) {
+    RunParallel(N, batch_concurrency_.load(std::memory_order_relaxed), [&](size_t i) {
       hit[i] = Get(items[i].key, items[i].out, items[i].n) ? 1 : 0;
     });
     return std::vector<bool>(hit.begin(), hit.end());
@@ -325,7 +325,7 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     by[{node, items[i].n}].push_back(i);
   }
   std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups(by.begin(), by.end());
-  RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
+  RunParallel(groups.size(), batch_concurrency_.load(std::memory_order_relaxed), [&](size_t g) {
     const std::string& node = groups[g].first.first;
     uint64_t now = NowMs();
     if (!health_.Healthy(node, now)) return;
@@ -364,7 +364,7 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
   std::vector<char> hit(N, 0);
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
   if (!t_->pipelined()) {  // TCP: parallelize per item with our own threads.
-    RunParallel(N, batch_concurrency_, [&](size_t i) {
+    RunParallel(N, batch_concurrency_.load(std::memory_order_relaxed), [&](size_t i) {
       size_t got = 0;
       if (GetAuto(items[i].key, items[i].out, items[i].n, &got)) { hit[i] = 1; lens[i] = got; }
     });
@@ -381,7 +381,7 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
     by[{node, items[i].n}].push_back(i);
   }
   std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups(by.begin(), by.end());
-  RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
+  RunParallel(groups.size(), batch_concurrency_.load(std::memory_order_relaxed), [&](size_t g) {
     const std::string& node = groups[g].first.first;
     uint64_t now = NowMs();
     if (!health_.Healthy(node, now)) return;
@@ -418,7 +418,7 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
   const size_t N = keys.size();
   std::vector<char> e(N, 0);
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
-    RunParallel(N, batch_concurrency_, [&](size_t i) {
+    RunParallel(N, batch_concurrency_.load(std::memory_order_relaxed), [&](size_t i) {
       e[i] = Exist(keys[i]) ? 1 : 0;
     });
     return std::vector<bool>(e.begin(), e.end());
@@ -433,7 +433,7 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
     by_node[node].push_back(i);
   }
   std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
-  RunParallel(groups.size(), batch_concurrency_, [&](size_t g) {
+  RunParallel(groups.size(), batch_concurrency_.load(std::memory_order_relaxed), [&](size_t g) {
     const std::string& node = groups[g].first;
     uint64_t now = NowMs();
     if (!health_.Healthy(node, now)) return;

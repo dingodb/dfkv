@@ -10,6 +10,7 @@
 #ifndef DFKV_KV_CLIENT_H_
 #define DFKV_KV_CLIENT_H_
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -64,7 +65,9 @@ class KVClient {
                                  std::vector<size_t>* out_lens);
   std::vector<bool> BatchExist(const std::vector<std::string>& keys);
 
-  void set_batch_concurrency(size_t n) { batch_concurrency_ = n ? n : 1; }
+  void set_batch_concurrency(size_t n) {
+    batch_concurrency_.store(n ? n : 1, std::memory_order_relaxed);
+  }
 
   // Register a large caller memory region (e.g. the whole SGLang host KV pool) for
   // zero-copy transfer, so Put/Get never do a per-op RDMA MR registration — every
@@ -108,7 +111,8 @@ class KVClient {
   std::unique_ptr<Transport> owned_;
   Transport* t_;
   std::string transport_reason_ = "unknown";
-  size_t batch_concurrency_ = 8;
+  // Atomic: configurable via the C ABI; reads on the batch path are relaxed.
+  std::atomic<size_t> batch_concurrency_{8};
   std::unique_ptr<MdsMemberPoller> poller_;
   PeerHealth health_;
 };
