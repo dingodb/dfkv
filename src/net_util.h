@@ -56,7 +56,10 @@ inline void PutU32(char* p, uint32_t v) { std::memcpy(p, &v, 4); }
 inline uint64_t GetU64(const char* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 inline uint32_t GetU32(const char* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 
-// "ip:port" -> connected fd, or -1.
+// "ip:port" -> connected fd, or -1. IPv4 only (inet_pton AF_INET): an IPv6
+// literal or hostname returns -1 (caller treats as a clean connect failure /
+// marks the endpoint down). All current deploys are IPv4 (192.168.x); switch to
+// getaddrinfo here if an IPv6/dual-stack fabric is ever introduced.
 inline int Dial(const std::string& addr, int connect_ms = 0, int io_ms = 0) {
   auto pos = addr.rfind(':');
   if (pos == std::string::npos) return -1;

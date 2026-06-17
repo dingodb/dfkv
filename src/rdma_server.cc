@@ -42,6 +42,12 @@ size_t ResolveMaxPayload(size_t configured) {
   size_t n = configured ? configured : (64u << 20);
   n = EnvBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n);
   n = EnvBytes("DFKV_RDMA_MAX_MSG_BYTES", n);
+  // Clamp the constructor-supplied value too (EnvBytes only clamps the env paths):
+  // dbuf/SGE length is uint32, so payload must stay under uint32 - header - 2*align
+  // or the registered length silently overflows/truncates -> corruption.
+  constexpr size_t kMaxSge = static_cast<size_t>(
+      std::numeric_limits<uint32_t>::max() - ValueHeader::kSize - 2 * rdma::kDirectIoAlign);
+  if (n > kMaxSge) n = kMaxSge;
   return n;
 }
 

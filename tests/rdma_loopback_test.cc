@@ -292,6 +292,20 @@ TEST(RdmaLoopback, ManyEndpointsShareDeviceContext) {
   ASSERT_TRUE(again.Open(nullptr, 64 * 1024, 1));
 }
 
+// The user-MR LRU cap must be >= pipeline depth, else a single windowed batch
+// (which registers up to `depth` distinct out-of-pool buffers before posting
+// their WRs) could evict an MR still referenced by an in-flight WR.
+TEST(RdmaLoopback, UserMrCapTracksDepth) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  rdma::RcEndpoint shallow;
+  ASSERT_TRUE(shallow.Open(nullptr, 16 * 1024, 1));
+  EXPECT_GE(shallow.user_mr_cap(), 64u);            // floor
+  EXPECT_GE(shallow.user_mr_cap(), shallow.depth());
+  rdma::RcEndpoint deep;
+  ASSERT_TRUE(deep.Open(nullptr, 16 * 1024, 100));  // depth > default cap of 64
+  EXPECT_GE(deep.user_mr_cap(), 100u) << "cap below depth -> in-window MR eviction risk";
+}
+
 TEST(RdmaLoopback, PoolMrSharedAcrossBuffers) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   rdma::RcEndpoint ep;
