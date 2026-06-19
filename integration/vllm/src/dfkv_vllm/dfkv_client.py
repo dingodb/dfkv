@@ -36,23 +36,44 @@ class DfkvDeviceClient:
 
     def __init__(
         self,
-        members: str,
-        model_hash: int,
+        members: str = "",
+        model_hash: int = 0,
         lib_path: Optional[str] = None,
         batch_concurrency: int = 8,
         geometry: Sequence[int] = _GEOMETRY_ZEROS,
+        mds_endpoints: str = "",
+        mds_group: str = "default",
+        mds_poll_ms: int = 3000,
     ):
         if len(geometry) != 8:
             raise ValueError("geometry must have exactly 8 fields")
+        if not members and not mds_endpoints:
+            raise ValueError(
+                "DfkvDeviceClient needs 'mds_endpoints' (MDS discovery) or "
+                "'members' (static list)"
+            )
         self._lib = load_lib(lib_path)
+        # MDS path opens with an empty/seed member list and lets discovery build
+        # the ring; the static path opens directly with the given members.
         self._h = self._lib.dfkv_open(
             members.encode(),
             c_uint64(model_hash & 0xFFFFFFFFFFFFFFFF),
             *(c_uint32(int(g) & 0xFFFFFFFF) for g in geometry),
         )
         if not self._h:
-            raise RuntimeError(f"dfkv_open failed (members={members!r})")
+            raise RuntimeError(
+                f"dfkv_open failed (members={members!r}, mds={mds_endpoints!r})"
+            )
         self._lib.dfkv_set_batch_concurrency(self._h, c_uint64(batch_concurrency))
+        if mds_endpoints:
+            rc = self._lib.dfkv_start_mds_discovery(
+                self._h, mds_endpoints.encode(), mds_group.encode(), int(mds_poll_ms)
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f"dfkv_start_mds_discovery failed (rc={rc}, "
+                    f"mds={mds_endpoints!r}, group={mds_group!r})"
+                )
 
     @property
     def transport_mode(self) -> str:

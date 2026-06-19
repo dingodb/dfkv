@@ -727,8 +727,13 @@ class DfkvStoreWorker:
         # client. dfkv selects its own RNIC via the DFKV_RDMA_DEV env and is
         # configured entirely through kv_connector_extra_config.
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        # Membership: prefer MDS discovery (production) when mds_endpoints is set;
+        # else fall back to a static members list. The client requires one of them.
         self.client = DfkvDeviceClient(
-            members=extra["members"],
+            members=extra.get("members", ""),
+            mds_endpoints=extra.get("mds_endpoints", ""),
+            mds_group=extra.get("mds_group", "default"),
+            mds_poll_ms=int(extra.get("mds_poll_ms", 3000)),
             model_hash=int(extra.get("model_hash", 0)),
             lib_path=extra.get("lib"),
             batch_concurrency=int(extra.get("batch_concurrency", 8)),

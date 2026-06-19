@@ -43,6 +43,12 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_open.restype = c_void_p
     lib.dfkv_open.argtypes = [c_char_p, c_uint64] + [c_uint32] * 8
 
+    # int = dfkv_start_mds_discovery(c, mds_endpoints, group, poll_ms)
+    # Background MDS-based membership discovery (production path): the ring is
+    # built/refreshed from the MDS tier instead of a static --members list.
+    lib.dfkv_start_mds_discovery.restype = c_int
+    lib.dfkv_start_mds_discovery.argtypes = [c_void_p, c_char_p, c_char_p, c_int]
+
     # GPUDirect MR registration (ibv_reg_mr on a host OR device pointer).
     lib.dfkv_register_memory.restype = c_int
     lib.dfkv_register_memory.argtypes = [c_void_p, c_void_p, c_uint64]
