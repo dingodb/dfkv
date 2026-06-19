@@ -470,6 +470,64 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
   ::unsetenv("DFKV_RDMA_DEPTH");
 }
 
+// Fix 1 regression: an oversized SG key (total payload > max_payload_, but with a
+// legal segment count so it passes the client guard) must fail ONLY itself inside
+// CacheFromMulti/RangeIntoMulti, NOT poison its node batch. Previously the up-front
+// validation std::fill'd every result kInvalid and returned; now the offender is
+// skipped in the window and its siblings on the same node proceed normally.
+TEST(RdmaLoopback, ScatterGatherOversizedFailsOnlyOffender) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_DEPTH", "4", 1);
+  RdmaNode node("sgov");
+  RdmaTransport rt(kMaxMsg);  // max_payload_ = 256 KiB
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  c.set_batch_concurrency(1);  // single node, stable on rxe loopback
+  ASSERT_TRUE(rt.pipelined());
+
+  auto fill = [](std::string& s, int seed) {
+    for (size_t b = 0; b < s.size(); ++b) s[b] = static_cast<char>((seed + b * 7) & 0xFF);
+  };
+
+  // Valid sibling A, an oversized item (2 segs * 200 KiB = 400 KiB > 256 KiB max_payload,
+  // only 2 segments so it clears the <=29-seg client guard), then valid sibling B —
+  // all routed to the same (only) node. The offender must report failure; both
+  // siblings must succeed and round-trip byte-exact.
+  std::string a0(4096, '\0'); fill(a0, 11);
+  std::string b0(8192, '\0'); fill(b0, 23);
+  std::string big0(200 * 1024, '\0'), big1(200 * 1024, '\0');
+  fill(big0, 31); fill(big1, 37);
+
+  std::vector<KvPutItemSg> puts = {
+      {"sgov_a", {a0.data()}, {a0.size()}},
+      {"sgov_big", {big0.data(), big1.data()}, {big0.size(), big1.size()}},
+      {"sgov_b", {b0.data()}, {b0.size()}},
+  };
+  auto pr = c.BatchPutSg(puts);
+  EXPECT_TRUE(pr[0]) << "sibling A put";
+  EXPECT_FALSE(pr[1]) << "oversized put must fail only itself";
+  EXPECT_TRUE(pr[2]) << "sibling B put (must not be poisoned by the offender)";
+
+  // The two siblings must have been stored; the oversized key must be absent (never
+  // written). Drive the GET-side oversized path too: a get whose total cap exceeds
+  // max_payload must miss without poisoning its siblings.
+  std::string ga(4096, '\0'), gb(8192, '\0');
+  std::string gbig0(200 * 1024, '\0'), gbig1(200 * 1024, '\0');
+  std::vector<KvGetItemSg> gets = {
+      {"sgov_a", {&ga[0]}, {ga.size()}},
+      {"sgov_big", {&gbig0[0], &gbig1[0]}, {gbig0.size(), gbig1.size()}},
+      {"sgov_b", {&gb[0]}, {gb.size()}},
+  };
+  std::vector<size_t> lens;
+  auto gr = c.BatchGetAutoSg(gets, &lens);
+  EXPECT_TRUE(gr[0]) << "sibling A get";
+  EXPECT_FALSE(gr[1]) << "oversized get must miss only itself";
+  EXPECT_TRUE(gr[2]) << "sibling B get (must not be poisoned by the offender)";
+  if (gr[0]) { EXPECT_EQ(ga, a0); }
+  if (gr[2]) { EXPECT_EQ(gb, b0); }
+
+  ::unsetenv("DFKV_RDMA_DEPTH");
+}
+
 TEST(RdmaLoopback, PipelinedPoolDepth) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   // depth>1 enables client pipelining + the server GET worker pool (the most

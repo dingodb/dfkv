@@ -573,14 +573,18 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   if (!c) return res;
   rdma::RcEndpoint& ep = c->ep;
   const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
-  for (const auto& s : srcs) {
+  // Per-item validation: an oversized key must fail ONLY itself (kInvalid), not
+  // poison its node batch. The connector treats per-key kInvalid as a save miss
+  // (fail-soft recompute), so we mark offenders and skip them in the window below.
+  std::vector<char> bad(n, 0);
+  for (size_t i = 0; i < n; ++i) {
+    const auto& s = srcs[i];
     size_t total = 0;
     for (const auto& p : s.payloads) total += p.second;
     if (s.header_len > control_cap_ - kReqPrefix || total > max_payload_ ||
         s.payloads.size() > max_payload_segs) {
-      Release(node, c);
-      std::fill(res.begin(), res.end(), Status::kInvalid);
-      return res;
+      bad[i] = 1;
+      res[i] = Status::kInvalid;
     }
   }
 
@@ -591,9 +595,12 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
     // Register every payload segment of every key in this window (cached MR lookup).
     // mrs_per[j] holds the per-segment MRs for slot j. Any failure => give the conn
     // back; Cache is idempotent so re-sending earlier windows on retry is harmless.
+    // Oversized slots (bad[base+j]) are skipped: no MR, no recv/send, and they do
+    // not consume a completion (need is sized to the posted slots only).
     std::vector<std::vector<ibv_mr*>> mrs_per(w);
     bool regok = true;
     for (size_t j = 0; j < w && regok; ++j) {
+      if (bad[base + j]) continue;
       const CacheSrcMulti& s = srcs[base + j];
       mrs_per[j].assign(s.payloads.size(), nullptr);
       for (size_t e = 0; e < s.payloads.size() && regok; ++e) {
@@ -604,7 +611,9 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       }
     }
     if (!regok) { Release(node, c); return res; }
+    size_t posted = 0;
     for (size_t j = 0; j < w && conn_ok; ++j) {
+      if (bad[base + j]) continue;
       const CacheSrcMulti& s = srcs[base + j];
       size_t total = 0;
       std::vector<std::pair<const void*, uint32_t>> segs;
@@ -620,11 +629,13 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       if (!ep.PostSendScatterMulti(j, kReqPrefix + s.header_len, segs, mrs_per[j])) {
         conn_ok = false; break;
       }
+      ++posted;
     }
     if (!conn_ok) break;
+    if (posted == 0) continue;  // whole window was oversized: nothing to reap
     std::vector<ibv_wc> wcs(2 * w);
     std::vector<uint32_t> rbytes(w, 0);
-    int need = static_cast<int>(2 * w);
+    int need = static_cast<int>(2 * posted);
     while (need > 0) {
       int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
       if (g <= 0) { conn_ok = false; break; }
@@ -664,13 +675,15 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
   if (!c) return res;
   rdma::RcEndpoint& ep = c->ep;
   const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
-  for (const auto& d : dsts) {
+  // Per-item validation: an oversized destination must fail ONLY itself (kInvalid),
+  // not poison its node batch. Offenders are marked and skipped in the window below.
+  std::vector<char> bad(n, 0);
+  for (size_t i = 0; i < n; ++i) {
     size_t cap = 0;
-    for (const auto& p : d.payloads) cap += p.second;
-    if (cap > max_payload_ || d.payloads.size() > max_payload_segs) {
-      Release(node, c);
-      std::fill(res.begin(), res.end(), Status::kInvalid);
-      return res;
+    for (const auto& p : dsts[i].payloads) cap += p.second;
+    if (cap > max_payload_ || dsts[i].payloads.size() > max_payload_segs) {
+      bad[i] = 1;
+      res[i] = Status::kInvalid;
     }
   }
 
@@ -678,11 +691,13 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
   bool conn_ok = true;
   for (size_t base = 0; base < n && conn_ok; base += W) {
     const size_t w = std::min(W, n - base);
-    // Register every destination segment of every key in this window.
+    // Register every destination segment of every key in this window. Oversized
+    // slots (bad[base+j]) are skipped: no MR, no recv/send, no completion consumed.
     std::vector<std::vector<ibv_mr*>> mrs_per(w);
     std::vector<size_t> caps(w, 0);
     bool regok = true;
     for (size_t j = 0; j < w && regok; ++j) {
+      if (bad[base + j]) continue;
       const RangeDstMulti& d = dsts[base + j];
       mrs_per[j].assign(d.payloads.size(), nullptr);
       for (size_t e = 0; e < d.payloads.size() && regok; ++e) {
@@ -693,7 +708,9 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       }
     }
     if (!regok) { Release(node, c); return res; }
+    size_t posted = 0;
     for (size_t j = 0; j < w && conn_ok; ++j) {
+      if (bad[base + j]) continue;
       const RangeDstMulti& d = dsts[base + j];
       bool armed;
       if (caps[j]) {
@@ -708,11 +725,13 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       if (!armed) { conn_ok = false; break; }
       EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + caps[j], 0);
       if (!ep.PostSend(j, kReqPrefix)) { conn_ok = false; break; }
+      ++posted;
     }
     if (!conn_ok) break;
+    if (posted == 0) continue;  // whole window was oversized: nothing to reap
     std::vector<ibv_wc> wcs(2 * w);
     std::vector<uint32_t> rbytes(w, 0);
-    int need = static_cast<int>(2 * w);
+    int need = static_cast<int>(2 * posted);
     while (need > 0) {
       int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
       if (g <= 0) { conn_ok = false; break; }

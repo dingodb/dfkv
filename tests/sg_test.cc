@@ -159,6 +159,34 @@ TEST(Sg, MissReturnsMiss) {
   a->srv->Stop();
 }
 
+// Fix 3: an empty/null key in a batch is skipped (no header-only blob written, no
+// wasted GET issued) and reported failed/miss, while valid siblings still succeed.
+TEST(Sg, EmptyKeySkipped) {
+  auto a = Start("emptykey");
+  KVClient c({{"a", a->addr}}, Hdr());
+  std::string v(128, 'x');
+  std::vector<KvPutItemSg> puts = {
+      {"", {v.data()}, {v.size()}},        // empty key: must be skipped
+      {"ek_ok", {v.data()}, {v.size()}},   // valid sibling
+  };
+  auto pr = c.BatchPutSg(puts);
+  EXPECT_FALSE(pr[0]) << "empty-key put must be skipped/failed";
+  EXPECT_TRUE(pr[1]) << "valid sibling must still be stored";
+
+  std::string d0(128, '\0'), d1(128, '\0');
+  std::vector<KvGetItemSg> gets = {
+      {"", {&d0[0]}, {d0.size()}},         // empty key: must miss (no GET issued)
+      {"ek_ok", {&d1[0]}, {d1.size()}},    // valid sibling: hit
+  };
+  std::vector<size_t> lens;
+  auto gr = c.BatchGetAutoSg(gets, &lens);
+  EXPECT_FALSE(gr[0]) << "empty-key get must miss";
+  EXPECT_EQ(lens[0], 0u);
+  EXPECT_TRUE(gr[1]) << "valid sibling get must hit";
+  if (gr[1]) { EXPECT_EQ(d1, v); }
+  a->srv->Stop();
+}
+
 // Multi-key fan-out across two nodes, mixed segment counts.
 TEST(Sg, MultiKeyTwoNodes) {
   auto a = Start("mk_a"); auto b = Start("mk_b");

@@ -4,6 +4,7 @@
 #ifndef DFKV_TRANSPORT_H_
 #define DFKV_TRANSPORT_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -12,6 +13,7 @@
 
 #include "kv_store.h"   // Status
 #include "kv_types.h"
+#include "value_header.h"  // ValueHeader (for true stored-length in RangeIntoMulti)
 #include "wire.h"       // WireOp, kReqPrefix, kRespPrefix, Encode/DecodeReq/Resp
 
 namespace dfkv {
@@ -227,7 +229,17 @@ class Transport {
         if (p.second) std::memcpy(p.first, scratch[i].data() + off, p.second);
         off += p.second;
       }
-      if (out_lens) (*out_lens)[i] = off;
+      // out_lens = the TRUE received payload length (matching the RDMA override,
+      // which reports received_bytes - header), not the sum-of-caps `off`. The
+      // stored length lives in the value header; RangeInto delivered min(stored,cap).
+      if (out_lens) {
+        size_t stored = off;  // fall back to caps if the header can't be parsed
+        ValueHeader vh;
+        if (header_size >= ValueHeader::kSize &&
+            ValueHeader::Parse((*hdrs)[i].data(), (*hdrs)[i].size(), &vh))
+          stored = std::min<size_t>(vh.payload_len, off);
+        (*out_lens)[i] = stored;
+      }
     }
     return r;
   }
