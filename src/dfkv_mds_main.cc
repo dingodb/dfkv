@@ -17,6 +17,21 @@ void OnSig(int) { g_stop = 1; }  // async-signal-safe: just set a flag
 
 int main(int argc, char** argv) {
   if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_mds %s\n", dfkv::Version()); return 0; }
+  // No args or --help: print usage and exit, rather than starting with defaults.
+  if (argc == 1 || dfkv::WantsHelp(argc, argv)) {
+    bool help = dfkv::WantsHelp(argc, argv);
+    std::FILE* out = help ? stdout : stderr;
+    std::fprintf(out,
+      "dfkv_mds %s — dfkv Membership Directory Service daemon (stateless; state in etcd)\n"
+      "Usage: dfkv_mds --listen <port> [--etcd <host:port>] [options]\n\n"
+      "  --listen <port>      TCP port to serve MDS requests on\n"
+      "  --etcd <host:port>   etcd endpoint (default 127.0.0.1:2379)\n"
+      "  --metrics-port <p>   enable Prometheus /metrics (omit = off); --metrics-bind <addr>\n"
+      "  --version, -V        print version and exit\n"
+      "  --help, -h           print this help and exit\n",
+      dfkv::Version());
+    return help ? 0 : 1;
+  }
   std::string etcd = "127.0.0.1:2379", metrics_bind;
   int port = 0, metrics_port = -1;
   for (int i = 1; i + 1 < argc; i += 2) {

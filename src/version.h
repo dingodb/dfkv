@@ -15,6 +15,10 @@ const char* Version();
 // --version and fall through to running the daemon.
 bool WantsVersion(int argc, char** argv);
 
+// True if argv contains "--help" or "-h". Same rationale: an unknown flag would
+// otherwise be ignored and the daemon would start with default config.
+bool WantsHelp(int argc, char** argv);
+
 }  // namespace dfkv
 
 #endif  // DFKV_VERSION_H_
