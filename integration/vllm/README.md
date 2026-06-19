@@ -10,7 +10,12 @@ The connector is pure Python (ctypes over `libdfkv.so`); there is no native
 build. It talks to dfkv on **raw GPU device pointers** — the paged KV cache is
 registered once via `dfkv_register_memory` (an `ibv_reg_mr` that, under
 nvidia-peermem, yields a GPUDirect MR), and transfers RDMA directly to/from GPU
-memory with no host bounce.
+memory with no host bounce. Per-chunk layer segments are coalesced into one dfkv
+key via the **scatter-gather** batch API (one multi-SGE RDMA per chunk instead of
+one per layer-segment), cutting key/disk-read count ~20x.
+
+> **Full deployment walkthrough + recommended settings: [`docs/vllm/DEPLOY.md`](../../docs/vllm/DEPLOY.md).**
+> This README is the quick reference.
 
 ## Enable
 
@@ -27,24 +32,52 @@ memory with no host bounce.
 }'
 ```
 
-Also set `DFKV_RDMA=1` and `DFKV_RDMA_DEV=<rail, e.g. ib7s400p0>` in the engine
-environment to select the RDMA transport and rail.
+## Environment variables (engine process)
+
+Read by `libdfkv.so` (the C client) and the connector, so set them in **every**
+vLLM engine process — each DP rank is its own process.
+
+| env | default | meaning |
+|---|---|---|
+| `DFKV_RDMA` | unset (TCP) | `1` selects the RDMA transport; unset ⇒ TCP fallback. |
+| `DFKV_RDMA_DEV` | — | RDMA rail by name (`ib7s400p0`; comma-list = multi-rail). Required when `DFKV_RDMA=1`. |
+| **`PYTHONHASHSEED`** | unset | **Set to `0` (any fixed value, identical on every rank and instance).** vLLM's block hashes feed the dfkv key and use Python `hash()`, which is per-process randomized by default. Without a fixed seed, DP ranks and restarts compute **different keys for the same tokens** ⇒ cross-process / cross-restart prefix reuse silently drops to ~0. The single most common "no hit" misconfig. |
+| `DFKV_RDMA_DEPTH` | `1` | Requests in flight per connection. A latency hider, **not** a throughput knob (GET/PUT are depth-flat — the per-connection serve loop is in-order). Leave at default. |
+| `DFKV_RDMA_NUMA` | `0` | `1` pins buffers/threads to the rail's NUMA node and picks a NUMA-local rail per connection. Optional. |
+| `DFKV_LIB` / `DFKV_BUILD` | — | `libdfkv.so` path (overridden by the `lib` extra-config key). |
 
 ## `kv_connector_extra_config` keys
 
-| key | meaning |
-|---|---|
-| `members` | dfkv member string. **The port MUST be the server's `--rdma-port`** (the RDMA bootstrap listener), not the main `--port`, when RDMA is enabled. |
-| `model_hash` | uint64 namespace for keys; isolates this model's KV from others sharing the pool. A shared `model_hash` requires identical kv-cache-dtype / page-size / layout. |
-| `lib` | path to `libdfkv.so` (else env `DFKV_LIB` / `$DFKV_BUILD/libdfkv.so`). |
-| `batch_concurrency` | client fan-out for batch ops (default 8). |
+| key | default | meaning |
+|---|---|---|
+| `members` | (required) | dfkv member string. **The port MUST be the server's `--rdma-port`** (the RDMA bootstrap listener), not the main `--port`, when RDMA is enabled. |
+| `model_hash` | `0` | uint64 namespace for keys; isolates this model's KV from others sharing the pool. A shared `model_hash` requires identical kv-cache-dtype / page-size / layout (see geometry guard below). |
+| `lib` | env `DFKV_LIB` / `$DFKV_BUILD/libdfkv.so` | path to `libdfkv.so`. |
+| `batch_concurrency` | `8` | client fan-out across nodes for batch ops; the real throughput lever (depth is flat). Raise toward the cluster's node count for wider pools. |
+| `load_async` | `True` | async KV load: the scheduler returns `WAITING_FOR_REMOTE_KVS` and the load runs off the critical path. Keep `True`. |
+| `enable_cross_layers_blocks` | `False` | opt-in for engines whose paged layout interleaves layers within a block. Leave `False` unless you know the layout needs it. |
+| `lookup_rpc_port` | (ipc auto) | port for the rank-0 scheduler-side prefix-lookup RPC; set only if the default IPC socket name collides. |
+
+## Geometry guard (instances sharing one pool)
+
+KV written by instance A is only safe to read by instance B when their tensor
+geometry matches. Before sharing a `model_hash` across instances, confirm all of:
+**`--kv-cache-dtype`, page/block size, KV memory layout, `--max-model-len`** are
+identical. The dfkv value header guards `payload_len` (byte size) only — same-size
+but different-layout KV would be read back as **silent garbage**. To isolate
+instead of share, give each a distinct `served-model-name` / `model_hash`.
 
 ## Gotchas (validated on hd04 H100 + IB)
 
 - **member port = rdma-port.** Pointing at the main `--port` makes every RDMA
   `put` fail (`rc=-1`); RDMA QP bootstrap listens on `--rdma-port`.
+- **`PYTHONHASHSEED=0` on every rank** (see env table) — the #1 cause of "writes
+  succeed but reads never hit".
 - **GPU buffers use the batch path only.** The single `dfkv_get_auto` computes a
   CRC over the destination on the CPU and segfaults on device memory; the batch
   `dfkv_batch_get_auto` is zero-copy and GPU-safe.
 - **GPUDirect needs nvidia-peermem loaded** on the GPU node (`lsmod | grep
   nvidia_peermem`).
+- **First request per DP rank pays a one-time ~2s Triton JIT** (resumed-prefill +
+  SWA-index kernels). Warm it with a synthetic hit per rank at startup if first-token
+  latency matters.

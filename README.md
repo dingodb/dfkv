@@ -1,11 +1,16 @@
-# dfkv — distributed KV cache for SGLang HiCache
+# dfkv — distributed KV cache for LLM inference (SGLang · LMCache · vLLM)
 
 [![CI](https://github.com/dingodb/dfkv/actions/workflows/ci.yml/badge.svg)](https://github.com/dingodb/dfkv/actions/workflows/ci.yml)
 
-A small, **self-contained** distributed key-value cache that plugs into SGLang's
-HiCache as its L3 external KV store. Built to pool GPU-node NVMe SSDs into a
-shared, large-capacity KVCache pool for LLM inference (e.g. GLM-5.1 / MLA),
-**without any DingoFS / brpc / MDS / S3-RADOS dependency** — it runs on its own.
+A small, **self-contained** distributed key-value cache that pools GPU-node NVMe
+SSDs into a shared, large-capacity KV pool for LLM inference (e.g. GLM-5.1 / MLA,
+DeepSeek-V4), **without any DingoFS / brpc / S3-RADOS dependency** — it runs on
+its own (only its built-in MDS + etcd for dynamic membership). It plugs into
+three engines through thin adapters over one portable core:
+
+- **SGLang HiCache** as an L3 external KV store (`--hicache-storage-backend dynamic`).
+- **LMCache** as a `RemoteConnector`.
+- **vLLM** directly as a `KVConnectorBase_V1` (GPUDirect RDMA, no LMCache).
 
 > Origin: extracted from the DingoFS branch `feat/kvcache-sglang`
 > (`src/cache/kvclient`). The portable core has zero coupling to DingoFS, so it
@@ -79,16 +84,25 @@ Full rollout runbook (etcd + MDS + systemd units): `docs/DEPLOY.md`.
 src/        portable C++ core (headers + .cc) + dfkv_server_main.cc + dfkv_mds_main.cc
 python/     dfkv_hicache.py  (SGLang dynamic backend plugin)
 integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libdfkv.so)
+integration/vllm/     dfkv_vllm       (vLLM KVConnectorBase_V1, GPUDirect RDMA, bypass LMCache)
 tests/      gtest suites + tests/python (unittest + no-torch sglang shim)
 docs/       DEPLOY.md (standalone rollout) · INTEGRATION.md (fuse into dingo-cache)
 docs/hicache/  SGLang HiCache plugin docs (access_log, module README)
 docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
+docs/vllm/     vLLM connector docs (DEPLOY — config reference + recommended settings)
 ```
 
 ## Engine integrations
 - **SGLang HiCache**: `python/dfkv_hicache.py` — see `docs/hicache/` and `docs/DEPLOY.md`.
 - **LMCache**: `integration/lmcache/` (`dfkv_connector`) — see `docs/lmcache/DESIGN.md`,
   `docs/lmcache/IMPLEMENTATION.md`, `docs/lmcache/DEPLOY.md`.
+- **vLLM (direct)**: `integration/vllm/` (`dfkv_vllm`) — a `KVConnectorBase_V1`
+  connector occupying the same `--kv-transfer-config` slot as `MooncakeStoreConnector`,
+  storing/loading KV **directly over GPUDirect RDMA** (no LMCache, no host bounce).
+  Pure-Python ctypes over `libdfkv.so`; uses the scatter-gather batch API to coalesce
+  per-chunk keys. Validated on H100 + IB with DeepSeek-V4 (multi kv_cache_group / MLA +
+  SWA), full cross-restart and cross-DP prefix hit. See `docs/vllm/DEPLOY.md` (config
+  reference + recommended settings) and `integration/vllm/README.md`.
 
 ## Operability & performance features
 - **Connection pooling + keep-alive** (TCP_NODELAY): ~250× lower latency vs dial-per-call.
@@ -127,6 +141,6 @@ docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
 
 ## Status
-TDD; **53 C++ ctest entries + 7 Python tests green**, 0 warnings, **ThreadSanitizer-clean**.
-CI: gcc/clang build+test, TSan, RDMA compile-check, static-artifact build. License: Apache-2.0.
+TDD; **88 C++ ctest entries + Python plugin & connector tests green**, 0 warnings, **ThreadSanitizer-clean**.
+CI: gcc/clang build+test, TSan, RDMA datapath (Soft-RoCE loopback), RDMA compile-check, static-artifact build. License: Apache-2.0.
 See `docs/DEPLOY.md` (rollout) and the round report in the ai_david KB.
