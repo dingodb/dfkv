@@ -477,7 +477,8 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   // contract holds on TCP too. Empty-segment keys are valid (header-only).
   std::vector<char> over(N, 0);
   for (size_t i = 0; i < N; ++i) {
-    if (items[i].ptrs.size() != items[i].sizes.size() ||
+    if (items[i].key.empty() ||  // null/empty key: skip (no header-only blob written)
+        items[i].ptrs.size() != items[i].sizes.size() ||
         items[i].ptrs.size() > kSgMaxPayloadSegs)
       over[i] = 1;
   }
@@ -534,7 +535,8 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
   // request can scatter into is reported a miss up front.
   std::vector<char> over(N, 0);
   for (size_t i = 0; i < N; ++i) {
-    if (items[i].dsts.size() != items[i].caps.size() ||
+    if (items[i].key.empty() ||  // null/empty key: skip (no wasted GET issued)
+        items[i].dsts.size() != items[i].caps.size() ||
         items[i].dsts.size() > kSgMaxPayloadSegs)
       over[i] = 1;
   }
