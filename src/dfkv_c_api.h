@@ -66,6 +66,24 @@ int dfkv_batch_get_auto(dfkv_client_t c, const char** keys, void** ptrs,
                         uint64_t* out_len);
 int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist);
 
+// Scatter-gather batch put: each of the n keys gathers num_bufs[i] non-contiguous
+// source buffers (ptrs[i][0..num_bufs[i]-1], sizes[i][...]) into one stored blob
+// (the in-order concatenation; segment boundaries are client-side only). Coalesces
+// many tiny KV chunks into one key + one RDMA multi-SGE op. out_ok[i]=1 on success.
+// A key with more than 29 buffers (RDMA max_sge-1) is reported out_ok[i]=0 (not
+// corrupted). Return 0 on call success.
+int dfkv_batch_put_sg(dfkv_client_t c, const char** keys, const void*** ptrs,
+                      const uint64_t** sizes, const int* num_bufs, int n,
+                      int* out_ok);
+// Scatter-gather variable-size batch get: each key's stored blob is scattered
+// across num_dsts[i] destination buffers (dsts[i][...], caps[i][...]) in order
+// (segment sizes define the split). Accepts any stored size <= sum(caps[i]).
+// out_hit[i]=1/0; out_len[i] receives the true stored payload byte length (0 on
+// miss). A key with more than 29 buffers is reported a miss. Return 0 on success.
+int dfkv_batch_get_auto_sg(dfkv_client_t c, const char** keys, void*** dsts,
+                           const uint64_t** caps, const int* num_dsts, int n,
+                           int* out_hit, uint64_t* out_len);
+
 // Client-side Prometheus metrics snapshot (ops served, IO errors, peer health
 // transitions, per-peer errors). Writes up to `cap` bytes (NUL-terminated when
 // it fits) into buf and returns the FULL text length (excluding NUL). Pass cap=0

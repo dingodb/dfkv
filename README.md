@@ -115,6 +115,10 @@ docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
   buffer; the client scatters the payload directly into the caller's buffer (e.g.
   a SGLang HiCache registered host page) — no intermediate copies.
 - **Optional pipelining** (`DFKV_RDMA_DEPTH=K`): K requests in flight per connection.
+  A network-latency hider, **not a throughput knob** — GET and PUT are both
+  depth-flat (the per-connection serve loop is in-order; benchmarked GET ~1.24 GB/s at
+  depth 1 == 32). The throughput levers are **multi-connection fan-out**
+  (`batch_concurrency`) and **fewer/larger keys**. See `docs/datapath-perf-notes.md`.
 - **NUMA-aware rail selection** (`DFKV_RDMA_NUMA=1`): pins buffers/serve-threads to
   the rail's NUMA node AND, with a multi-rail `DFKV_RDMA_DEV`, picks a NUMA-local
   rail per connection (falls back to round-robin over all rails when no local rail

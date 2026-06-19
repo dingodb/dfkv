@@ -61,6 +61,16 @@ class RdmaTransport : public Transport {
                                 const std::vector<RangeDst>& dsts,
                                 size_t header_size,
                                 std::vector<std::string>* hdrs) override;
+  // Scatter-gather overrides: one wire SEND/RECV gathers/scatters N payload
+  // segments per key via multi-SGE work requests (additive zero-copy datapath
+  // for dfkv_batch_put_sg / dfkv_batch_get_auto_sg).
+  std::vector<Status> CacheFromMulti(
+      const std::string& node,
+      const std::vector<CacheSrcMulti>& srcs) override;
+  std::vector<Status> RangeIntoMulti(
+      const std::string& node, const std::vector<BlockKey>& keys,
+      const std::vector<RangeDstMulti>& dsts, size_t header_size,
+      std::vector<std::string>* hdrs, std::vector<size_t>* out_lens) override;
 
  private:
   struct Conn;

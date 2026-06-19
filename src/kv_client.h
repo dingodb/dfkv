@@ -30,6 +30,23 @@ namespace dfkv {
 struct KvPutItem { std::string key; const void* value; size_t n; };
 struct KvGetItem { std::string key; void* out; size_t n; };
 
+// Scatter-gather batch items: one dfkv key gathers N non-contiguous source
+// buffers on put / scatters into N destination buffers on get. The stored value
+// is the in-order concatenation of the segments; segment boundaries are purely
+// client-side (the server stores one opaque blob). ptrs.size() == sizes.size();
+// dsts.size() == caps.size(). Used by the additive C ABI dfkv_batch_put_sg /
+// dfkv_batch_get_auto_sg to coalesce many tiny KV chunks into one key/RDMA op.
+struct KvPutItemSg {
+  std::string key;
+  std::vector<const void*> ptrs;
+  std::vector<size_t> sizes;
+};
+struct KvGetItemSg {
+  std::string key;
+  std::vector<void*> dsts;
+  std::vector<size_t> caps;
+};
+
 class KVClient {
  public:
   // members: (node_name, "ip:port"). self_hdr: this engine's geometry identity.
@@ -64,6 +81,19 @@ class KVClient {
   std::vector<bool> BatchGetAuto(const std::vector<KvGetItem>& items,
                                  std::vector<size_t>* out_lens);
   std::vector<bool> BatchExist(const std::vector<std::string>& keys);
+
+  // Scatter-gather batch put: each key gathers its N source segments into one
+  // stored blob (sum of sizes). Mirrors BatchPut (consistent-hash routing per key,
+  // group by node, zero-copy multi-SGE gather on RDMA). Per-item result. A key
+  // with more segments than the RDMA transport can carry in one work request
+  // (max_sge-1) is reported as failed (false) rather than corrupted.
+  std::vector<bool> BatchPutSg(const std::vector<KvPutItemSg>& items);
+  // Scatter-gather variable-size batch get: each key's stored blob is scattered
+  // across its N destination segments in order (the segment sizes define the
+  // split). Mirrors BatchGetAuto: accepts any stored size <= sum(caps); out_lens
+  // (if non-null) receives the true stored payload length per key (0 on miss).
+  std::vector<bool> BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
+                                   std::vector<size_t>* out_lens);
 
   void set_batch_concurrency(size_t n) {
     batch_concurrency_.store(n ? n : 1, std::memory_order_relaxed);

@@ -44,6 +44,11 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]);
 // Fixed-size device-name field the client sends first in the bootstrap so the
 // server opens its QP on the matching device (same rail) for multi-rail setups.
 constexpr size_t kDevNameBytes = 32;
+// Target QP scatter-gather entries. SGE0 is the header (req/resp prefix + value
+// header); the remaining kMaxSge-1 carry payload segments, so a scatter-gather
+// key may hold up to kMaxSge-1 (=29) non-contiguous buffers. Open() clamps this
+// to the device's reported max_sge (ConnectX-* on hd04 reports 30).
+constexpr size_t kMaxSge = 30;
 // Alignment used for server-side O_DIRECT read buffers. NVMe/xfs are happy with
 // 4096, and it is a safe superset for 512-byte logical-sector devices.
 constexpr size_t kDirectIoAlign = 4096;
@@ -109,6 +114,28 @@ class RcEndpoint {
   bool PostSendScatter(size_t slot, size_t hdr_len, const void* payload,
                        size_t payload_len, ibv_mr* payload_mr);
 
+  // Multi-segment scatter/gather (one wire SEND/RECV gathers/scatters N payload
+  // segments, in addition to the header SGE). Used by the additive scatter-gather
+  // API (dfkv_batch_put_sg / dfkv_batch_get_auto_sg) so one dfkv key coalesces N
+  // non-contiguous caller buffers without a client concat copy. Each segment must
+  // belong to its corresponding MR (from RegisterUser / pool MR). num_sge =
+  // 1 + segs.size(), which must be <= the QP's max_send_sge/max_recv_sge.
+  // PostSendScatterMulti: SGE0 = sbuf_[slot][0,hdr_len), then one SGE per segment.
+  bool PostSendScatterMulti(
+      size_t slot, size_t hdr_len,
+      const std::vector<std::pair<const void*, uint32_t>>& segs,
+      const std::vector<ibv_mr*>& mrs);
+  // PostRecvScatterMulti: SGE0 = rbuf_[slot][0,hdr_bytes), then one SGE per
+  // destination segment (the NIC scatters the concatenated reply payload across
+  // the segments in order, honoring each segment's length).
+  bool PostRecvScatterMulti(
+      size_t slot, const std::vector<std::pair<void*, uint32_t>>& segs,
+      const std::vector<ibv_mr*>& mrs, size_t hdr_bytes);
+
+  // QP scatter-gather capability negotiated in Open() = min(kMaxSge, device cap).
+  // The SG datapath caps payload segments at max_sge()-1 (SGE0 is the header).
+  size_t max_sge() const { return max_sge_; }
+
   // Block until at least one completion, drain up to `max` into out[]; returns
   // the count (>0), or <0 on error / when Wake() is called. wr_id of each wc =
   // the slot. Used for single round-trips (max=1) and pipelined batches.
@@ -136,6 +163,7 @@ class RcEndpoint {
   unsigned cq_armed_unacked_ = 0;
 
   size_t cap_ = 0, depth_ = 0, dbuf_cap_ = 0;
+  size_t max_sge_ = 2;  // QP max_send_sge/max_recv_sge = min(kMaxSge, device cap)
   std::vector<char*> sbuf_, rbuf_, dbuf_;
   std::vector<ibv_mr*> smr_, rmr_, dmr_;
   // Big pre-registered caller regions (the host KV pool). Registered once at

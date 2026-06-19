@@ -154,6 +154,62 @@ int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist) 
   return 0;
 }
 
+// Scatter-gather batch entrypoints. Same null-tolerance convention as the other
+// batch APIs: a null keys[i] yields an empty item reported as failed/miss. The
+// nested arrays (ptrs[i] / sizes[i] of length num_bufs[i]) are unpacked into the
+// KvPutItemSg/KvGetItemSg vectors. num_bufs[i] < 0 is treated as 0 (empty value).
+int dfkv_batch_put_sg(dfkv_client_t c, const char** keys, const void*** ptrs,
+                      const uint64_t** sizes, const int* num_bufs, int n,
+                      int* out_ok) {
+  if (!c || n < 0) return -1;
+  if (n > 0 && (!keys || !ptrs || !sizes || !num_bufs || !out_ok)) return -1;
+  std::vector<dfkv::KvPutItemSg> items(n);
+  for (int i = 0; i < n; ++i) {
+    const char* k = keys[i];
+    if (!k) { items[i] = {}; continue; }
+    items[i].key = std::string(k);
+    int nb = num_bufs[i] > 0 ? num_bufs[i] : 0;
+    items[i].ptrs.reserve(nb);
+    items[i].sizes.reserve(nb);
+    for (int j = 0; j < nb; ++j) {
+      items[i].ptrs.push_back(ptrs[i] ? ptrs[i][j] : nullptr);
+      items[i].sizes.push_back(sizes[i] ? static_cast<size_t>(sizes[i][j]) : 0);
+    }
+  }
+  auto r = static_cast<KVClient*>(c)->BatchPutSg(items);
+  for (int i = 0; i < n; ++i) out_ok[i] = (keys[i] && r[i]) ? 1 : 0;
+  return 0;
+}
+
+int dfkv_batch_get_auto_sg(dfkv_client_t c, const char** keys, void*** dsts,
+                           const uint64_t** caps, const int* num_dsts, int n,
+                           int* out_hit, uint64_t* out_len) {
+  if (!c || n < 0) return -1;
+  if (n > 0 && (!keys || !dsts || !caps || !num_dsts || !out_hit || !out_len))
+    return -1;
+  std::vector<dfkv::KvGetItemSg> items(n);
+  for (int i = 0; i < n; ++i) {
+    const char* k = keys[i];
+    if (!k) { items[i] = {}; continue; }
+    items[i].key = std::string(k);
+    int nd = num_dsts[i] > 0 ? num_dsts[i] : 0;
+    items[i].dsts.reserve(nd);
+    items[i].caps.reserve(nd);
+    for (int j = 0; j < nd; ++j) {
+      items[i].dsts.push_back(dsts[i] ? dsts[i][j] : nullptr);
+      items[i].caps.push_back(caps[i] ? static_cast<size_t>(caps[i][j]) : 0);
+    }
+  }
+  std::vector<size_t> lens;
+  auto r = static_cast<KVClient*>(c)->BatchGetAutoSg(items, &lens);
+  for (int i = 0; i < n; ++i) {
+    bool hit = keys[i] && r[i];
+    out_hit[i] = hit ? 1 : 0;
+    out_len[i] = hit ? static_cast<uint64_t>(lens[i]) : 0;
+  }
+  return 0;
+}
+
 int dfkv_set_members(dfkv_client_t c, const char* members) {
   if (!c) return -1;
   static_cast<KVClient*>(c)->SetMembers(ParseMembers(members));

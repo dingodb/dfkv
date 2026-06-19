@@ -16,6 +16,12 @@
 namespace dfkv {
 
 namespace {
+// Max payload segments per scatter-gather key. The RDMA QP carries max_sge SGEs
+// per work request; SGE0 is the header, leaving max_sge-1 payload SGEs. The
+// device cap on hd04 ConnectX is 30 -> 29 payload segments. The connector
+// guarantees <=29; a key over this is reported failed instead of corrupted.
+constexpr size_t kSgMaxPayloadSegs = 29;
+
 // Run fn(i) for i in [0,n) across up to `workers` threads (atomic work-steal).
 void RunParallel(size_t n, size_t workers, const std::function<void(size_t)>& fn) {
   if (n == 0) return;
@@ -449,6 +455,129 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
     for (size_t m = 0; m < idx.size(); ++m) e[idx[m]] = (m < ex.size() && ex[m]) ? 1 : 0;
   });
   return std::vector<bool>(e.begin(), e.end());
+}
+
+std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
+  const size_t N = items.size();
+  std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
+
+  // Guard: a key with more payload segments than one RDMA work request can carry
+  // (max_sge-1) is reported failed up front and excluded from the wire (so it
+  // never corrupts a shared connection). Done transport-independently so the
+  // contract holds on TCP too. Empty-segment keys are valid (header-only).
+  std::vector<char> over(N, 0);
+  for (size_t i = 0; i < N; ++i) {
+    if (items[i].ptrs.size() != items[i].sizes.size() ||
+        items[i].ptrs.size() > kSgMaxPayloadSegs)
+      over[i] = 1;
+  }
+
+  // Header per item (stamps total payload_len = sum of segment sizes). hdrs must
+  // outlive the RunParallel lambdas that reference it.
+  std::vector<std::array<char, ValueHeader::kSize>> hdrs(N);
+  std::map<std::string, std::vector<size_t>> by_node;
+  for (size_t i = 0; i < N; ++i) {
+    if (over[i]) continue;
+    std::string node = Route(items[i].key);
+    if (node.empty()) continue;
+    size_t total = 0;
+    for (size_t s : items[i].sizes) total += s;
+    ValueHeader h = self_hdr_;
+    h.payload_len = total;
+    h.Serialize(hdrs[i].data());
+    by_node[node].push_back(i);
+  }
+  std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
+  RunParallel(groups.size(), batch_concurrency_.load(std::memory_order_relaxed), [&](size_t g) {
+    const std::string& node = groups[g].first;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) return;
+    const std::vector<size_t>& idx = groups[g].second;
+    std::vector<CacheSrcMulti> srcs;
+    srcs.reserve(idx.size());
+    for (size_t k : idx) {
+      CacheSrcMulti s;
+      s.key = ToBlockKey(items[k].key);
+      s.header = hdrs[k].data();
+      s.header_len = ValueHeader::kSize;
+      s.payloads.reserve(items[k].ptrs.size());
+      for (size_t j = 0; j < items[k].ptrs.size(); ++j)
+        s.payloads.emplace_back(items[k].ptrs[j], items[k].sizes[j]);
+      srcs.push_back(std::move(s));
+    }
+    std::vector<Status> sts = t_->CacheFromMulti(node, srcs);
+    for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
+    bool resp = false, ioerr = false;
+    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+  });
+  return std::vector<bool>(ok.begin(), ok.end());
+}
+
+std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
+                                           std::vector<size_t>* out_lens) {
+  const size_t N = items.size();
+  std::vector<char> hit(N, 0);
+  std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
+
+  // Guard (same as put): a key with more destination segments than one RDMA work
+  // request can scatter into is reported a miss up front.
+  std::vector<char> over(N, 0);
+  for (size_t i = 0; i < N; ++i) {
+    if (items[i].dsts.size() != items[i].caps.size() ||
+        items[i].dsts.size() > kSgMaxPayloadSegs)
+      over[i] = 1;
+  }
+
+  // Group by (node, total_cap): a group shares the Range length (= sum of caps)
+  // so the existing RangeInto windowing/pipelining applies unchanged.
+  std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
+  for (size_t i = 0; i < N; ++i) {
+    if (over[i]) continue;
+    std::string node = Route(items[i].key);
+    if (node.empty()) continue;
+    size_t cap = 0;
+    for (size_t c : items[i].caps) cap += c;
+    by[{node, cap}].push_back(i);
+  }
+  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups(by.begin(), by.end());
+  RunParallel(groups.size(), batch_concurrency_.load(std::memory_order_relaxed), [&](size_t g) {
+    const std::string& node = groups[g].first.first;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) return;
+    const std::vector<size_t>& idx = groups[g].second;
+    std::vector<BlockKey> keys;
+    std::vector<RangeDstMulti> dsts;
+    keys.reserve(idx.size());
+    dsts.reserve(idx.size());
+    for (size_t k : idx) {
+      keys.push_back(ToBlockKey(items[k].key));
+      RangeDstMulti d;
+      d.payloads.reserve(items[k].dsts.size());
+      for (size_t j = 0; j < items[k].dsts.size(); ++j)
+        d.payloads.emplace_back(items[k].dsts[j], items[k].caps[j]);
+      dsts.push_back(std::move(d));
+    }
+    std::vector<std::string> hdrs;
+    std::vector<size_t> tlens;
+    std::vector<Status> sts =
+        t_->RangeIntoMulti(node, keys, dsts, ValueHeader::kSize, &hdrs, &tlens);
+    bool resp = false, ioerr = false;
+    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    for (size_t m = 0; m < idx.size(); ++m) {
+      size_t cap = groups[g].first.second;
+      if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
+      ValueHeader h;
+      if (!ValueHeader::Parse(hdrs[m].data(), hdrs[m].size(), &h)) continue;
+      if (!HeaderMatches(self_hdr_, h)) continue;
+      if (h.payload_len > cap) continue;  // doesn't fit caller buffers => miss
+      lens[idx[m]] = h.payload_len;       // authoritative length from header
+      hit[idx[m]] = 1;
+    }
+  });
+  if (out_lens) *out_lens = std::move(lens);
+  return std::vector<bool>(hit.begin(), hit.end());
 }
 
 }  // namespace dfkv

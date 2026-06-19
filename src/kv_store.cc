@@ -451,6 +451,49 @@ Status KVStore::RangeDirect(const BlockKey& key, uint64_t offset, uint64_t lengt
   return Status::kOk;
 }
 
+Status KVStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
+                                uint64_t length, size_t io_cap,
+                                RangePrep* out) {
+  *out = RangePrep{};
+  int raw_fd = -1;  // released to the caller on kOk; closed here on every error
+  uint64_t fsize = 0;
+  {  // index lookup + open under a SHARED lock; bulk read happens in the caller
+    const std::string fname = key.Filename();
+    Shard& sh = ShardFor(fname);
+    std::shared_lock<std::shared_mutex> rl(sh.mu);
+    auto it = sh.index.find(fname);
+    if (it == sh.index.end()) return Status::kNotFound;
+    raw_fd = ::open(it->second.path.c_str(), O_RDONLY | O_DIRECT);
+    if (raw_fd < 0) return Status::kIOError;
+    fsize = it->second.size;
+    it->second.referenced.store(true, std::memory_order_relaxed);  // CLOCK touch
+  }
+  // From here a failure must close raw_fd (the caller only owns it on kOk).
+  auto fail = [&](Status s) { ::close(raw_fd); return s; };
+  if (offset > fsize) return fail(Status::kInvalid);
+  uint64_t n = length;
+  if (n > fsize - offset) n = fsize - offset;
+  if (n == 0) {  // valid zero-length hit: nothing to read, no fd to keep
+    ::close(raw_fd);
+    out->fd = -1;
+    out->payload_len = 0;
+    return Status::kOk;
+  }
+  // Mirror PreadRangeDirectTo's aligned-superset math so the caller's read covers
+  // exactly the bytes the synchronous path would have read.
+  const uint64_t astart = AlignDown(offset);
+  uint64_t aend = 0;
+  if (!AlignUp(offset + n, &aend)) return fail(Status::kIOError);
+  const size_t alen = static_cast<size_t>(aend - astart);
+  if (alen > io_cap) return fail(Status::kIOError);
+  out->fd = raw_fd;  // ownership transferred to caller
+  out->aligned_off = astart;
+  out->aligned_len = alen;
+  out->head = static_cast<size_t>(offset - astart);
+  out->payload_len = static_cast<size_t>(n);
+  return Status::kOk;
+}
+
 bool KVStore::IsCached(const BlockKey& key) const {
   const std::string fname = key.Filename();
   Shard& sh = ShardFor(fname);

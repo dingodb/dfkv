@@ -65,6 +65,26 @@ class KVStore {
   Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                      char* io_buf, size_t io_cap, const char** out_data,
                      size_t* out_len);
+
+  // Async-friendly split of RangeDirect. Does ONLY the cheap, lock-protected
+  // prep: index lookup, O_DIRECT open, range clamp, and O_DIRECT alignment math.
+  // It performs NO disk read — the caller issues the (slow) pread itself (e.g.
+  // via io_uring) and then trims the slice. On kOk the caller MUST ::close(out->fd)
+  // after the read completes (the fd pins the inode against eviction meanwhile).
+  // Output (kOk only): {fd, aligned_off, aligned_len, head, payload_len}.
+  //   read aligned_len bytes at aligned_off into io_buf, then the requested bytes
+  //   are at io_buf+head for payload_len bytes. payload_len==0 is a valid zero-len
+  //   hit (fd<0, nothing to read). io_cap must be >= aligned_len.
+  struct RangePrep {
+    int fd = -1;              // owned by caller on kOk (caller closes); -1 if no read
+    uint64_t aligned_off = 0; // O_DIRECT-aligned read start
+    size_t aligned_len = 0;   // O_DIRECT-aligned read length (multiple of 4096)
+    size_t head = 0;          // offset of requested bytes within the aligned read
+    size_t payload_len = 0;   // exact requested bytes (after clamp to file size)
+  };
+  Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
+                         size_t io_cap, RangePrep* out);
+
   bool IsCached(const BlockKey& key) const;
 
   uint64_t UsedBytes() const;

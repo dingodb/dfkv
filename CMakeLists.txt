@@ -13,8 +13,22 @@ add_compile_options(-Wall -Wextra)
 option(DFKV_BUILD_TESTS "Build dfkv tests" ON)
 option(DFKV_STATIC_LIBSTDCXX "Statically link libstdc++/libgcc for portable artifacts" OFF)
 option(DFKV_WITH_RDMA "Build the RDMA transport (needs libibverbs)" OFF)
+# Additive, env-gated io_uring async-GET disk-read path in the RDMA server. When
+# ON, links liburing and compiles the DFKV_WITH_URING code; the path is still
+# inert unless the server is started with DFKV_SERVER_URING=1. When OFF (default)
+# the io_uring code is #ifdef'd out and the env flag is a no-op. Requires RDMA.
+option(DFKV_WITH_URING "Build the io_uring async GET path in the RDMA server (needs liburing)" OFF)
 if(DFKV_STATIC_LIBSTDCXX)
   add_link_options(-static-libstdc++ -static-libgcc)
+endif()
+if(DFKV_WITH_URING AND NOT DFKV_WITH_RDMA)
+  message(FATAL_ERROR "DFKV_WITH_URING requires DFKV_WITH_RDMA=ON (the io_uring path lives in the RDMA server)")
+endif()
+if(DFKV_WITH_URING)
+  find_library(URING_LIB uring)
+  if(NOT URING_LIB)
+    message(FATAL_ERROR "DFKV_WITH_URING=ON but liburing not found (install liburing-dev)")
+  endif()
 endif()
 
 # --- portable core library (everything in src/ except *_main.cc + gated rdma) ---
@@ -46,6 +60,10 @@ if(DFKV_WITH_RDMA)
   target_compile_definitions(dfkv_core PUBLIC DFKV_WITH_RDMA)
   target_link_libraries(dfkv_core PUBLIC ibverbs)
 endif()
+if(DFKV_WITH_URING)
+  target_compile_definitions(dfkv_core PUBLIC DFKV_WITH_URING)
+  target_link_libraries(dfkv_core PUBLIC ${URING_LIB})
+endif()
 
 # C ABI shared lib for the Python (ctypes) plugin
 add_library(dfkv SHARED ${DFKV_SRCS})
@@ -56,6 +74,10 @@ target_link_libraries(dfkv PUBLIC Threads::Threads)
 if(DFKV_WITH_RDMA)
   target_compile_definitions(dfkv PUBLIC DFKV_WITH_RDMA)
   target_link_libraries(dfkv PUBLIC ibverbs)
+endif()
+if(DFKV_WITH_URING)
+  target_compile_definitions(dfkv PUBLIC DFKV_WITH_URING)
+  target_link_libraries(dfkv PUBLIC ${URING_LIB})
 endif()
 
 # standalone cache-node daemon + CLI tools

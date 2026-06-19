@@ -36,6 +36,9 @@ class DiskCacheGroup {
   Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                      char* io_buf, size_t io_cap, const char** out_data,
                      size_t* out_len);
+  // Cheap prep half of RangeDirect (no disk read); see KVStore::RangeDirectPrep.
+  Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
+                         size_t io_cap, KVStore::RangePrep* out);
   bool IsCached(const BlockKey& key) const;
 
   uint64_t UsedBytes() const;   // summed across disks

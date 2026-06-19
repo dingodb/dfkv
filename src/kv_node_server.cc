@@ -327,6 +327,30 @@ Status KvNodeServer::RangeDirect(uint64_t id, uint32_t index, uint32_t ksize,
   return st;
 }
 
+Status KvNodeServer::RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize,
+                                     uint64_t offset, uint64_t length,
+                                     size_t io_cap, KVStore::RangePrep* out) {
+  BlockKey key{id, index, ksize};
+  Status st = group_.RangeDirectPrep(key, offset, length, io_cap, out);
+  // Only miss/io-error are final here; a kOk prep is accounted on read completion
+  // (RangeDirectComplete) because the async read can still fail.
+  if (st == Status::kNotFound) {
+    cache_miss_.fetch_add(1, std::memory_order_relaxed);
+  } else if (st == Status::kIOError) {
+    get_io_err_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return st;
+}
+
+void KvNodeServer::RangeDirectComplete(bool ok, size_t bytes_read) {
+  if (ok) {
+    cache_hit_.fetch_add(1, std::memory_order_relaxed);
+    bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
+  } else {
+    get_io_err_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 // Keep-alive: serve requests on this connection until the peer closes it.
 void KvNodeServer::Handle(int fd) {
   while (running_) {

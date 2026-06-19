@@ -42,6 +42,49 @@ TEST(CApiGuard, RejectsNullArraysWithPositiveN) {
   dfkv_close(c);
 }
 
+// Scatter-gather C ABI: same guard contract as the contiguous batch entrypoints
+// (null handle => -1; null arrays with n>0 => -1; n==0 => 0). A discovery-only
+// client (empty ring) makes every real route miss, so no server is needed.
+TEST(CApiGuard, ScatterGatherNullAndZero) {
+  EXPECT_EQ(dfkv_batch_put_sg(nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr), -1);
+  EXPECT_EQ(dfkv_batch_get_auto_sg(nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr), -1);
+
+  dfkv_client_t c = OpenEmpty();
+  ASSERT_NE(c, nullptr);
+  int ok[2] = {9, 9};
+  uint64_t len[2] = {9, 9};
+  // null nested arrays with n>0 => rejected.
+  EXPECT_EQ(dfkv_batch_put_sg(c, nullptr, nullptr, nullptr, nullptr, 2, ok), -1);
+  EXPECT_EQ(dfkv_batch_get_auto_sg(c, nullptr, nullptr, nullptr, nullptr, 2, ok, len), -1);
+  // zero-length batch is a valid no-op.
+  EXPECT_EQ(dfkv_batch_put_sg(c, nullptr, nullptr, nullptr, nullptr, 0, nullptr), 0);
+  EXPECT_EQ(dfkv_batch_get_auto_sg(c, nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr), 0);
+
+  // Well-formed call against an empty ring: every key routes nowhere => fail/miss,
+  // but the FFI unpacking must not crash on a null keys[i] element.
+  const char* keys[2] = {"k0", nullptr};
+  const char b0a[8] = {0}, b0b[8] = {0};
+  const void* p0[2] = {b0a, b0b};
+  const void** ptrs[2] = {p0, nullptr};
+  uint64_t s0[2] = {8, 8};
+  const uint64_t* sizes[2] = {s0, nullptr};
+  int num_bufs[2] = {2, 0};
+  EXPECT_EQ(dfkv_batch_put_sg(c, keys, ptrs, sizes, num_bufs, 2, ok), 0);
+  EXPECT_EQ(ok[0], 0);  // empty ring => route miss => failure (not a crash)
+  EXPECT_EQ(ok[1], 0);  // null key => skipped, reported failed
+
+  char d0a[8], d0b[8];
+  void* dp0[2] = {d0a, d0b};
+  void** dsts[2] = {dp0, nullptr};
+  uint64_t c0[2] = {8, 8};
+  const uint64_t* caps[2] = {c0, nullptr};
+  int num_dsts[2] = {2, 0};
+  EXPECT_EQ(dfkv_batch_get_auto_sg(c, keys, dsts, caps, num_dsts, 2, ok, len), 0);
+  EXPECT_EQ(ok[0], 0); EXPECT_EQ(len[0], 0u);
+  EXPECT_EQ(ok[1], 0); EXPECT_EQ(len[1], 0u);
+  dfkv_close(c);
+}
+
 TEST(CApiStats, SnapshotSizingAndContent) {
   dfkv_client_t c = OpenEmpty();
   ASSERT_NE(c, nullptr);

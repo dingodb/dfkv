@@ -106,6 +106,27 @@ int main(int argc, char** argv) {
                size_t cap) {
           return srv.CacheDirect(id, idx, ks, data, len, cap);
         });
+    // Async-GET hooks (used only when built -DDFKV_WITH_URING and started with
+    // DFKV_SERVER_URING=1; otherwise the serve loop ignores these and uses the
+    // synchronous range_handler above verbatim).
+    rsrv->set_range_prep_handler(
+        [&srv](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
+               size_t cap, dfkv::RdmaServer::RangePrepResult* out) {
+          dfkv::KVStore::RangePrep p;
+          Status st = srv.RangeDirectPrep(id, idx, ks, off, len, cap, &p);
+          if (st == Status::kOk) {
+            out->fd = p.fd;
+            out->aligned_off = p.aligned_off;
+            out->aligned_len = p.aligned_len;
+            out->head = p.head;
+            out->payload_len = p.payload_len;
+          }
+          return st;
+        });
+    rsrv->set_range_complete_handler(
+        [&srv](bool ok, size_t bytes_read) {
+          srv.RangeDirectComplete(ok, bytes_read);
+        });
     if (rsrv->Start(rdma_port) == Status::kOk)
       DFKV_LOG_INFO("dfkv_server RDMA listening (TCP bootstrap) on port " +
                     std::to_string(rsrv->port()) +

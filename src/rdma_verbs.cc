@@ -146,11 +146,27 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
   if (!cq_) { Close(); return false; }
   if (ibv_req_notify_cq(cq_, 0) != 0) { Close(); return false; }
 
+  // Negotiate scatter-gather width: min(kMaxSge, device cap). SGE0 is always the
+  // header; the rest carry payload segments for the scatter-gather datapath. The
+  // legacy [hdr | payload] path only ever uses 2, so raising the cap is additive.
+  max_sge_ = 2;
+  {
+    ibv_device_attr dev_attr{};
+    if (ibv_query_device(ctx_, &dev_attr) == 0 && dev_attr.max_sge > 0) {
+      size_t cap_sge = static_cast<size_t>(dev_attr.max_sge);
+      max_sge_ = std::min(kMaxSge, cap_sge);
+      if (max_sge_ < 2) max_sge_ = 2;
+    } else {
+      max_sge_ = kMaxSge;  // query failed: trust the documented device cap
+    }
+  }
+
   ibv_qp_init_attr qa{};
   qa.send_cq = cq_; qa.recv_cq = cq_;
   qa.cap.max_send_wr = static_cast<uint32_t>(depth_ + 1);
   qa.cap.max_recv_wr = static_cast<uint32_t>(depth_ + 1);
-  qa.cap.max_send_sge = 2; qa.cap.max_recv_sge = 2;  // both may scatter [hdr | payload]
+  qa.cap.max_send_sge = static_cast<uint32_t>(max_sge_);  // SGE0=hdr, rest=payload segs
+  qa.cap.max_recv_sge = static_cast<uint32_t>(max_sge_);
   qa.qp_type = IBV_QPT_RC;
   qa.sq_sig_all = 1;
   qp_ = ibv_create_qp(pd_, &qa);
@@ -374,6 +390,55 @@ bool RcEndpoint::PostRecvScatter(size_t slot, void* payload, size_t payload_len,
   sge[1].lkey = payload_mr->lkey;
   ibv_recv_wr wr{}, *bad = nullptr;
   wr.wr_id = slot; wr.sg_list = sge; wr.num_sge = 2;
+  return ibv_post_recv(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostSendScatterMulti(
+    size_t slot, size_t hdr_len,
+    const std::vector<std::pair<const void*, uint32_t>>& segs,
+    const std::vector<ibv_mr*>& mrs) {
+  // SGE0 = header from sbuf_[slot]; SGE[1..] = one payload segment each. Bail if
+  // the segment count would exceed the QP's negotiated max_send_sge.
+  if (segs.size() != mrs.size()) return false;
+  if (1 + segs.size() > max_sge_) return false;
+  std::vector<ibv_sge> sge(1 + segs.size());
+  sge[0].addr = reinterpret_cast<uintptr_t>(sbuf_[slot]);
+  sge[0].length = static_cast<uint32_t>(hdr_len);
+  sge[0].lkey = smr_[slot]->lkey;
+  for (size_t i = 0; i < segs.size(); ++i) {
+    if (segs[i].second && !mrs[i]) return false;  // non-empty seg needs an MR
+    sge[1 + i].addr = reinterpret_cast<uintptr_t>(segs[i].first);
+    sge[1 + i].length = segs[i].second;
+    sge[1 + i].lkey = segs[i].second ? mrs[i]->lkey : 0;
+  }
+  ibv_send_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot; wr.sg_list = sge.data();
+  wr.num_sge = static_cast<int>(sge.size());
+  wr.opcode = IBV_WR_SEND; wr.send_flags = IBV_SEND_SIGNALED;
+  return ibv_post_send(qp_, &wr, &bad) == 0;
+}
+
+bool RcEndpoint::PostRecvScatterMulti(
+    size_t slot, const std::vector<std::pair<void*, uint32_t>>& segs,
+    const std::vector<ibv_mr*>& mrs, size_t hdr_bytes) {
+  // SGE0 = header into rbuf_[slot]; SGE[1..] = one destination segment each. The
+  // NIC fills SGEs in order, so the concatenated reply payload scatters across the
+  // segments honoring each segment's length (no client-side split copy).
+  if (segs.size() != mrs.size()) return false;
+  if (1 + segs.size() > max_sge_) return false;
+  std::vector<ibv_sge> sge(1 + segs.size());
+  sge[0].addr = reinterpret_cast<uintptr_t>(rbuf_[slot]);
+  sge[0].length = static_cast<uint32_t>(hdr_bytes);
+  sge[0].lkey = rmr_[slot]->lkey;
+  for (size_t i = 0; i < segs.size(); ++i) {
+    if (segs[i].second && !mrs[i]) return false;
+    sge[1 + i].addr = reinterpret_cast<uintptr_t>(segs[i].first);
+    sge[1 + i].length = segs[i].second;
+    sge[1 + i].lkey = segs[i].second ? mrs[i]->lkey : 0;
+  }
+  ibv_recv_wr wr{}, *bad = nullptr;
+  wr.wr_id = slot; wr.sg_list = sge.data();
+  wr.num_sge = static_cast<int>(sge.size());
   return ibv_post_recv(qp_, &wr, &bad) == 0;
 }
 

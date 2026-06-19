@@ -19,6 +19,7 @@
 #include "numa_util.h"    // pin serve thread to the device's NUMA node
 #include "rdma_verbs.h"   // RcEndpoint, QpInfo
 #include "transport.h"    // kReqPrefix, kRespPrefix
+#include "uring_reader.h" // io_uring async-GET path (DFKV_WITH_URING only)
 #include "value_header.h"
 
 namespace dfkv {
@@ -181,7 +182,32 @@ int ServerIdleMs() {
   return 600000;  // 10 minutes
 }
 
+#ifdef DFKV_WITH_URING
+// io_uring async-GET ring depth. Defaults to the pipeline depth K so each in-
+// flight request can have one read outstanding; can be raised independently to
+// expose more disk queue depth without growing the RDMA pipeline. Clamped to
+// [1, 256] and to >= K by the caller.
+size_t UringDepth(size_t k) {
+  const char* e = std::getenv("DFKV_SERVER_URING_DEPTH");
+  if (e && *e) {
+    long v = std::strtol(e, nullptr, 10);
+    if (v >= 1 && v <= 256) return static_cast<size_t>(v);
+  }
+  return k;  // one outstanding read per in-flight request by default
+}
+#endif  // DFKV_WITH_URING
+
 }  // namespace
+
+bool RdmaServer::UseUringPath() const {
+#ifdef DFKV_WITH_URING
+  if (!range_prep_handler_ || !range_complete_handler_) return false;
+  const char* e = std::getenv("DFKV_SERVER_URING");
+  return e && *e && std::strcmp(e, "0") != 0;
+#else
+  return false;
+#endif
+}
 
 void RdmaServer::Serve(int boot_fd) {
   // Bootstrap: client first names the device it wants us to use (same rail for
@@ -354,6 +380,190 @@ void RdmaServer::Serve(int boot_fd) {
   bool fail = false;
   const int idle_ms = ServerIdleMs();
   active_conns_.fetch_add(1, std::memory_order_relaxed);
+
+#ifdef DFKV_WITH_URING
+  // -------------------------------------------------------------------------
+  // io_uring async-GET serve loop (env-gated; correctness-preserving).
+  //
+  // Batch-and-wait model (Mooncake's uring_file batch_read adapted to dfkv's
+  // per-WaitComp completion batch). For each completion batch returned by
+  // WaitComp: handle SEND completions and non-kRange RECVs inline exactly as the
+  // sync loop; for the kRange GET RECVs, do the cheap prep (open O_DIRECT fd +
+  // index lookup + alignment) into an ordered descriptor list, submit ALL their
+  // reads to io_uring at once (QD>1 in flight => saturates the SSD), WAIT for the
+  // whole batch, then PostSendScatter each reply IN ARRIVAL ORDER. Because every
+  // read is complete before any reply is sent, in-order replies are preserved
+  // trivially — no reorder buffer, no out-of-order completion handling. Anything
+  // that can't go async (miss, zero-len, oversize, prep error) falls back to the
+  // synchronous build_reply for THAT request, still emitted in arrival order.
+  if (UseUringPath()) {
+    const size_t uring_depth = std::max(UringDepth(K), K);
+    UringReader ring(static_cast<unsigned>(uring_depth));
+    if (!ring.ok()) {
+      // Ring init failed: fall through to the sync loop below (correctness-first).
+      goto sync_serve_loop;
+    }
+    {
+      // One queued reply for this completion batch, kept in strict arrival order.
+      // The client correlates replies to requests purely by SEND order on the
+      // wire (RC in-order delivery; recv slot j <-> j-th reply), so EVERY reply —
+      // sync-built or read-completed — MUST be SENT in arrival order. We therefore
+      // queue all replies first, run the io_uring read batch, then emit the whole
+      // queue in order. `read_idx>=0` means this entry's payload comes from
+      // descs[read_idx] (a deferred kRange hit); otherwise it is a fully-built
+      // synchronous Reply.
+      struct Queued {
+        size_t send_slot = 0;
+        size_t recv_slot = 0;
+        int read_idx = -1;   // >=0: index into descs (async read); -1: sync reply
+        int fd = -1;         // owned (async only); closed after the batch read
+        size_t head = 0;
+        size_t payload_len = 0;
+        Reply reply;         // used when read_idx < 0
+      };
+      std::vector<UringReader::ReadDesc> descs;
+      std::vector<Queued> queue;
+      descs.reserve(K);
+      queue.reserve(K);
+
+      while (running_ && !fail) {
+        int g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
+        if (g == 0) { idle_reclaims_.fetch_add(1, std::memory_order_relaxed); break; }
+        if (g < 0) break;  // error / Stop()'s Wake()
+        descs.clear();
+        queue.clear();
+        for (int w = 0; w < g && !fail; ++w) {
+          const ibv_wc& wc = wcs[w];
+          if (wc.status != IBV_WC_SUCCESS) {
+            completion_errors_.fetch_add(1, std::memory_order_relaxed);
+            fail = true; break;
+          }
+          if (wc.opcode == IBV_WC_SEND) {
+            size_t sid = static_cast<size_t>(wc.wr_id);
+            if (sid < rearm_on_send.size() && rearm_on_send[sid] != kNoSlot) {
+              if (!post_request_recv(rearm_on_send[sid])) { fail = true; break; }
+              rearm_on_send[sid] = kNoSlot;
+            }
+            free_send.push_back(sid);
+            continue;
+          }
+          if (wc.opcode != IBV_WC_RECV || wc.byte_len < kReqPrefix) { fail = true; break; }
+          completions_.fetch_add(1, std::memory_order_relaxed);  // a request RECV
+          size_t r = static_cast<size_t>(wc.wr_id);
+          ReqFields rq;
+          if (!DecodeReq(ep.rbuf(r), &rq)) { fail = true; break; }
+          if (free_send.empty()) { fail = true; break; }
+          size_t s = free_send.back(); free_send.pop_back();
+
+          Queued qd;
+          qd.send_slot = s;
+          qd.recv_slot = r;
+
+          // Defer a kRange GET hit's disk read to the io_uring batch below; reply
+          // after the whole batch completes (the emit pass preserves arrival order).
+          bool deferred = false;
+          if (rq.op == static_cast<uint8_t>(WireOp::kRange) &&
+              ep.dbuf(r) && ep.dmr(r) &&
+              rq.length <= static_cast<uint64_t>(ValueHeader::kSize + max_msg_)) {
+            RangePrepResult pr;
+            Status pst = range_prep_handler_(rq.id, rq.index, rq.size, rq.offset,
+                                             rq.length, ep.dbuf_cap(), &pr);
+            if (pst == Status::kOk && pr.fd >= 0 && pr.payload_len != 0 &&
+                pr.aligned_len <= ep.dbuf_cap() &&
+                pr.aligned_len <= std::numeric_limits<unsigned>::max()) {
+              UringReader::ReadDesc d;
+              d.fd = pr.fd;
+              d.buf = ep.dbuf(r);
+              d.len = static_cast<unsigned>(pr.aligned_len);
+              d.off = pr.aligned_off;
+              qd.read_idx = static_cast<int>(descs.size());
+              descs.push_back(d);
+              qd.fd = pr.fd;
+              qd.head = pr.head;
+              qd.payload_len = pr.payload_len;
+              deferred = true;
+            } else if (pst == Status::kOk && pr.fd >= 0) {
+              ::close(pr.fd);  // zero-len / oversize: handled by sync build below
+            }
+          }
+
+          if (!deferred) {
+            // Synchronous build for this request (non-range, or range miss / zero /
+            // oversize / prep miss). Consumes rbuf/dbuf[r]. Queued, not sent yet.
+            if (!build_reply(s, r, rq, wc.byte_len, &qd.reply)) { fail = true; break; }
+          }
+          queue.push_back(qd);
+        }
+        if (fail) break;
+
+        // Submit + wait for ALL deferred reads in this batch (QD>1 concurrency).
+        // If the batch infrastructure fails, fall back to a synchronous pread per
+        // deferred request in the emit pass below (correctness-first).
+        bool batch_ok = true;
+        if (!descs.empty())
+          batch_ok = ring.BatchRead(descs.data(), static_cast<int>(descs.size()));
+
+        // Emit every reply in STRICT arrival order (every read is now complete,
+        // so an async reply never trails a later request's reply).
+        for (size_t i = 0; i < queue.size() && !fail; ++i) {
+          Queued& qd = queue[i];
+          if (qd.read_idx < 0) {
+            // Sync-built reply: rearm recv (or defer to SEND), then SEND in order.
+            Reply& reply = qd.reply;
+            if (reply.defer_recv_rearm) {
+              rearm_on_send[qd.send_slot] = reply.recv_slot;
+            } else if (!post_request_recv(qd.recv_slot)) {
+              fail = true; break;
+            }
+            bool sent = reply.scatter
+                            ? ep.PostSendScatter(qd.send_slot, reply.first_len,
+                                                 reply.payload, reply.payload_len,
+                                                 reply.payload_mr)
+                            : ep.PostSend(qd.send_slot, reply.first_len);
+            if (!sent) { fail = true; break; }
+            continue;
+          }
+          // Deferred async read: validate result (or sync fallback), then SEND.
+          UringReader::ReadDesc& d = descs[qd.read_idx];
+          bool ok;
+          if (batch_ok) {
+            long res = d.result;
+            ok = res >= 0 && static_cast<size_t>(res) >= qd.head + qd.payload_len;
+          } else {
+            ssize_t got = ::pread(qd.fd, d.buf, d.len, static_cast<off_t>(d.off));
+            ok = got >= 0 && static_cast<size_t>(got) >= qd.head + qd.payload_len;
+          }
+          if (qd.fd >= 0) { ::close(qd.fd); qd.fd = -1; }
+          if (range_complete_handler_)
+            range_complete_handler_(ok, ok ? qd.payload_len : 0);
+          char* sb = ep.sbuf(qd.send_slot);
+          if (ok) {
+            EncodeResp(sb, Status::kOk, qd.payload_len);
+            const char* out_data = ep.dbuf(qd.recv_slot) + qd.head;
+            // Defer recv rearm until this scatter SEND completes (read target reuse).
+            rearm_on_send[qd.send_slot] = qd.recv_slot;
+            if (!ep.PostSendScatter(qd.send_slot, kRespPrefix, out_data,
+                                    qd.payload_len, ep.dmr(qd.recv_slot))) {
+              fail = true; break;
+            }
+          } else {
+            EncodeResp(sb, Status::kIOError, 0);
+            if (!post_request_recv(qd.recv_slot)) { fail = true; break; }
+            if (!ep.PostSend(qd.send_slot, kRespPrefix)) { fail = true; break; }
+          }
+        }
+      }
+
+      // Connection ending: close any fds still owned by un-emitted queue entries.
+      for (auto& qd : queue) if (qd.fd >= 0) ::close(qd.fd);
+    }
+    active_conns_.fetch_sub(1, std::memory_order_relaxed);
+    { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
+    return;
+  }
+sync_serve_loop:;
+#endif  // DFKV_WITH_URING
+
   while (running_ && !fail) {
     int g = ep.WaitComp(wcs.data(), static_cast<int>(K), idle_ms);
     if (g == 0) { idle_reclaims_.fetch_add(1, std::memory_order_relaxed); break; }  // idle -> reclaim

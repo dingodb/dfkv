@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kv_store.h"   // Status
@@ -27,6 +28,23 @@ struct CacheSrc {
   BlockKey key;
   const void* header; size_t header_len;
   const void* payload; size_t payload_len;
+};
+
+// Scatter-gather write source: one dfkv key whose stored payload is the in-order
+// concatenation of N non-contiguous caller buffers. The transport gathers
+// [header | payload[0] | payload[1] | ...] on the wire via a multi-SGE RDMA SEND
+// without a client-side concat copy. All buffers must outlive the CacheFromMulti
+// call and stay unmodified until it returns. payload_len = sum of segment sizes.
+struct CacheSrcMulti {
+  BlockKey key;
+  const void* header; size_t header_len;
+  std::vector<std::pair<const void*, size_t>> payloads;  // (ptr, size) in order
+};
+// Scatter-gather read target: the stored payload (one concatenated blob) is
+// scattered across N caller buffers in order, each receiving its own size worth
+// of bytes (RDMA multi-SGE RECV). The destination capacity = sum of segment sizes.
+struct RangeDstMulti {
+  std::vector<std::pair<void*, size_t>> payloads;  // (ptr, size) in order
 };
 
 class Transport {
@@ -148,6 +166,70 @@ class Transport {
       items.push_back(CacheItem{srcs[i].key, bufs[i].data(), bufs[i].size()});
     }
     return CacheMany(node, items);
+  }
+
+  // Scatter-gather write: each key's payload is the concatenation of N caller
+  // segments. Default: concatenate the segments into a single CacheSrc and route
+  // through CacheFrom (no payload zero-copy, but correct on any transport). The
+  // RDMA transport overrides this to gather the segments via a multi-SGE SEND.
+  virtual std::vector<Status> CacheFromMulti(
+      const std::string& node, const std::vector<CacheSrcMulti>& srcs) {
+    std::vector<std::vector<char>> bufs(srcs.size());
+    std::vector<CacheSrc> flat;
+    flat.reserve(srcs.size());
+    for (size_t i = 0; i < srcs.size(); ++i) {
+      size_t total = 0;
+      for (const auto& p : srcs[i].payloads) total += p.second;
+      bufs[i].resize(total);
+      size_t off = 0;
+      for (const auto& p : srcs[i].payloads) {
+        if (p.second) std::memcpy(bufs[i].data() + off, p.first, p.second);
+        off += p.second;
+      }
+      flat.push_back(CacheSrc{srcs[i].key, srcs[i].header, srcs[i].header_len,
+                              bufs[i].data(), total});
+    }
+    return CacheFrom(node, flat);
+  }
+
+  // Scatter-gather read: the stored payload is split across each key's N caller
+  // segments in order. Default: RangeInto a single contiguous scratch buffer, then
+  // split-copy it into the caller segments by their sizes (no zero-copy, but
+  // correct on any transport). out_lens[i] (if non-null) = total payload bytes for
+  // key[i] (0 on miss). The RDMA transport overrides this to scatter via multi-SGE
+  // RECV directly into the caller segments. hdrs[i] gets the value-header bytes.
+  virtual std::vector<Status> RangeIntoMulti(
+      const std::string& node, const std::vector<BlockKey>& keys,
+      const std::vector<RangeDstMulti>& dsts, size_t header_size,
+      std::vector<std::string>* hdrs, std::vector<size_t>* out_lens) {
+    const size_t n = keys.size();
+    hdrs->assign(n, std::string());
+    if (out_lens) out_lens->assign(n, 0);
+    // Concatenate each key's segments into one contiguous scratch RangeDst, run
+    // the existing RangeInto, then split the scratch back into the segments.
+    std::vector<std::vector<char>> scratch(n);
+    std::vector<RangeDst> flat(n);
+    for (size_t i = 0; i < n; ++i) {
+      size_t cap = 0;
+      for (const auto& p : dsts[i].payloads) cap += p.second;
+      scratch[i].resize(cap);
+      flat[i] = RangeDst{cap ? scratch[i].data() : nullptr, cap};
+    }
+    std::vector<Status> r = RangeInto(node, keys, flat, header_size, hdrs);
+    for (size_t i = 0; i < n; ++i) {
+      if (r[i] != Status::kOk || (*hdrs)[i].size() < header_size) continue;
+      // The stored payload length is carried by the value header; the caller
+      // (KVClient) verifies geometry. Here we split exactly the bytes we received
+      // across the segments. The RangeInto fallback copied min(stored, cap) bytes
+      // into scratch; replay that across the segments honoring each segment size.
+      size_t off = 0;
+      for (const auto& p : dsts[i].payloads) {
+        if (p.second) std::memcpy(p.first, scratch[i].data() + off, p.second);
+        off += p.second;
+      }
+      if (out_lens) (*out_lens)[i] = off;
+    }
+    return r;
   }
 };
 

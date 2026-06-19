@@ -48,12 +48,43 @@ class RdmaServer {
       uint64_t id, uint32_t index, uint32_t ksize, char* data, size_t len,
       size_t cap)>;
 
+  // Optional async-GET prep handler (ADDITIVE, used only by the io_uring serve
+  // path when DFKV_SERVER_URING=1). Does the cheap, lock-protected half of a
+  // direct GET — index lookup, O_DIRECT open, range clamp + O_DIRECT alignment
+  // math — but performs NO disk read. The serve loop issues the pread itself via
+  // io_uring, then trims [head, head+payload_len) out of the aligned buffer. On
+  // kOk the serve loop OWNS `fd` and must ::close it after the read completes.
+  // payload_len==0 with fd<0 is a valid zero-length hit (no read needed).
+  struct RangePrepResult {
+    int fd = -1;               // owned by serve loop on kOk; -1 => no read
+    uint64_t aligned_off = 0;  // O_DIRECT-aligned read start
+    size_t aligned_len = 0;    // O_DIRECT-aligned read length (multiple of 4096)
+    size_t head = 0;           // offset of the requested bytes within the read
+    size_t payload_len = 0;    // exact requested bytes (post file-size clamp)
+  };
+  using RangePrepHandler = std::function<Status(
+      uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
+      uint64_t length, size_t io_cap, RangePrepResult* out)>;
+  // Optional accounting hook invoked once an async read completes (mirrors the
+  // hit/io-error counters the synchronous RangeDirect bumps).
+  using RangeCompleteHandler = std::function<void(bool ok, size_t bytes_read)>;
+
   // dev_name empty => env DFKV_RDMA_DEV, else first device.
   explicit RdmaServer(Handler handler, size_t max_msg = (64u << 20),
                       const std::string& dev_name = "");
   void set_range_handler(RangeHandler h) { range_handler_ = std::move(h); }
   void set_cache_direct_handler(CacheDirectHandler h) {
     cache_direct_handler_ = std::move(h);
+  }
+  // Wire the async-GET prep + completion accounting hooks. Optional: the io_uring
+  // serve path is used only when BOTH are set, the binary is built with
+  // DFKV_WITH_URING, AND env DFKV_SERVER_URING=1. Otherwise the serve loop uses
+  // the existing synchronous path verbatim (zero behavior change).
+  void set_range_prep_handler(RangePrepHandler h) {
+    range_prep_handler_ = std::move(h);
+  }
+  void set_range_complete_handler(RangeCompleteHandler h) {
+    range_complete_handler_ = std::move(h);
   }
   ~RdmaServer();
 
@@ -77,6 +108,10 @@ class RdmaServer {
   void AcceptLoop();
   void Serve(int boot_fd);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
+  // Whether the io_uring async-GET serve path should be used for new conns. True
+  // only when built with DFKV_WITH_URING, env DFKV_SERVER_URING=1, and both the
+  // range prep + complete handlers are set. Decided once per connection.
+  bool UseUringPath() const;
 
   // A live connection: its Serve thread plus a flag the thread sets (last thing
   // it does) so AcceptLoop can tell it has finished and join it without blocking.
@@ -90,6 +125,8 @@ class RdmaServer {
   Handler handler_;
   RangeHandler range_handler_;
   CacheDirectHandler cache_direct_handler_;
+  RangePrepHandler range_prep_handler_;
+  RangeCompleteHandler range_complete_handler_;
   size_t max_msg_;
   size_t control_cap_;
   std::string dev_name_;

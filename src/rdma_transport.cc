@@ -560,4 +560,189 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
   return res;
 }
 
+std::vector<Status> RdmaTransport::CacheFromMulti(
+    const std::string& node, const std::vector<CacheSrcMulti>& srcs) {
+  const size_t n = srcs.size();
+  std::vector<Status> res(n, Status::kIOError);
+  if (n == 0) return res;
+  // Validate: header fits the control buffer, total payload fits one message, and
+  // the segment count fits one work request (1 header SGE + segs). Like CacheFrom,
+  // do not silently fall back — this is the zero-copy SG PUT route.
+  bool from_pool = false;
+  Conn* c = Acquire(node, &from_pool);
+  if (!c) return res;
+  rdma::RcEndpoint& ep = c->ep;
+  const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
+  for (const auto& s : srcs) {
+    size_t total = 0;
+    for (const auto& p : s.payloads) total += p.second;
+    if (s.header_len > control_cap_ - kReqPrefix || total > max_payload_ ||
+        s.payloads.size() > max_payload_segs) {
+      Release(node, c);
+      std::fill(res.begin(), res.end(), Status::kInvalid);
+      return res;
+    }
+  }
+
+  const size_t W = ep.depth();
+  bool conn_ok = true;
+  for (size_t base = 0; base < n && conn_ok; base += W) {
+    const size_t w = std::min(W, n - base);
+    // Register every payload segment of every key in this window (cached MR lookup).
+    // mrs_per[j] holds the per-segment MRs for slot j. Any failure => give the conn
+    // back; Cache is idempotent so re-sending earlier windows on retry is harmless.
+    std::vector<std::vector<ibv_mr*>> mrs_per(w);
+    bool regok = true;
+    for (size_t j = 0; j < w && regok; ++j) {
+      const CacheSrcMulti& s = srcs[base + j];
+      mrs_per[j].assign(s.payloads.size(), nullptr);
+      for (size_t e = 0; e < s.payloads.size() && regok; ++e) {
+        if (s.payloads[e].second == 0) continue;  // empty segment: lkey 0, no MR
+        mrs_per[j][e] = ep.RegisterUser(const_cast<void*>(s.payloads[e].first),
+                                        s.payloads[e].second);
+        if (!mrs_per[j][e]) regok = false;
+      }
+    }
+    if (!regok) { Release(node, c); return res; }
+    for (size_t j = 0; j < w && conn_ok; ++j) {
+      const CacheSrcMulti& s = srcs[base + j];
+      size_t total = 0;
+      std::vector<std::pair<const void*, uint32_t>> segs;
+      segs.reserve(s.payloads.size());
+      for (const auto& p : s.payloads) {
+        segs.emplace_back(p.first, static_cast<uint32_t>(p.second));
+        total += p.second;
+      }
+      // Wire payload_len = header_len + total user payload (the full stored blob).
+      EncodeReq(ep.sbuf(j), WireOp::kCache, s.key, 0, 0, s.header_len + total);
+      if (s.header_len) std::memcpy(ep.sbuf(j) + kReqPrefix, s.header, s.header_len);
+      if (!ep.PostRecv(j)) { conn_ok = false; break; }
+      if (!ep.PostSendScatterMulti(j, kReqPrefix + s.header_len, segs, mrs_per[j])) {
+        conn_ok = false; break;
+      }
+    }
+    if (!conn_ok) break;
+    std::vector<ibv_wc> wcs(2 * w);
+    std::vector<uint32_t> rbytes(w, 0);
+    int need = static_cast<int>(2 * w);
+    while (need > 0) {
+      int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
+      if (g <= 0) { conn_ok = false; break; }
+      for (int i = 0; i < g; ++i) {
+        if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
+        if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
+        --need;
+      }
+      if (!conn_ok) break;
+    }
+    if (!conn_ok) break;
+    for (size_t j = 0; j < w; ++j) {
+      Status st; uint64_t dl = 0;
+      if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
+    }
+  }
+  if (conn_ok) Release(node, c); else Destroy(c);
+  return res;
+}
+
+std::vector<Status> RdmaTransport::RangeIntoMulti(
+    const std::string& node, const std::vector<BlockKey>& keys,
+    const std::vector<RangeDstMulti>& dsts, size_t header_size,
+    std::vector<std::string>* hdrs, std::vector<size_t>* out_lens) {
+  const size_t n = keys.size();
+  hdrs->assign(n, std::string());
+  if (out_lens) out_lens->assign(n, 0);
+  std::vector<Status> res(n, Status::kIOError);
+  if (n == 0) return res;
+  const size_t hdr_bytes = kRespPrefix + header_size;  // resp prefix + value header
+  if (hdr_bytes > control_cap_) {
+    std::fill(res.begin(), res.end(), Status::kInvalid);
+    return res;
+  }
+  bool from_pool = false;
+  Conn* c = Acquire(node, &from_pool);
+  if (!c) return res;
+  rdma::RcEndpoint& ep = c->ep;
+  const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
+  for (const auto& d : dsts) {
+    size_t cap = 0;
+    for (const auto& p : d.payloads) cap += p.second;
+    if (cap > max_payload_ || d.payloads.size() > max_payload_segs) {
+      Release(node, c);
+      std::fill(res.begin(), res.end(), Status::kInvalid);
+      return res;
+    }
+  }
+
+  const size_t W = ep.depth();
+  bool conn_ok = true;
+  for (size_t base = 0; base < n && conn_ok; base += W) {
+    const size_t w = std::min(W, n - base);
+    // Register every destination segment of every key in this window.
+    std::vector<std::vector<ibv_mr*>> mrs_per(w);
+    std::vector<size_t> caps(w, 0);
+    bool regok = true;
+    for (size_t j = 0; j < w && regok; ++j) {
+      const RangeDstMulti& d = dsts[base + j];
+      mrs_per[j].assign(d.payloads.size(), nullptr);
+      for (size_t e = 0; e < d.payloads.size() && regok; ++e) {
+        caps[j] += d.payloads[e].second;
+        if (d.payloads[e].second == 0) continue;
+        mrs_per[j][e] = ep.RegisterUser(d.payloads[e].first, d.payloads[e].second);
+        if (!mrs_per[j][e]) regok = false;
+      }
+    }
+    if (!regok) { Release(node, c); return res; }
+    for (size_t j = 0; j < w && conn_ok; ++j) {
+      const RangeDstMulti& d = dsts[base + j];
+      bool armed;
+      if (caps[j]) {
+        std::vector<std::pair<void*, uint32_t>> segs;
+        segs.reserve(d.payloads.size());
+        for (const auto& p : d.payloads)
+          segs.emplace_back(p.first, static_cast<uint32_t>(p.second));
+        armed = ep.PostRecvScatterMulti(j, segs, mrs_per[j], hdr_bytes);
+      } else {
+        armed = ep.PostRecv(j);  // header-only reply
+      }
+      if (!armed) { conn_ok = false; break; }
+      EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + caps[j], 0);
+      if (!ep.PostSend(j, kReqPrefix)) { conn_ok = false; break; }
+    }
+    if (!conn_ok) break;
+    std::vector<ibv_wc> wcs(2 * w);
+    std::vector<uint32_t> rbytes(w, 0);
+    int need = static_cast<int>(2 * w);
+    while (need > 0) {
+      int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
+      if (g <= 0) { conn_ok = false; break; }
+      for (int i = 0; i < g; ++i) {
+        if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
+        if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
+        --need;
+      }
+      if (!conn_ok) break;
+    }
+    if (!conn_ok) break;
+    for (size_t j = 0; j < w; ++j) {
+      uint32_t rb = rbytes[j];
+      if (rb < kRespPrefix) continue;
+      Status st; uint64_t dl = 0;
+      if (!DecodeResp(ep.rbuf(j), &st, &dl)) continue;
+      res[base + j] = st;  // payload (if any) already scattered into dsts[].payloads
+      if (st == Status::kOk) {
+        if (rb >= hdr_bytes) {
+          (*hdrs)[base + j].assign(ep.rbuf(j) + kRespPrefix, header_size);
+          // True stored payload bytes received = rb - resp-prefix - value header.
+          if (out_lens) (*out_lens)[base + j] = rb - hdr_bytes;
+        } else {
+          res[base + j] = Status::kIOError;
+        }
+      }
+    }
+  }
+  if (conn_ok) Release(node, c); else Destroy(c);
+  return res;
+}
+
 }  // namespace dfkv

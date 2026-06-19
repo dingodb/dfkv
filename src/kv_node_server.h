@@ -79,6 +79,17 @@ class KvNodeServer {
                      uint64_t length, char* io_buf, size_t io_cap,
                      const char** out_data, size_t* out_len);
 
+  // Async-friendly prep half of RangeDirect: index lookup + O_DIRECT open +
+  // alignment math, NO disk read (see KVStore::RangeDirectPrep). The caller
+  // issues the pread (io_uring) into its io_buf and closes out->fd afterward.
+  // Updates miss/io-error counters; the hit/bytes-read counters are bumped by
+  // RangeDirectComplete once the read result is known.
+  Status RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize,
+                         uint64_t offset, uint64_t length, size_t io_cap,
+                         KVStore::RangePrep* out);
+  // Account a completed prep-based GET (called after the async read finishes).
+  void RangeDirectComplete(bool ok, size_t bytes_read);
+
  private:
   void AcceptLoop();
   void Handle(int fd);

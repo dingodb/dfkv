@@ -55,6 +55,16 @@ Empirical (8x400G IB testbed, 3-node, 1 MiB PUT, single writer thread, batch 64)
   single-rank r0 path + server serial-per-connection writes, already mitigated by
   the 8-way fan-out.
 
+- **GET is depth-flat too** (2026-06-20, `dfkv_bench --threads 1 --bc 1 --size 512KiB
+  --count 2000`, single RC connection, io_uring server on a local SSD, 3 interleaved
+  runs): GET held **1.22–1.25 GB/s with `DFKV_RDMA_DEPTH` 1 vs 32 — indistinguishable**
+  (p50 call-lat ~0.41 ms both). Same reason as PUT: the server's per-connection serve
+  loop is strictly in-order, so pipelining N GETs on one connection just queues them.
+  Depth is a network-latency-hider, not a throughput knob; **do not expect a load
+  speedup from raising `DFKV_RDMA_DEPTH` alone.** Caution when benchmarking on a shared
+  node: the SSD's read latency varies several-fold with other tenants' I/O, which can
+  masquerade as a depth effect — interleave depth values within one run to cancel it.
+
 ## One-sided RDMA WRITE/READ vs two-sided SEND/RECV
 
 A colleague noted one-sided (READ/WRITE) often beats two-sided (SEND/RECV). True in
