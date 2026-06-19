@@ -29,6 +29,29 @@ static void OnSig(int) { g_stop = 1; }
 
 int main(int argc, char** argv) {
   if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_server %s\n", dfkv::Version()); return 0; }
+  // No args or --help: print usage and exit, rather than silently starting a
+  // server with default config (the old behavior — a foot-gun).
+  if (argc == 1 || dfkv::WantsHelp(argc, argv)) {
+    bool help = dfkv::WantsHelp(argc, argv);
+    std::FILE* out = help ? stdout : stderr;
+    std::fprintf(out,
+      "dfkv_server %s — dfkv cache-node daemon\n"
+      "Usage: dfkv_server --dir <p1[,p2,...]> [--port <p|0>] --cap <bytes> [options]\n\n"
+      "  --dir <paths>        comma-separated NVMe paths; --cap is the TOTAL, split evenly\n"
+      "  --cap <bytes>        total cache capacity (LRU self-limits)\n"
+      "  --port <p>           TCP bootstrap/data port (0 = ephemeral)\n"
+      "  --rdma-port <p>      RDMA QP-bootstrap port (enables RDMA data path)\n"
+      "  --rdma-dev <name>    RDMA device by name (comma list = multi-rail)\n"
+      "  --mds <ip:port,...>  MDS endpoints to register into (with --group/--id/--advertise)\n"
+      "  --group <g>          membership group name (default \"default\")\n"
+      "  --id <id>            node id; --advertise <ip:port>  address peers reach (rdma-port)\n"
+      "  --weight <n>         consistent-hash weight (default 1)\n"
+      "  --metrics-port <p>   enable Prometheus /metrics (omit = off); --metrics-bind <addr>\n"
+      "  --version, -V        print version and exit\n"
+      "  --help, -h           print this help and exit\n",
+      dfkv::Version());
+    return help ? 0 : 1;
+  }
   std::string dir = "/tmp/dfkv_node";
   std::string rdma_dev, mds, group = "default", node_id, advertise, metrics_bind;
   int weight = 1;
