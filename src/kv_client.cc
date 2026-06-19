@@ -20,6 +20,16 @@ namespace {
 // per work request; SGE0 is the header, leaving max_sge-1 payload SGEs. The
 // device cap on hd04 ConnectX is 30 -> 29 payload segments. The connector
 // guarantees <=29; a key over this is reported failed instead of corrupted.
+//
+// KNOWN LIMITATION (heterogeneous hardware): this is a fixed 29, not the live
+// negotiated ep.max_sge()-1. On an HCA reporting max_sge < 30, a key whose seg
+// count is between (max_sge-1) and 29 passes this client guard but trips the
+// transport's per-window check (CacheFromMulti/RangeIntoMulti), which today
+// fails the WHOLE node batch (std::fill kInvalid), not just the offender. That
+// is fail-soft (the connector recomputes those blocks; no data corruption) but
+// costs the cache benefit on small-max_sge devices. TODO for cross-HCA support:
+// (a) fail only the offending item in the transport, and/or (b) derive the SG
+// chunk size from the live max_sge instead of this constant.
 constexpr size_t kSgMaxPayloadSegs = 29;
 
 // Run fn(i) for i in [0,n) across up to `workers` threads (atomic work-steal).

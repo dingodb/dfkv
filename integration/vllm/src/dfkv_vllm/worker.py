@@ -408,12 +408,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._record_operation(
                     "save_put",
                     put_start,
-                    len(flat_keys),
+                    len(sg_keys),
                     num_bytes=batch_bytes,
                     status="error",
-                    num_failed_keys=len(flat_keys),
+                    num_failed_keys=len(sg_keys),
                 )
-                logger.error("Failed to put key %s, error: %s", flat_keys, e)
+                logger.error("Failed to put keys %s, error: %s", sg_keys[:3], e)
 
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
@@ -491,6 +491,14 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 addr_list.append(addr)
                 size_list.append(size)
                 block_id_list.append(block_id)
+
+        # Nothing to load (e.g. every chunk masked out for this group) -> finish
+        # the request now, else `tp_rank % 0` below would raise and the req would
+        # never be reported done, hanging vLLM's WAITING_FOR_REMOTE_KVS wait.
+        if not key_list:
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
 
         # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
