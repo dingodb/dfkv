@@ -77,7 +77,8 @@ dfkv_server --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
 # OR legacy static path (single-node / simple setups)
 #    dfkv_open("n1=10.0.0.10:12000,...", ...)
 ```
-Full rollout runbook (etcd + MDS + systemd units): `docs/DEPLOY.md`.
+Full dfkv CLUSTER deploy runbook (etcd + MDS + systemd units): `docs/DEPLOY.md`.
+Per-engine connect/config: `docs/hicache/DEPLOY.md` · `docs/vllm/DEPLOY.md` · `docs/lmcache/DEPLOY.md`.
 
 ## Layout
 ```
@@ -86,14 +87,15 @@ python/     dfkv_hicache.py  (SGLang dynamic backend plugin)
 integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libdfkv.so)
 integration/vllm/     dfkv_vllm       (vLLM KVConnectorBase_V1, GPUDirect RDMA, bypass LMCache)
 tests/      gtest suites + tests/python (unittest + no-torch sglang shim)
-docs/       DEPLOY.md (standalone rollout) · INTEGRATION.md (fuse into dingo-cache)
-docs/hicache/  SGLang HiCache plugin docs (access_log, module README)
+docs/       DEPLOY.md (dfkv CLUSTER deploy: etcd + MDS + server + systemd) · INTEGRATION.md (fuse into dingo-cache)
+docs/hicache/  SGLang HiCache connector docs (DEPLOY — connect/config/use)
 docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
 docs/vllm/     vLLM connector docs (DEPLOY — config reference + recommended settings)
 ```
 
 ## Engine integrations
-- **SGLang HiCache**: `python/dfkv_hicache.py` — see `docs/hicache/` and `docs/DEPLOY.md`.
+- **SGLang HiCache**: `python/dfkv_hicache.py` — see `docs/hicache/DEPLOY.md` (connect/config/use;
+  cluster deploy is `docs/DEPLOY.md`).
 - **LMCache**: `integration/lmcache/` (`dfkv_connector`) — see `docs/lmcache/DESIGN.md`,
   `docs/lmcache/IMPLEMENTATION.md`, `docs/lmcache/DEPLOY.md`.
 - **vLLM (direct)**: `integration/vllm/` (`dfkv_vllm`) — a `KVConnectorBase_V1`

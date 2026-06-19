@@ -6,6 +6,8 @@
 > 前提：GLM-5.1 = MLA（每页 KV ≈ 2.74 MiB 单对象、跨 TP 复制、仅 tp_rank0 写）。
 > 已在 400G InfiniBand 上端到端验证（两端零拷贝，单口 GET ~93% 线速）。
 
+> **本文只讲 dfkv 集群自身的部署;各推理引擎如何对接/配置 dfkv 见 [docs/hicache/DEPLOY.md](hicache/DEPLOY.md)、[docs/vllm/DEPLOY.md](vllm/DEPLOY.md)、[docs/lmcache/DEPLOY.md](lmcache/DEPLOY.md)。**
+
 ---
 
 ## 0. 网络模型（关键）
@@ -126,7 +128,7 @@ journalctl -u dfkv -n 10 --no-pager
 #      + "dfkv_server registered with MDS group=default id=n57 advertise=192.168.1.57:28001"
 ```
 > server 的 bootstrap 监听 `0.0.0.0`，靠防火墙限制在内网。优雅关闭已修（`systemctl stop` 约 1s 退出）。
-> **多轨**：让客户端在多张 400G 口间分散即可（见 §5 `DFKV_RDMA_DEV` 列表）；server 会按客户端请求的设备名在同轨开 QP，无需为多轨改 server 配置（保留 `--rdma-dev` 作默认）。
+> **多轨**：让客户端在多张 400G 口间分散即可（客户端 `DFKV_RDMA_DEV` 逗号列表，见各引擎对接文档如 [hicache/DEPLOY.md](hicache/DEPLOY.md)）；server 会按客户端请求的设备名在同轨开 QP，无需为多轨改 server 配置（保留 `--rdma-dev` 作默认）。
 > ⚠️ 同机 8×400G 多轨受 NUMA 限制（NIC 跨双 socket，单内存域）；单口已近线速，多轨叠加需 NUMA 感知，暂不必配。
 
 ## 4. 集群成员管理
@@ -152,64 +154,7 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
 增减节点 = 改成员字符串并重载 SGLang 端。`dfkv_server` 此时不带 `--mds` 启动。
 建议 N≥4 降低单点 miss 影响。
 
-## 5. SGLang 侧接入（免 fork，dynamic 侧载）
-
-把 `libdfkv.so` + `python/dfkv_hicache.py` 放到 pod 可访问路径，启动 `sglang serve` 前注入环境：
-```bash
-export PYTHONPATH=/userdata/dfkv:$PYTHONPATH
-export DFKV_LIB=/userdata/dfkv/libdfkv.so
-export DFKV_RDMA=1                       # 启用 RDMA 数据面（否则 TCP）
-export DFKV_REQUIRE_RDMA=1               # 可选：禁止悄悄 TCP fallback
-export DFKV_RDMA_DEV=ib7s400p0           # 数据面设备；多轨用逗号列表 ib7s400p0,ib7s400p1,...
-export DFKV_RDMA_MAX_PAYLOAD_BYTES=67108864  # 可选：单 chunk payload 上限，默认 64MiB
-# 可选: DFKV_RDMA_DEPTH (单连接 pipeline, K 个请求在途; 仅网络延迟隐藏、对吞吐 flat——见下注; 默认 1 即可)
-```
-> ⚠️ **depth 是延迟隐藏、不是吞吐旋钮(2026-06 实测更正)**：server 单连接 serve loop 串行处理,
-> 实测 **PUT 与 GET 的吞吐对 depth 都是 flat**(1≈8≈16≈32)。早先"depth>1 抬高写带宽"的说法不成立。
-> 写/读吞吐的真正杠杆是 **`batch_concurrency`(多连接跨节点 fan-out,客户端默认 8)** 与**少而大的 key**;
-> depth 只在网络延迟受限的链路上有意义,**默认 1 即可**,见 `docs/datapath-perf-notes.md`。
-> (机制仍在:extra_config `"rdma_depth":K` 会在 dfkv_open 前自动设 DFKV_RDMA_DEPTH,且 client depth ≤ server depth;但一般无需设。)
-
-> **多轨 NUMA 选轨**（v1.2.0 起）：设 extra_config `"rdma_numa":1`（或 env `DFKV_RDMA_NUMA=1`）+ 多轨 `DFKV_RDMA_DEV`，**C++ 客户端在建连时按调用线程的 NUMA 节点自动选本地轨**（无本地轨→轮转全轨）。SGLang/vLLM 两端通吃，无需各自改，仅在新建连接触发（热路径零开销）。
-> - ⚠️ **旧 `"rail_affinity"` 已废弃为 no-op**（v1.2.0）：它按 `tp_rank` 收窄，但 DP-attention 下每 rank `tp_rank=0`→塌缩到单轨。配了只打 stderr 告警、不再生效；改用上面的 `rdma_numa`。
-
-**方案 A — MDS 动态发现（推荐）**：配置 `mds_endpoints` + `mds_group`；插件内部调用
-`dfkv_start_mds_discovery` 自动轮询 MDS，epoch 变化时重建环，无需重启。
-```bash
-sglang serve ... \
-  --enable-hierarchical-cache --hicache-write-policy write_through \
-  --hicache-mem-layout page_first_direct --hicache-io-backend direct \
-  --hicache-storage-backend dynamic \
-  --hicache-storage-backend-extra-config '{
-    "backend_name":"dfkv","module_path":"dfkv_hicache","class_name":"DfkvHiCache",
-    "interface_v1":1,
-    "mds_endpoints":"10.0.0.1:9400,10.0.0.2:9400",
-    "mds_group":"default",
-    "model_hash": 81, "page_size":64, "dtype_tag":1178092852,
-    "layer_num":78, "head_num":1, "head_dim":576 }'
-```
-
-**方案 B — 静态成员表（遗留）**：无 MDS 时配置 `members` 字段，节点增减需重启 SGLang。
-```bash
-sglang serve ... \
-  --enable-hierarchical-cache --hicache-write-policy write_through \
-  --hicache-mem-layout page_first_direct --hicache-io-backend direct \
-  --hicache-storage-backend dynamic \
-  --hicache-storage-backend-extra-config '{
-    "backend_name":"dfkv","module_path":"dfkv_hicache","class_name":"DfkvHiCache",
-    "interface_v1":1,
-    "members":"n57=192.168.1.57:28001,n58=192.168.1.58:28001",
-    "model_hash": 81, "page_size":64, "dtype_tag":1178092852,
-    "layer_num":78, "head_num":1, "head_dim":576 }'
-```
-> **`interface_v1:1` 是必填项**，插件 `__init__` 强校验：缺失即 `raise ValueError` 启动失败。原因——对 `dynamic` 后端，SGLang 仅在 `interface_v1` 为真时才走零拷贝 `batch_set_v1/get_v1`；否则退回 generic `set/get` 路径，而 dfkv 的 generic `get/batch_get` 是未实现的桩，会导致**写成功、L3 读静默失败**（线上踩过：launch 脚本漏配此项，14GB 写入但 prefetch 全部 miss）。
-> `interface_v1:1` 触发零拷贝 `batch_set_v1/get_v1` —— GET payload 经 RDMA 散射**直落 HiCache 宿主页**（client 端零拷贝），server 端 O_DIRECT 直读入已注册 direct buffer 并 scatter-send（server 端无 payload memcpy），两端零拷贝。
-> MLA 下插件自动单对象、无 rank 后缀、`backup_skip`（仅 tp_rank0 写）。decode 共享前缀配同 members。
-> 多池模型（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
-> 排查命中率/慢操作：可开启 access log（`access_log`/`access_log_path` 或 `DFKV_ACCESS_LOG_*`），见 [access_log.md](hicache/access_log.md)。
-> **客户端指标**：插件自动在 SGLang 自带的 `/metrics` 上暴露 `dfkv_client_*{tp_rank}`（set/get 量、命中、IO 错误、peer 熔断切换、set/get 延迟直方图）。后台轮询线程读 C 客户端快照，间隔由 extra_config `client_stats_poll_s`（默认 10s，`DFKV_CLIENT_STATS_POLL_S` 兜底，`0`=关）控制。全指标见 [METRICS.md](METRICS.md) §3.3。
-
-## 6. 上线顺序 + 冒烟（无需 GPU）
+## 5. 上线顺序 + 冒烟（无需 GPU）
 
 1. （MDS 路径）起 etcd，再起所有 `dfkv_mds` 副本（§2b），确认日志 "listening"。
 2. 所有节点起 `dfkv_server`（§3），确认 PORT + "registered with MDS" 日志。
@@ -226,18 +171,18 @@ sglang serve ... \
 5. 压测（可选）：`DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 dfkv_bench --members ... --size 2752512 --count 8000 --threads 64`。
 6. 在**一个受控 SGLang 副本**上切 `dynamic` 后端，发共享长前缀请求看命中上涨，确认后推广。
 
-## 7. 回滚（秒级）
+## 6. 回滚（秒级）
 - SGLang：`--hicache-storage-backend` 改回原后端（mooncake 等）重启该副本，与 dfkv 解耦。
 - dfkv 节点：`systemctl stop dfkv`；缓存可丢（KV 可重算），彻底清理删 `/mnt/diskX/dfkv`。
 - dfkv MDS：`systemctl stop dfkv_mds`；无状态，etcd 数据可保留也可清除（`etcdctl del /dfkv --prefix`）。
 - 全程不影响 dingo-cache / dingofs / 生产 MDS / 对象存储。
 
-## 8. 监控 / 边界
+## 7. 监控 / 边界
 **完整指标/CLI 参考见 [METRICS.md](METRICS.md)。** 要点：
 - **Prometheus 抓取**（opt-in）：`dfkv_server`/`dfkv_mds` 加 `--metrics-port <p>` → `GET /metrics`、`/healthz`。`--id/--group` 成为 `{node,group}` 标签（不设=无标签，向后兼容）。**缺省不开端口 → 行为与旧版一致、对数据面零影响**。Prometheus 直接抓每节点 `:<p>/metrics`。
   - 服务端含：put/hit/miss、bytes、淘汰、错误分型、`open_connections`、per-disk、**采样延迟直方图 `dfkv_op_latency_seconds{op}`**、RDMA 完成/错误/活跃连接。
   - MDS 含：register/keepalive/list/lease/etcd-error + members gauge。
-  - 客户端（SGLang 插件 `/metrics`）：`dfkv_client_*{tp_rank}`，见 §5 / METRICS.md §3.3。
+  - 客户端（SGLang 插件 `/metrics`）：`dfkv_client_*{tp_rank}`，见 [hicache/DEPLOY.md](hicache/DEPLOY.md) / METRICS.md §3.3。
 - **集群/环视图**（CLI，无需开端口）：
   - `dfkvctl ring --mds <eps> --group <g>` — 成员表 + 一致性哈希环每节点 vnode 占比。
   - `dfkvctl stat --all --mds <eps> --group <g>` — 逐节点指标 + 集群聚合（容量/对象/命中率）。
@@ -245,32 +190,3 @@ sglang serve ... \
 - SGLang `--enable-cache-report` 的 HiCache storage hit/miss、TTFT。
 - 生产只读：不改现网组件；dfkv 端口（含 `/metrics`）仅内网开放、无鉴权勿暴露公网。
 - 线协议带 1B 版本号，混版本部署会被 server 拒（不静默错读）；升级时整集群同版本。**指标均为新增、不改 wire，v1.3.0 节点与 v1.4.0 客户端互通。**
-
-## 9. 引擎与特性边界（HiCache 侧）
-
-dfkv 现在同时服务三种引擎：**SGLang HiCache**（本 runbook）、**LMCache**（`docs/lmcache/`）、
-**vLLM 直连**（`docs/vllm/DEPLOY.md`）。后续给 vLLM 连接器加的几个特性**并不适用于 HiCache 侧**，
-不是漏配，是数据形状不匹配——HiCache 维持常规路径即可：
-
-- **scatter-gather（SG，合并 key）— HiCache 不用。** SG 把"一个 chunk 的多个层段"合成一个多-SGE
-  RDMA key，是为 vLLM 连接器的变长 chunk × 多层段做的。HiCache MLA **每页就是一个打包 latent 对象
-  （~2.74 MiB）**，本来一页一 key、无碎段可合，SG 在此无收益。（仅 MHA 的 `_k`/`_v` 对或未来多池
-  HiCache v2 才理论上有边际收益，且需改插件代码、非开关。）
-- **io_uring async GET（`DFKV_SERVER_URING`）— HiCache 不要开。** 实测单盘上对吞吐 **flat/无收益**
-  （瓶颈是盘不是读提交），默认关。HiCache 单盘场景开它纯属白费。
-- **`DFKV_RDMA_DEPTH` — 保持默认 1**（见 §5：实测对 PUT/GET 吞吐都 flat）。
-- HiCache 真正需要的硬化与可观测性（RDMA 空闲回收、CLOCK 持久指针、MDS 硬化、Prometheus 指标）
-  **已在 v1.5.2 内**，无需额外动作。
-
-### vLLM 实例与 HiCache 实例（即便同一模型）能否共用同一个池？
-
-- **共用同一套 dfkv 集群 / 同一个哈希环：可以。** 环只负责把 key 路由到节点；两种引擎指同一 `members`
-  即可共用存储池与容量（共享 LRU）。
-- **但二者不会复用彼此的 KV（同模型也不行）。** SGLang HiCache 与 vLLM 连接器用**完全不同的 key 方案**
-  （前缀/哈希/`@sg` 后缀/tp_rank 处理都不同）**和不同的 KV 字节布局**（MLA 单页打包对象 vs 连接器的
-  逐组分段）。同一模型、同一段 token，两边算出的 **key 不同、字节也不兼容**——只是共存于同一池、
-  keyspace 互不相交，谈不上跨引擎前缀命中。
-- **推荐：给两者不同的命名空间隔离 keyspace**（vLLM 侧 `model_hash` / `served-model-name` 与 HiCache 侧
-  取不同值）。这样即使理论上撞到同名 key，也因命名空间不同而不会发生"同 key 不同字节"的静默错读
-  （dfkv 值头只守 `payload_len` 字节大小，大小相同而布局不同会读成脏数据）。结论：**共享节点与容量、
-  隔离 keyspace**。

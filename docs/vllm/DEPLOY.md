@@ -20,57 +20,23 @@
 
 > dfkv 与 vLLM 可同机(GPU 节点既跑 server 又跑 vLLM,池化本机 NVMe),也可分离。
 
----
-
-## 第 1 步:编译 dfkv(带 RDMA)
-
-```bash
-cmake -S . -B build -DDFKV_WITH_RDMA=ON          # 数据面 400G 必须开;可选 -DDFKV_WITH_URING=ON
-cmake --build build -j
-ldd build/dfkv_server | grep ibverbs              # 确认链接了 RDMA 库
-# 产物:build/dfkv_server  build/dfkv_mds  build/libdfkv.so
-```
-
-`libdfkv.so` 是连接器唯一的原生依赖,拷到推理节点即可(或挂载共享盘)。
+> **前提:先按 [docs/DEPLOY.md](../DEPLOY.md) 部署好 dfkv 集群(server + MDS);把 libdfkv.so
+> 拷到推理节点;`pip install -e integration/vllm` 装 dfkv_vllm 包。**
+> ⚠️ **`members` 端口必须是 server 的 `--rdma-port`(RDMA QP bootstrap),不是 `--port`。**
 
 ---
 
-## 第 2 步:启动 dfkv 存储集群
+## 第 1 步:启动 vLLM
 
-每台缓存节点起一个 `dfkv_server`。**关键:`--rdma-port` 是 RDMA QP bootstrap 端口,
-连接器的 `members` 必须指向它,而不是 `--port`。** `--advertise` 也用 rdma-port。
-
-```bash
-dfkv_server \
-  --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \   # 多盘逗号分隔,节点内 Ketama
-  --port 28000 --rdma-port 28001 --rdma-dev ib7s400p0 \      # port=TCP bootstrap; rdma-port=RDMA bootstrap; rdma-dev=数据面400G口
-  --cap 6597069766656 \                                      # 总容量(字节),按盘均分,自带 LRU 自限
-  --mds 10.0.0.1:9400,10.0.0.2:9400 --group glm \            # 可选:接 MDS 动态成员(否则连接器用静态 members)
-  --id n1 --advertise 192.168.1.1:28001                      # advertise 端口 = rdma-port
-```
-
-- **容量隔离**:`--cap` 设保守值,确认 `现网用量 + dfkv cap + 预留 < 物理总量`。
-- **MDS(可选)**:多副本无状态 `dfkv_mds --listen 9400 --etcd ...` + 节点 `--mds`;连接器目前用
-  **静态 `members`**,MDS 主要服务 SGLang 侧,vLLM 侧直接列服务端 rdma 地址即可。
-- 观测:加 `--metrics-port 28110` 开 Prometheus `/metrics`(off 时无监听,见 `docs/METRICS.md`)。
-
----
-
-## 第 3 步:在推理节点安装 connector
-
-```bash
-pip install -e integration/vllm        # 提供 dfkv_vllm 包(纯 Python)
-# libdfkv.so 路径通过 extra_config.lib 或 env DFKV_LIB 指定
-```
-
----
-
-## 第 4 步:启动 vLLM
+**推荐(生产):MDS 动态发现** —— 配 `mds_endpoints` + `mds_group`,连接器内部调
+`dfkv_start_mds_discovery` 自动轮询 MDS、epoch 变化时重建环,节点增减无需重启 vLLM。
+连接器要求 **`mds_endpoints` 或 `members` 二选一**,设了 `mds_endpoints` 即优先走 MDS。
 
 ```bash
 PYTHONHASHSEED=0 \                       # ★ 必设,见下方说明,否则跨进程/重启不命中
-DFKV_RDMA=1 DFKV_RDMA_DEV=ib7s400p0 \    # 选 RDMA 传输 + 数据面轨
-DFKV_LIB=/opt/dfkv/libdfkv.so \
+DFKV_RDMA=1 \
+DFKV_RDMA_DEV=ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7 \
+DFKV_LIB=/opt/dfkv/libdfkv.so \          # 数据面 8×400G 多轨(逗号列表);单口节点列单个
 vllm serve <model> \
   --tensor-parallel-size 2 --data-parallel-size 4 \
   --kv-transfer-config '{
@@ -78,11 +44,25 @@ vllm serve <model> \
     "kv_connector_module_path": "dfkv_vllm.connector",
     "kv_role": "kv_both",
     "kv_connector_extra_config": {
-      "members": "n1=192.168.1.1:28001,n2=192.168.1.2:28001",
+      "mds_endpoints": "192.168.0.8:28150,192.168.0.9:28150,192.168.0.10:28150",
+      "mds_group": "glm",
       "model_hash": "1234567890",
       "batch_concurrency": "8"
     }
   }'
+```
+
+> ⚠️ **`DFKV_RDMA_DEV` 默认列全 8 轨**:一台 8×400G 节点把 8 个口都列上(逗号分隔)。
+> hd04 当前只有 `ib7s400p0,ib7s400p1` 两轨 up,但标准节点有 8 轨——按本机实际 up 的口列。
+
+**备选(单节点 / 简单部署):静态成员表** —— 无 MDS 时改用 `members`,节点增减需重启 vLLM:
+
+```bash
+    "kv_connector_extra_config": {
+      "members": "n1=192.168.1.1:28001,n2=192.168.1.2:28001",   # 端口=server --rdma-port
+      "model_hash": "1234567890",
+      "batch_concurrency": "8"
+    }
 ```
 
 > **`PYTHONHASHSEED=0` 是头号坑。** dfkv key 的 chunk_hash 源自 vLLM 的 block hash,
@@ -92,7 +72,7 @@ vllm serve <model> \
 
 ---
 
-## 第 5 步:验证
+## 第 2 步:验证
 
 1. **首轮(cold)**:发一个长 prompt,记 TTFT。
 2. **重启 vLLM**(或换一个 DP 实例)后**发同一 prompt**:若连接器工作,vLLM 跳过 prefill
@@ -100,8 +80,8 @@ vllm serve <model> \
    **输出与 cold 逐字一致**。
 3. server 侧 `dfkvctl stat --all` 或 `/metrics` 看 get 命中、写入量。
 
-不命中排查顺序:`PYTHONHASHSEED` → `members` 端口是否 rdma-port → `nvidia-peermem` →
-`model_hash`/几何是否一致(见下)。
+不命中排查顺序:`PYTHONHASHSEED` → MDS 可达(或静态 `members` 端口是否 rdma-port) →
+`nvidia-peermem` → `model_hash`/几何是否一致(见下)。
 
 ---
 
@@ -112,7 +92,7 @@ vllm serve <model> \
 | env | 默认 | 推荐 | 说明 |
 |---|---|---|---|
 | `DFKV_RDMA` | 未设=TCP | `1` | 选 RDMA 传输;未设则 TCP 回退 |
-| `DFKV_RDMA_DEV` | — | 本机 400G 口名(`ib7s400p0`) | RDMA 轨,逗号列表=多轨;`DFKV_RDMA=1` 时必填 |
+| `DFKV_RDMA_DEV` | — | 本机所有 400G 口名,逗号列表(标准节点 8 轨 `ib7s400p0,...,p7`) | RDMA 轨,逗号列表=多轨;`DFKV_RDMA=1` 时必填(hd04 当前仅 p0,p1 up,标准节点 8 轨) |
 | **`PYTHONHASHSEED`** | 未设 | **`0`(全 rank/实例一致)** | 跨进程/跨重启 key 确定性,**不设=不命中** |
 | `DFKV_RDMA_DEPTH` | `1` | **保持 1** | 每连接在途请求数;延迟隐藏、**非吞吐旋钮**(GET/PUT 都 depth-flat,server 单连接串行) |
 | `DFKV_RDMA_NUMA` | `0` | 多 NUMA 大机可设 `1` | 绑 buffer/线程到轨的 NUMA 节点 + 选 NUMA-local 轨 |
@@ -120,9 +100,14 @@ vllm serve <model> \
 
 ### B. `kv_connector_extra_config`
 
+> 成员发现:连接器要求 **`mds_endpoints` 或 `members` 二选一**;设了 `mds_endpoints` 即优先走 MDS,生产推荐 MDS。
+
 | key | 默认 | 推荐 | 说明 |
 |---|---|---|---|
-| `members` | 必填 | `n=ip:rdma-port,...` | **端口必须是 server 的 `--rdma-port`**,不是 `--port` |
+| `mds_endpoints` | — | `ip:port,...`(dfkv_mds 层,如 `192.168.0.8:28150,...`) | **生产首选**;设了即走 MDS 动态发现,省略 `members` |
+| `mds_group` | `default` | `glm` 等 | MDS 成员组名,与 `dfkv_server --group` 一致 |
+| `mds_poll_ms` | `3000` | 默认即可 | MDS 轮询间隔(ms),epoch 变化时重建环 |
+| `members` | static fallback(用 mds_endpoints 时省略) | `n=ip:rdma-port,...` | **端口必须是 server 的 `--rdma-port`**,不是 `--port` |
 | `model_hash` | `0` | 每模型一个固定 uint64 | key 命名空间;共享需几何一致(见下) |
 | `lib` | env 兜底 | `libdfkv.so` 绝对路径 | |
 | `batch_concurrency` | `8` | **大池可调高到≈节点数** | 跨节点 fan-out,**真正的吞吐杠杆**(depth 是平的) |
@@ -130,15 +115,9 @@ vllm serve <model> \
 | `enable_cross_layers_blocks` | `False` | 默认 False | 仅当引擎分页布局层内交错时开 |
 | `lookup_rpc_port` | ipc 自动 | 一般不设 | rank0 前缀查询 RPC,仅 socket 名冲突时设 |
 
-### C. dfkv_server 关键 flag
-
-| flag | 推荐 | 说明 |
-|---|---|---|
-| `--dir` | 多块 NVMe 逗号分隔 | 节点内 Ketama 分散 |
-| `--port` / `--rdma-port` | 错开两个端口 | TCP bootstrap / RDMA bootstrap |
-| `--rdma-dev` | 数据面 400G 口名 | |
-| `--cap` | 保守值(留现网余量) | LRU 自限 |
-| `--mds`/`--group`/`--id`/`--advertise` | 接 MDS 时配 | advertise 端口=rdma-port |
+> dfkv 集群侧 flag(`--dir`/`--port`/`--rdma-port`/`--mds`/`--group`/`--advertise` 等)见
+> [docs/DEPLOY.md](../DEPLOY.md);**连接器侧只需记住 `members` 端口 = server 的 `--rdma-port`、
+> `mds_group` = server 的 `--group`**。
 
 ---
 

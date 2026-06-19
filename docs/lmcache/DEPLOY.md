@@ -1,7 +1,7 @@
 # dfkv LMCache connector — 使用指南
 
 把 vLLM 的 KV cache 通过 LMCache 卸载到 **dfkv** 集群，实现跨请求/跨实例的前缀缓存复用。
-本文按步骤说明怎么从零搭起来：**编译 → 起缓存集群 → 装 connector → 改 lmcache.yaml → 起 vLLM → 验证**。
+本文按步骤说明：**装 connector → 改 lmcache.yaml → 起 vLLM → 验证**。
 
 设计与实现细节见 [DESIGN.md](DESIGN.md) / [IMPLEMENTATION.md](IMPLEMENTATION.md)。
 
@@ -9,81 +9,39 @@
 
 ## 0. 角色与前置条件
 
-两类机器：
+> **前提：先按 [docs/DEPLOY.md](../DEPLOY.md) 部署好 dfkv 集群(server + MDS)。**
+
+推理节点要求：
 
 | 角色 | 跑什么 | 要求 |
 |---|---|---|
-| **推理节点** | vLLM + LMCache + dfkv connector | GPU；已装 vLLM、LMCache (≥0.4.5)；编译需 cmake≥3.20、gcc/g++ |
-| **缓存节点**（≥1 台）| `dfkv_server` | 有数据盘（如 NVMe）；编译需 cmake、gcc/g++；走 RDMA 还需 `libibverbs-dev` |
+| **推理节点** | vLLM + LMCache + dfkv connector | GPU；已装 vLLM、LMCache (≥0.4.5)；connector 是纯 Python 包(ctypes 调 `libdfkv.so`) |
 
 网络要求：
 - 推理节点必须能 TCP 连到每台缓存节点的 dfkv 端口。
-- 若用 RDMA，推理节点与缓存节点要在**同一 IB/RoCE 网络**（否则用 TCP，见第 4 步）。
+- 若用 RDMA，推理节点与缓存节点要在**同一 IB/RoCE 网络**（否则用 TCP，见第 2 步）。
 
 下文用占位符，请替换成你的实际值：
 - `<CACHE1_IP>` `<CACHE2_IP>` … 缓存节点 IP
-- `<DFKV_SRC>` dfkv 源码目录、`<LIBDFKV>` 编译出的 `libdfkv.so` 路径
+- `<DFKV_SRC>` dfkv 源码目录、`<LIBDFKV>` 部署好的 `libdfkv.so` 路径
 
 ---
 
-## 第 1 步：编译 dfkv
-
-推理节点和缓存节点都要编译（同一份源码，产物不同）。
-
-```bash
-git clone -b feat/lmcache_connector https://github.com/dingodb/dfkv.git
-cd dfkv
-# RDMA 版（推荐，自动带 TCP 回退）；只要 TCP 就把 ON 改成 OFF
-cmake -S . -B build-rdma -DDFKV_WITH_RDMA=ON -DDFKV_BUILD_TESTS=OFF
-cmake --build build-rdma -j"$(nproc)" --target dfkv dfkv_server
-```
-
-产物：
-- `build-rdma/libdfkv.so` —— **推理节点** connector 通过 ctypes 加载的库。
-- `build-rdma/dfkv_server` —— **缓存节点** 的缓存服务进程。
-
-> 访问 github 需要代理时：`ALL_PROXY=socks5://<proxy_ip:port> git clone ...`。
-
----
-
-## 第 2 步：在每台缓存节点启动 dfkv_server
-
-每台缓存节点起一个 `dfkv_server`，指定数据盘目录、端口和容量：
-
-```bash
-# TCP + RDMA 都监听（RDMA 设备名用本机的，如 mlx5_0 / ib0；查 `ls /sys/class/infiniband`）
-dfkv_server \
-  --dir /data/disk0/dfkv,/data/disk1/dfkv \   # 逗号分隔多块盘
-  --port 18800 \                              # TCP 端口
-  --rdma-port 18801 \                         # RDMA 端口（不要 RDMA 就去掉这两行）
-  --rdma-dev mlx5_0 \
-  --cap 214748364800                          # 该节点总容量（字节），按盘量设
-```
-
-启动成功会打印 `PORT 18800` 并常驻。**记下每台节点的 `<IP>:<端口>`**，第 4 步要用：
-- 走 TCP → 用 `--port`（如 `<CACHE1_IP>:18800`）
-- 走 RDMA → 用 `--rdma-port`（如 `<CACHE1_IP>:18801`）
-
-> 生产环境想让客户端自动发现节点增减，可改用 MDS 发现模式（`dfkv_mds` + etcd + `dfkv_server --mds ...`），
-> 见根目录 [../DEPLOY.md](../DEPLOY.md)；本指南用更简单的**静态成员**模式。
-
----
-
-## 第 3 步：在推理节点安装 connector
+## 第 1 步：在推理节点安装 connector
 
 装到 vLLM 所在的 Python 环境（venv/conda）里：
 
 ```bash
 source /path/to/your/vllm-venv/bin/activate
 pip install <DFKV_SRC>/integration/lmcache       # 纯 Python wheel，不编译
-export DFKV_LIB=<DFKV_SRC>/build-rdma/libdfkv.so  # 指向第 1 步编出的库
+export DFKV_LIB=<LIBDFKV>                          # 指向部署好的 libdfkv.so
 ```
 
 `dfkv-connector` 是纯 Python 包（通过 ctypes 调用 `libdfkv.so`），无需匹配 ABI。
 
 ---
 
-## 第 4 步：写 LMCache 配置 `lmcache.yaml`
+## 第 2 步：写 LMCache 配置 `lmcache.yaml`
 
 新建一个 LMCache 配置文件，启用 dfkv 插件。**TCP 版**（最简单，先跑通用这个）：
 
@@ -98,10 +56,10 @@ extra_config:
   # 静态成员：列出每台缓存节点的 name=ip:TCP端口，逗号分隔；末尾 /<group> 任意填
   remote_storage_plugin.dfkv.url:         dfkv://c1=<CACHE1_IP>:18800,c2=<CACHE2_IP>:18800/g1
   remote_storage_plugin.dfkv.membership:  static
-  remote_storage_plugin.dfkv.lib:         <DFKV_SRC>/build-rdma/libdfkv.so
+  remote_storage_plugin.dfkv.lib:         <LIBDFKV>
 ```
 
-**RDMA 版**：只改两点 —— URL 用 **RDMA 端口（18801）**，并在第 5 步给 vLLM 进程加 `export DFKV_RDMA=1`：
+**RDMA 版**：只改两点 —— URL 用 **RDMA 端口（18801）**，并在第 3 步给 vLLM 进程加 `export DFKV_RDMA=1`：
 
 ```yaml
   remote_storage_plugin.dfkv.url:         dfkv://c1=<CACHE1_IP>:18801,c2=<CACHE2_IP>:18801/g1
@@ -109,17 +67,27 @@ extra_config:
 
 > 跨网卡（推理节点与缓存节点的 RDMA 设备名不同，如 a100 是 `ib6s200p0`、缓存节点是 `mlx5_0`）时，
 > **不要**在推理节点设 `DFKV_RDMA_DEV`：客户端会用本机第一个设备、并让服务端用它自己的 `--rdma-dev`。
+> 同轨同网卡且要多轨时，`DFKV_RDMA_DEV` 用逗号列表列全部口（标准节点 8×400G：
+> `ib7s400p0,ib7s400p1,ib7s400p2,ib7s400p3,ib7s400p4,ib7s400p5,ib7s400p6,ib7s400p7`；hd04 当前仅 p0,p1 up）。
+
+> **生产推荐 MDS 动态发现**（取代静态成员，节点增减自动生效）：把 `membership` 改为 `mds`、
+> `url` 的 endpoint 改成 dfkv_mds 层的 `ip:port` 列表（组名走 URL 末尾 `/<group>`），
+> 可选 `remote_storage_plugin.dfkv.mds_poll_ms`（默认 3000）。MDS 层如何部署见 [../DEPLOY.md](../DEPLOY.md) §4。
+> ```yaml
+>   remote_storage_plugin.dfkv.membership: mds
+>   remote_storage_plugin.dfkv.url:        dfkv://192.168.0.8:28150,192.168.0.9:28150,192.168.0.10:28150/glm
+> ```
 
 ---
 
-## 第 5 步：启动 vLLM
+## 第 3 步：启动 vLLM
 
 让 vLLM 用 LMCache 连接器，并指向上面的 yaml：
 
 ```bash
 export LMCACHE_USE_EXPERIMENTAL=True
 export LMCACHE_CONFIG_FILE=/path/to/lmcache.yaml
-export DFKV_LIB=<DFKV_SRC>/build-rdma/libdfkv.so
+export DFKV_LIB=<LIBDFKV>
 # 只有走 RDMA 才加这一行（TCP 不要加）：
 export DFKV_RDMA=1
 
@@ -131,7 +99,7 @@ vllm serve <model_path> \
 
 ---
 
-## 第 6 步：验证
+## 第 4 步：验证
 
 1. **连接器已加载**（vLLM 启动日志里应有，且没有回退到 blackhole）：
    ```
