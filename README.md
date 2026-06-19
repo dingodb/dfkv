@@ -1,11 +1,16 @@
-# dfkv — distributed KV cache for SGLang HiCache
+# dfkv — distributed KV cache for LLM inference (SGLang · LMCache · vLLM)
 
 [![CI](https://github.com/dingodb/dfkv/actions/workflows/ci.yml/badge.svg)](https://github.com/dingodb/dfkv/actions/workflows/ci.yml)
 
-A small, **self-contained** distributed key-value cache that plugs into SGLang's
-HiCache as its L3 external KV store. Built to pool GPU-node NVMe SSDs into a
-shared, large-capacity KVCache pool for LLM inference (e.g. GLM-5.1 / MLA),
-**without any DingoFS / brpc / MDS / S3-RADOS dependency** — it runs on its own.
+A small, **self-contained** distributed key-value cache that pools GPU-node NVMe
+SSDs into a shared, large-capacity KV pool for LLM inference (e.g. GLM-5.1 / MLA,
+DeepSeek-V4), **without any DingoFS / brpc / S3-RADOS dependency** — it runs on
+its own (only its built-in MDS + etcd for dynamic membership). It plugs into
+three engines through thin adapters over one portable core:
+
+- **SGLang HiCache** as an L3 external KV store (`--hicache-storage-backend dynamic`).
+- **LMCache** as a `RemoteConnector`.
+- **vLLM** directly as a `KVConnectorBase_V1` (GPUDirect RDMA, no LMCache).
 
 > Origin: extracted from the DingoFS branch `feat/kvcache-sglang`
 > (`src/cache/kvclient`). The portable core has zero coupling to DingoFS, so it
