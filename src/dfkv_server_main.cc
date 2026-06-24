@@ -193,6 +193,7 @@ int main(int argc, char** argv) {
     }
     dfkv::MemberInfo self{node_id, aip, aport,
                           static_cast<uint32_t>(weight < 1 ? 1 : weight)};
+    self.tcp_port = static_cast<uint32_t>(srv.port());  // TCP wire/stat port -> `dfkvctl stat`
     registrar = std::make_unique<dfkv::MdsRegistrar>(std::move(eps), group, self);
     registrar->Start();
     DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group + " id=" + node_id +

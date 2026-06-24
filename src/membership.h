@@ -14,17 +14,27 @@ namespace dfkv {
 struct MemberInfo {
   std::string id;
   std::string ip;
-  uint32_t port = 0;
+  uint32_t port = 0;       // data-path port clients dial (the rdma-port in an RDMA deploy)
   uint32_t weight = 1;
+  uint32_t tcp_port = 0;   // TCP wire/stat port that serves kStats; 0 = unknown / older peer.
+  // tcp_port rides an OPTIONAL trailing field in Encode/DecodeMembers, so peers that don't
+  // send it still interoperate. It is intentionally EXCLUDED from operator== and MembersEpoch:
+  // it is orthogonal metadata (not part of ring placement), and its only consumer (dfkvctl
+  // stat) re-fetches every run, so a change need not trigger a ring rebuild.
   bool operator==(const MemberInfo& o) const {
     return id == o.id && ip == o.ip && port == o.port && weight == o.weight;
   }
 };
 
+// Magic tag marking the OPTIONAL tcp_port extension appended after the member list.
+// Old encodings carry no trailing bytes, so this tag is unambiguous when present.
+constexpr uint32_t kMemberExtTcpPort = 0x54435031u;  // "TCP1"
+
 // Wire format for a membership view. Register payload = 1 member; ListMembers
 // response = N members + the epoch (etcd revision) clients compare to skip
 // rebuilding an unchanged ring. Layout (host-endian via net::):
 //   epoch u64 | count u32 | repeat{ idlen u32, id, iplen u32, ip, port u32, weight u32 }
+//   [ optional: kMemberExtTcpPort u32 | repeat count { tcp_port u32 } ]  <- old decoders ignore
 // (host-endian via net::; correct between same-endianness peers — see net_util.h)
 inline std::string EncodeMembers(const std::vector<MemberInfo>& ms,
                                  uint64_t epoch) {
@@ -42,6 +52,10 @@ inline std::string EncodeMembers(const std::vector<MemberInfo>& ms,
     net::PutU32(num, m.port);   out.append(num, 4);
     net::PutU32(num, m.weight); out.append(num, 4);
   }
+  // Optional trailing extension: a magic tag + one tcp_port per member, same order.
+  // Older decoders stop after the N members above and never read these bytes.
+  net::PutU32(num, kMemberExtTcpPort); out.append(num, 4);
+  for (const auto& m : ms) { net::PutU32(num, m.tcp_port); out.append(num, 4); }
   return out;
 }
 
@@ -67,6 +81,13 @@ inline bool DecodeMembers(const char* p, size_t n,
     m.port = net::GetU32(p + off);   off += 4;
     m.weight = net::GetU32(p + off);  off += 4;
     out->push_back(std::move(m));
+  }
+  // Optional tcp_port extension (see EncodeMembers). Present iff the magic tag plus
+  // `count` ports follow; absent from older peers' encodings -> tcp_port stays 0.
+  if (off + 4 <= n && net::GetU32(p + off) == kMemberExtTcpPort) {
+    off += 4;
+    if (off + static_cast<size_t>(count) * 4 <= n)
+      for (uint32_t i = 0; i < count; ++i) { (*out)[i].tcp_port = net::GetU32(p + off); off += 4; }
   }
   return true;
 }

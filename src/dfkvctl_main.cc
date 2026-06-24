@@ -4,7 +4,10 @@
  *   dfkvctl --members "n=ip:port,..." exist <key>
  *   dfkvctl stat <node-ip:port>           # fetch a node's Prometheus metrics
  *   dfkvctl ring --mds <ep,...> --group <g>          # show the cluster ring + vnode share
- *   dfkvctl stat --all --mds <ep,...> --group <g>    # per-node metrics + cluster aggregate
+ *   dfkvctl stat --all --mds <ep,...> --group <g> [--stat-port <p>]  # per-node metrics + aggregate
+ *     The MDS now hands back each node's TCP stat port (MemberInfo.tcp_port), so stat --all
+ *     reaches nodes automatically even in RDMA deploys. --stat-port <p> stays as a manual
+ *     override (e.g. for older servers that predate tcp_port registration).
  * Geometry flags (must match the writer for get to hit): --model_hash --page_size
  *   --dtype_tag --layer_num --head_num --head_dim --mla 0|1 --tp_size --tp_rank */
 #include <cstdint>
@@ -68,7 +71,8 @@ static int CmdRing(const std::string& mds, const std::string& group) {
   return 0;
 }
 
-static int CmdStatAll(const std::string& mds, const std::string& group) {
+static int CmdStatAll(const std::string& mds, const std::string& group,
+                      uint32_t stat_port) {
   if (mds.empty()) { std::fprintf(stderr, "stat --all needs --mds ip:port[,...]\n"); return 2; }
   std::vector<MemberInfo> ms;
   if (!QueryMembers(mds, group, &ms)) { std::fprintf(stderr, "stat --all: MDS query failed\n"); return 1; }
@@ -77,7 +81,11 @@ static int CmdStatAll(const std::string& mds, const std::string& group) {
   std::printf("%-14s %-20s %10s %9s %9s %9s %6s\n",
               "ID", "ADDR", "USED_MB", "OBJECTS", "HITS", "MISSES", "HIT%");
   for (const auto& m : ms) {
-    std::string addr = m.ip + ":" + std::to_string(m.port), text;
+    // Port to reach kStats on: an explicit --stat-port wins; else the server-registered
+    // TCP wire/stat port from the MDS (m.tcp_port); else fall back to the member's data
+    // port (the rdma-port in an RDMA deploy, where it would print (unreachable)).
+    uint32_t sp = stat_port ? stat_port : (m.tcp_port ? m.tcp_port : m.port);
+    std::string addr = m.ip + ":" + std::to_string(sp), text;
     if (t.Stats(addr, &text) != Status::kOk) {
       std::printf("%-14s %-20s   (unreachable)\n", m.id.c_str(), addr.c_str());
       continue;
@@ -123,6 +131,7 @@ int main(int argc, char** argv) {
   uint32_t page = 64, dtype = 0x46384534u, layer = 78, head = 1, hd = 576, tps = 8, tpr = 0, mla = 1;
   std::string mds, group = "default";
   bool all = false;
+  uint32_t stat_port = 0;  // override; 0 = use MDS-provided tcp_port, else the member's port
   std::vector<std::string> pos;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -132,6 +141,7 @@ int main(int argc, char** argv) {
     else if (a == "--mds" && i + 1 < argc) mds = argv[++i];
     else if (a == "--group" && i + 1 < argc) group = argv[++i];
     else if (a == "--all") all = true;
+    else if (a == "--stat-port") nv32(&stat_port);
     else if (a == "--model_hash") nv(&model_hash);
     else if (a == "--page_size") nv32(&page);
     else if (a == "--dtype_tag") nv32(&dtype);
@@ -149,8 +159,8 @@ int main(int argc, char** argv) {
   if (cmd == "ring") return CmdRing(mds, group);
 
   if (cmd == "stat") {
-    if (all) return CmdStatAll(mds, group);
-    if (pos.size() < 2) { std::fprintf(stderr, "stat <node-ip:port>  |  stat --all --mds ...\n"); return 2; }
+    if (all) return CmdStatAll(mds, group, stat_port);
+    if (pos.size() < 2) { std::fprintf(stderr, "stat <node-ip:port>  |  stat --all --mds ... [--stat-port <p>]\n"); return 2; }
     TcpTransport t; std::string text;
     if (t.Stats(pos[1], &text) != Status::kOk) { std::fprintf(stderr, "stat failed\n"); return 1; }
     std::fputs(text.c_str(), stdout);

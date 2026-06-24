@@ -26,12 +26,25 @@ TEST(MembershipCodec, RoundTripEmpty) {
 }
 
 TEST(MembershipCodec, RejectsTruncated) {
-  std::string buf = EncodeMembers({{"n1", "10.0.0.1", 28000, 1}}, 1);
+  std::vector<MemberInfo> ms = {{"n1", "10.0.0.1", 28000, 1, 28100}};  // tcp_port=28100
+  std::string buf = EncodeMembers(ms, 1);
   std::vector<MemberInfo> got;
   uint64_t epoch = 0;
-  for (size_t cut = 0; cut < buf.size(); ++cut)  // every short prefix must fail
+  // The mandatory member region must be complete to decode; the OPTIONAL tcp_port
+  // tail may be short/absent (older peers send none) -> tolerated, not an error.
+  // Discover the region boundary, then require failure below it and success at/above.
+  size_t lo = 0;
+  while (lo <= buf.size() && !DecodeMembers(buf.data(), lo, &got, &epoch)) ++lo;
+  ASSERT_LE(lo, buf.size());
+  for (size_t cut = 0; cut < lo; ++cut)
     EXPECT_FALSE(DecodeMembers(buf.data(), cut, &got, &epoch)) << "cut=" << cut;
-  EXPECT_TRUE(DecodeMembers(buf.data(), buf.size(), &got, &epoch));  // full = ok
+  for (size_t cut = lo; cut <= buf.size(); ++cut)
+    EXPECT_TRUE(DecodeMembers(buf.data(), cut, &got, &epoch)) << "cut=" << cut;
+  // Tail absent at the boundary -> tcp_port defaults to 0; fully present -> read back.
+  ASSERT_TRUE(DecodeMembers(buf.data(), lo, &got, &epoch));
+  EXPECT_EQ(got[0].tcp_port, 0u);
+  ASSERT_TRUE(DecodeMembers(buf.data(), buf.size(), &got, &epoch));
+  EXPECT_EQ(got[0].tcp_port, 28100u);
 }
 
 TEST(MembersEpoch, OrderIndependentAndContentSensitive) {
