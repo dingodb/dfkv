@@ -194,10 +194,13 @@ jobs:
              build-static/dfkv_smoke build-static/dfkvctl "$PKG/bin/"
           cp build-static/libdfkv.so "$PKG/lib/"
           cp python/dfkv_hicache.py python/dfkv_access_log.py python/dfkv_metrics.py "$PKG/python/"
+          # 共享遥测包：dfkv_hicache.py 顶部 `from dfkv_telemetry import ...`，
+          # 不一起打包则 SGLang 插件加载即 ImportError。
+          cp -r python/dfkv_telemetry "$PKG/python/"
           # vLLM / LMCache 连接器（源码 Python 包，随 release 一起发，便于免源码直接 pip install 对接）
           mkdir -p "$PKG/integration"
           cp -r integration/vllm integration/lmcache "$PKG/integration/"
-          find "$PKG/integration" -type d \( -name '__pycache__' -o -name '*.egg-info' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$PKG/python" "$PKG/integration" -type d \( -name '__pycache__' -o -name '*.egg-info' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + 2>/dev/null || true
           cp README.md VERSION LICENSE "$PKG/"
           tar czf "${PKG}.tar.gz" "$PKG"
           sha256sum "${PKG}.tar.gz"
