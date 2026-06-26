@@ -21,6 +21,7 @@ from dfkv_access_log import (access_log, configure as _configure_access_log,
                             fmt_bytes as _fmt_bytes, fmt_pools as _fmt_pools,
                             fmt_pool_results as _fmt_pool_results)
 from dfkv_metrics import Metrics as _Metrics, ClientStatsPoller as _ClientStatsPoller
+from dfkv_telemetry import metrics as _push_metrics, config as _tcfg
 
 _FLAG_IS_MLA = 0x1
 
@@ -71,9 +72,21 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_set_batch_concurrency.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_stats_snapshot.restype = ctypes.c_uint64
     lib.dfkv_stats_snapshot.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64]
+    lib.dfkv_version.restype = ctypes.c_char_p
+    lib.dfkv_version.argtypes = []
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [ctypes.c_void_p]
     return lib
+
+
+def _native_version(lib) -> str:
+    """libdfkv.so version via the C dfkv_version(); "" if the symbol is missing
+    (older lib) or the call fails. Never raises."""
+    try:
+        v = lib.dfkv_version()
+        return v.decode("utf-8", "replace") if v else ""
+    except Exception:
+        return ""
 
 
 def _read_snapshot(lib, h) -> str:
@@ -125,6 +138,25 @@ class DfkvHiCache(HiCacheStorage):
         # Client-side read/write counters (Prometheus when available). Lets ops
         # confirm SGLang->dfkv volume from /metrics instead of parsing access logs.
         self._metrics = _Metrics(self.tp_rank)
+        # Load the native lib up front so its version can ride on the fleet-metrics
+        # resource (dfkv_native_version). The actual client (dfkv_open) is created
+        # later, inside the access-log "init" block. The plugin ships with the dfkv
+        # repo, so its package version == the native lib version.
+        self._lib = _load_lib(cfg.get("lib_path"))
+        native_ver = _native_version(self._lib)
+        # Unified fleet metrics pushed over OTLP to the central Collector (off by
+        # default; zero cost when DFKV_METRICS_ENABLED is unset). Powers the
+        # cross-connector global dashboard (per connector_id / type).
+        _push_metrics.configure(cfg, connector_type=_tcfg.TYPE_HICACHE,
+                                tp_rank=self.tp_rank, model=self.model,
+                                version=native_ver, native_version=native_ver)
+        # When metrics are on, enable the C client's active per-peer latency probe
+        # (read at dfkv_open below) so every cache node shows avg/max latency even
+        # when idle. extra_config 'probe_interval_ms' overrides; 0 disables.
+        if _push_metrics.is_enabled():
+            probe_ms = int(float(_tcfg.resolve(
+                cfg, "probe_interval_ms", _tcfg.ENV_PROBE_INTERVAL_MS, 5000)))
+            os.environ["DFKV_PROBE_INTERVAL_MS"] = str(probe_ms)
         # Log the open/discovery setup (the access log is live from here on; the
         # earlier interface_v1 check raises before config is resolved).
         with access_log("init", lambda: f"{self._alog_tag} {self.model} "
@@ -158,7 +190,8 @@ class DfkvHiCache(HiCacheStorage):
                       "rail selection in the client.", file=_sys.stderr, flush=True)
             if cfg.get("rdma_numa"):
                 os.environ.setdefault("DFKV_RDMA_NUMA", "1")
-            self._lib = _load_lib(cfg.get("lib_path"))
+            # self._lib was loaded above (before configure) so the native version
+            # could be reported; dfkv_open uses that same handle here.
             flags = _FLAG_IS_MLA if self.is_mla else 0
             model_hash = int(cfg.get("model_hash", 0)) & 0xFFFFFFFFFFFFFFFF
             self._h = self._lib.dfkv_open(
@@ -210,12 +243,25 @@ class DfkvHiCache(HiCacheStorage):
             self._poller = _ClientStatsPoller(
                 lambda: _read_snapshot(self._lib, self._h), self.tp_rank, poll_s)
             self._poller.start()
+        # Per-cache-node latency: parse the same snapshot and push avg/max per peer
+        # over OTLP (no-op unless metrics enabled). Off the request path.
+        peer_poll_s = float(_tcfg.resolve(
+            cfg, "peer_latency_poll_s", _tcfg.ENV_PEER_POLL_S,
+            poll_s if poll_s > 0 else 10.0))
+        self._peer_lat_poller = _push_metrics.start_peer_latency_poller(
+            lambda: _read_snapshot(self._lib, self._h), peer_poll_s)
 
     def __del__(self):
         try:
             if getattr(self, "_poller", None):
                 self._poller.stop()
                 self._poller = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_peer_lat_poller", None):
+                self._peer_lat_poller.stop()
+                self._peer_lat_poller = None
         except Exception:
             pass
         try:
@@ -352,6 +398,8 @@ class DfkvHiCache(HiCacheStorage):
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"ok {sum(res)}/{n}"
             self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=sum(ss), seconds=dur)
+            if _push_metrics.is_enabled():
+                _push_metrics.record("put", keys=n, nbytes=sum(ss), seconds=dur)
             return res
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
@@ -366,6 +414,8 @@ class DfkvHiCache(HiCacheStorage):
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"hits={sum(res)}/{n}"
             self._metrics.on_get(pages=n, hit_pages=sum(res), nbytes=sum(ss), seconds=dur)
+            if _push_metrics.is_enabled():
+                _push_metrics.record("get", keys=n, nbytes=sum(ss), seconds=dur)
             return res
 
     def batch_exists(self, keys, extra_info=None) -> int:

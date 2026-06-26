@@ -90,6 +90,19 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_transport_mode.restype = c_char_p
     lib.dfkv_transport_mode.argtypes = [c_void_p]
 
+    # const char* dfkv_version(void) -> libdfkv.so version (process-global).
+    lib.dfkv_version.restype = c_char_p
+    lib.dfkv_version.argtypes = []
+
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [c_void_p]
     return lib
+
+
+def native_version(lib: ctypes.CDLL) -> str:
+    """libdfkv.so version via the C dfkv_version(); "" if missing/older lib."""
+    try:
+        v = lib.dfkv_version()
+        return v.decode("utf-8", "replace") if v else ""
+    except Exception:
+        return ""

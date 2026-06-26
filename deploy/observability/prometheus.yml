@@ -1,0 +1,27 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Connector fleet metrics, pushed via OTLP and re-exposed by the Collector.
+  - job_name: dfkv-connectors
+    honor_labels: true
+    static_configs:
+      - targets: ['otel-collector:8889']
+
+  # Collector self-telemetry.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ['otel-collector:8888']
+
+  # dfkv C++ daemons are scraped directly (pull) — few and long-lived. They run on
+  # the HOST (not in compose), so use host.docker.internal (compose adds the
+  # host-gateway alias on Linux). Start them with --metrics-port to enable /metrics.
+  - job_name: dfkv_server
+    static_configs:
+      - targets: ['host.docker.internal:28010']
+    # mark down targets as such rather than failing the whole config
+    honor_timestamps: true
+  - job_name: dfkv_mds
+    static_configs:
+      - targets: ['host.docker.internal:9410']

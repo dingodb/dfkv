@@ -11,10 +11,12 @@
 #define DFKV_KV_CLIENT_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -22,6 +24,7 @@
 #include "membership.h"
 #include "mds_member_poller.h"
 #include "peer_health.h"
+#include "peer_latency.h"
 #include "transport.h"
 #include "value_header.h"
 
@@ -125,14 +128,23 @@ class KVClient {
   bool RefreshMembers(const std::string& seed_addr);
 
   // Client-side Prometheus metrics text (ops served, IO errors, peer health
-  // transitions, per-peer errors) plus transport-level counters (RDMA per-rail
-  // connections, MR regions). Surfaced to the plugin via the C ABI.
+  // transitions, per-peer errors, per-peer latency) plus transport-level
+  // counters (RDMA per-rail connections, MR regions). Surfaced via the C ABI.
   std::string MetricsSnapshot() const;
   const std::string& TransportMode() const { return transport_reason_; }
+
+  // Start/stop the active per-peer latency prober: a background thread that
+  // sends a cheap round trip (kExist of a sentinel key) to each known member
+  // every `interval_ms`, so per-node avg/max latency is visible even when the
+  // client is idle. interval_ms<=0 is a no-op. Also auto-started from the ctor
+  // when DFKV_PROBE_INTERVAL_MS>0. Thread-safe vs Stop.
+  void StartProbe(int interval_ms);
+  void StopProbe();
 
  private:
   std::string Route(const std::string& key) const;
   uint64_t NowMs() const;
+  void ProbeLoop();
 
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
@@ -145,6 +157,14 @@ class KVClient {
   std::atomic<size_t> batch_concurrency_{8};
   std::unique_ptr<MdsMemberPoller> poller_;
   PeerHealth health_;
+
+  // Active per-peer latency prober (off the datapath; own thread).
+  PeerLatency peer_lat_;
+  std::atomic<bool> probe_running_{false};
+  int probe_interval_ms_ = 0;
+  std::thread probe_th_;
+  std::mutex probe_mu_;
+  std::condition_variable probe_cv_;
 };
 
 }  // namespace dfkv

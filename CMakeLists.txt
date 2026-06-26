@@ -107,6 +107,11 @@ install(FILES
   python/dfkv_access_log.py
   python/dfkv_metrics.py
   DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python)
+# Shared telemetry package (push-metrics now; tracing later). Canonical source;
+# the vLLM/LMCache pip connectors vendor a byte-identical copy (drift-guarded).
+install(DIRECTORY python/dfkv_telemetry
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python
+  FILES_MATCHING PATTERN "*.py")
 
 # --- tests ---
 if(DFKV_BUILD_TESTS)
@@ -142,6 +147,11 @@ if(DFKV_BUILD_TESTS)
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests/python)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so")
+    # Shared telemetry layer: pure-python, no build/lib needed (OTel-push test
+    # self-skips when the SDK is absent). Includes the vendored-copy drift guard.
+    add_test(NAME python_telemetry
+      COMMAND ${PYTHON3} -m unittest test_dfkv_telemetry test_telemetry_vendor_sync
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests/python)
   endif()
 
   # CLI tools integration smoke (dfkv_server + dfkv_smoke + dfkvctl)

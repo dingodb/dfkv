@@ -25,6 +25,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List, Optional, Sequence, Tuple
 
 from .access_log import access_log
+from ._telemetry import config as _tcfg
+from ._telemetry import metrics as _push_metrics
 
 __all__ = ["DfkvNativeClient", "load_lib"]
 
@@ -82,9 +84,20 @@ def load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_start_mds_discovery.argtypes = [c_void_p, c_char_p, c_char_p, c_int]
     lib.dfkv_transport_mode.restype = c_char_p
     lib.dfkv_transport_mode.argtypes = [c_void_p]
+    lib.dfkv_version.restype = c_char_p
+    lib.dfkv_version.argtypes = []
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [c_void_p]
     return lib
+
+
+def _native_version(lib: ctypes.CDLL) -> str:
+    """libdfkv.so version via the C dfkv_version(); "" if missing/older lib."""
+    try:
+        v = lib.dfkv_version()
+        return v.decode("utf-8", "replace") if v else ""
+    except Exception:
+        return ""
 
 
 def _mv_ptr(mv: memoryview) -> Tuple[int, Any]:
@@ -179,6 +192,14 @@ class DfkvNativeClient:
                 max_workers=max(1, int(get_parallelism)),
                 thread_name_prefix="dfkv-io",
             )
+            # Unified fleet metrics pushed over OTLP (off by default; zero cost
+            # when DFKV_METRICS_ENABLED is unset). LMCache had no dfkv metrics
+            # before — this gives it parity with the SGLang/vLLM connectors. Report
+            # the connector package + libdfkv.so versions for fleet skew tracking.
+            _push_metrics.configure(
+                {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(g["tp_rank"]),
+                version=_tcfg.dist_version("dfkv-connector"),
+                native_version=_native_version(self._lib))
             r.result = f"ok regs={regs} transport={self.transport_mode}"
 
     # ------------------------------------------------------------------
@@ -250,8 +271,11 @@ class DfkvNativeClient:
         self, keys: Sequence[str], bufs: Sequence[memoryview]
     ) -> Tuple[bool, Optional[List[bool]]]:
         n = len(keys)
-        with access_log("native.batch_set",
-                        lambda: f"{n} keys, {_total_size(bufs)} bytes") as r:
+        with _push_metrics.op("put", num_keys=n) as _m, \
+                access_log("native.batch_set",
+                           lambda: f"{n} keys, {_total_size(bufs)} bytes") as r:
+            if _m:
+                _m.bytes = _total_size(bufs)
             ok, per_key = await self._loop.run_in_executor(
                 self._executor, self._batch_set_blocking, list(keys), list(bufs)
             )
@@ -262,11 +286,14 @@ class DfkvNativeClient:
         self, keys: Sequence[str], bufs: Sequence[memoryview]
     ) -> Tuple[bool, Optional[List[bool]], List[int]]:
         n = len(keys)
-        with access_log("native.batch_get",
-                        lambda: f"{n} keys, {_total_size(bufs)} bytes") as r:
+        with _push_metrics.op("get", num_keys=n) as _m, \
+                access_log("native.batch_get",
+                           lambda: f"{n} keys, {_total_size(bufs)} bytes") as r:
             ok, per_key, lengths = await self._loop.run_in_executor(
                 self._executor, self._batch_get_blocking, list(keys), list(bufs)
             )
+            if _m:
+                _m.bytes = sum(lengths)
             hits = sum(1 for b in per_key if b)
             r.result = f"hits={hits}/{n}"
             return ok, per_key, lengths
@@ -275,7 +302,8 @@ class DfkvNativeClient:
         self, keys: Sequence[str]
     ) -> Optional[List[bool]]:
         n = len(keys)
-        with access_log("native.batch_exists", lambda: f"{n} keys") as r:
+        with _push_metrics.op("exist", num_keys=n), \
+                access_log("native.batch_exists", lambda: f"{n} keys") as r:
             per_key = await self._loop.run_in_executor(
                 self._executor, self._batch_exists_blocking, list(keys)
             )

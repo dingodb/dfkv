@@ -91,6 +91,13 @@ int dfkv_batch_get_auto_sg(dfkv_client_t c, const char** keys, void*** dsts,
 // the deltas onto its Prometheus counters.
 uint64_t dfkv_stats_snapshot(dfkv_client_t c, char* buf, uint64_t cap);
 
+// dfkv native library version (compile-time DFKV_VERSION, e.g. "1.6.3" or "dev").
+// Process-global (no client handle); never NULL; the returned string is static
+// and valid for the process lifetime. Connectors report it as the
+// dfkv_native_version metric label so the version of the linked libdfkv.so is
+// visible per connector instance (alongside daemons' dfkv_build_info gauge).
+const char* dfkv_version(void);
+
 void dfkv_close(dfkv_client_t c);
 
 #ifdef __cplusplus

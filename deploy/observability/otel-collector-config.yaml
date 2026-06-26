@@ -1,0 +1,50 @@
+# OpenTelemetry Collector — receives OTLP from the dfkv connectors (metrics now,
+# traces later) and fans out: metrics -> a Prometheus scrape endpoint (:8889),
+# traces -> Tempo. The dfkv C++ server/mds are scraped directly by Prometheus
+# (pull); only the many/dynamic connectors push here.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+  batch: {}
+
+exporters:
+  # Connector identity (connector_id/type/host/pid/tp_rank) rides on OTLP
+  # *resource* attributes; resource_to_telemetry_conversion copies them onto each
+  # series as labels so the dashboard can group/filter by connector. Metric names
+  # are passed through verbatim (add_metric_suffixes:false) so they match the
+  # instrument names the connectors emit (dfkv_connector_*).
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+    add_metric_suffixes: false
+    enable_open_metrics: true
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    metrics:
+      level: basic
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus, debug]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo, debug]

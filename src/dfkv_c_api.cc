@@ -9,6 +9,7 @@
 #include "kv_client.h"
 #include "log.h"
 #include "value_header.h"
+#include "version.h"
 
 using dfkv::KVClient;
 using dfkv::ValueHeader;
@@ -258,6 +259,8 @@ uint64_t dfkv_stats_snapshot(dfkv_client_t c, char* buf, uint64_t cap) {
   }
   return full;
 }
+
+const char* dfkv_version(void) { return dfkv::Version(); }
 
 void dfkv_close(dfkv_client_t c) { delete static_cast<KVClient*>(c); }
 

@@ -9,10 +9,12 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -88,6 +90,21 @@ TEST_F(KVClientTest, RefreshMembersDiscoversClusterFromSeed) {
     ASSERT_TRUE(c.Get(k, &out[0], out.size())) << k;
     EXPECT_EQ(out, v);
   }
+}
+
+TEST_F(KVClientTest, ActiveProbePopulatesPerPeerLatency) {
+  nodes_.push_back(StartNode("probe1"));
+  KVClient c({{ "p", nodes_[0]->addr }}, SelfHdr());
+  c.StartProbe(10);  // probe each member every 10ms (off the datapath)
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));  // several rounds
+  c.StopProbe();
+  const std::string snap = c.MetricsSnapshot();
+  // The probed node appears with a latency histogram + a max gauge.
+  const std::string peer = "peer=\"" + nodes_[0]->addr + "\"";
+  EXPECT_NE(snap.find("dfkv_client_peer_latency_seconds_count{" + peer + "}"),
+            std::string::npos) << snap;
+  EXPECT_NE(snap.find("dfkv_client_peer_latency_max_seconds{" + peer + "}"),
+            std::string::npos);
 }
 
 TEST_F(KVClientTest, MissReturnsFalseNotError) {

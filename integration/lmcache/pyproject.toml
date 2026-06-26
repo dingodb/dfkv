@@ -20,6 +20,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
+# Opt-in telemetry (OTLP push); zero-cost no-op when unset / not installed.
+otel = ["opentelemetry-sdk", "opentelemetry-exporter-otlp"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }

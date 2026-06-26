@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
@@ -68,6 +69,12 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
     t_ = owned_.get();
     DFKV_LOG_INFO("dfkv client transport=" + transport_reason_);
   }
+  // Opt-in active per-peer latency probe. Off unless DFKV_PROBE_INTERVAL_MS>0,
+  // so default behavior is unchanged (no background traffic).
+  if (const char* pe = std::getenv("DFKV_PROBE_INTERVAL_MS")) {
+    int ms = std::atoi(pe);
+    if (ms > 0) StartProbe(ms);
+  }
 }
 
 void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> members) {
@@ -109,7 +116,48 @@ void KVClient::StopMdsDiscovery() {
   if (poller_) { poller_->Stop(); poller_.reset(); }
 }
 
-KVClient::~KVClient() { StopMdsDiscovery(); }
+KVClient::~KVClient() { StopProbe(); StopMdsDiscovery(); }
+
+void KVClient::StartProbe(int interval_ms) {
+  if (interval_ms <= 0 || probe_running_.load(std::memory_order_relaxed)) return;
+  probe_interval_ms_ = interval_ms;
+  probe_running_.store(true, std::memory_order_relaxed);
+  probe_th_ = std::thread([this] { ProbeLoop(); });
+}
+
+void KVClient::StopProbe() {
+  if (!probe_running_.exchange(false, std::memory_order_relaxed)) return;
+  probe_cv_.notify_all();
+  if (probe_th_.joinable()) probe_th_.join();
+}
+
+void KVClient::ProbeLoop() {
+  // A sentinel key that no real workload writes; kExist of it is a cheap round
+  // trip that measures the node's responsiveness (kNotFound is a healthy reply).
+  const BlockKey probe = ToBlockKey("__dfkv_probe__");
+  while (probe_running_.load(std::memory_order_relaxed)) {
+    std::vector<std::string> addrs;
+    {
+      std::lock_guard<std::mutex> lk(ring_mu_);
+      addrs.reserve(addr_.size());
+      for (const auto& [name, a] : addr_) addrs.push_back(a);
+    }
+    for (const auto& a : addrs) {
+      if (!probe_running_.load(std::memory_order_relaxed)) break;
+      bool e = false;
+      auto t0 = std::chrono::steady_clock::now();
+      Status st = t_->Exist(a, probe, &e);
+      double sec = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t0).count();
+      // Only record real round trips; a transport IO error (e.g. connect refused)
+      // is fast and would skew latency, and is already counted by PeerHealth.
+      if (st != Status::kIOError) peer_lat_.Observe(a, sec);
+    }
+    std::unique_lock<std::mutex> lk(probe_mu_);
+    probe_cv_.wait_for(lk, std::chrono::milliseconds(probe_interval_ms_),
+                       [this] { return !probe_running_.load(std::memory_order_relaxed); });
+  }
+}
 
 std::string KVClient::MetricsSnapshot() const {
   std::string s;
@@ -117,6 +165,7 @@ std::string KVClient::MetricsSnapshot() const {
   s += "# TYPE dfkv_client_transport_info gauge\n";
   s += "dfkv_client_transport_info{transport=\"" + transport_reason_ + "\"} 1\n";
   s += health_.Render();
+  s += peer_lat_.Render();
   if (t_) s += t_->MetricsText();
   return s;
 }

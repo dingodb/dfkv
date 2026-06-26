@@ -15,10 +15,13 @@ Validated facts (hd04 H100 + IB, nvidia-peermem loaded):
     (``--rdma-port``), not the main ``--port``, when ``DFKV_RDMA=1``.
 """
 import ctypes
+import os
 from typing import Optional, Sequence
 
-from ._cabi import load_lib
+from ._cabi import load_lib, native_version
 from .access_log import access_log
+from ._telemetry import config as _tcfg
+from ._telemetry import metrics as _push_metrics
 
 c_void_p = ctypes.c_void_p
 c_char_p = ctypes.c_char_p
@@ -30,6 +33,19 @@ c_int = ctypes.c_int
 # isolation is by model_hash + key namespace. A KV pool sharing one model_hash
 # must share kv-cache-dtype / page-size / layout (see dfkv sharing-safety notes).
 _GEOMETRY_ZEROS = (0,) * 8
+
+
+def _env_rank() -> int:
+    """Best-effort TP/worker rank for the connector_id label (each rank is its own
+    process, so host:pid is already unique; this just adds readable detail)."""
+    for k in ("DFKV_TP_RANK", "LOCAL_RANK", "RANK"):
+        v = os.environ.get(k)
+        if v is not None:
+            try:
+                return int(v)
+            except ValueError:
+                pass
+    return 0
 
 
 class DfkvDeviceClient:
@@ -75,6 +91,15 @@ class DfkvDeviceClient:
                     f"dfkv_start_mds_discovery failed (rc={rc}, "
                     f"mds={mds_endpoints!r}, group={mds_group!r})"
                 )
+        # Unified fleet metrics pushed over OTLP to the central Collector (off by
+        # default; zero cost when DFKV_METRICS_ENABLED is unset). Env-driven so it
+        # needs no connector plumbing: set DFKV_METRICS_ENABLED + OTEL_*. Report
+        # both the connector package version and the linked libdfkv.so version so
+        # the dashboard can spot version skew across the fleet.
+        _push_metrics.configure(
+            {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
+            version=_tcfg.dist_version("dfkv-vllm"),
+            native_version=native_version(self._lib))
 
     @property
     def transport_mode(self) -> str:
@@ -101,7 +126,10 @@ class DfkvDeviceClient:
         of the single ``dfkv_put`` which returns 0=ok). We normalize here to the
         connector's "0 = ok" convention so callers don't have to know this."""
         n = len(keys)
-        with access_log("batch_put", lambda: f"{n} keys, {sum(sizes)} bytes") as r:
+        with _push_metrics.op("put", num_keys=n) as _m, \
+                access_log("batch_put", lambda: f"{n} keys, {sum(sizes)} bytes") as r:
+            if _m:
+                _m.bytes = sum(sizes)
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
             sarr = (c_uint64 * n)(*sizes)
@@ -120,7 +148,8 @@ class DfkvDeviceClient:
         ``caps[i]``). Returns ``(hits, lengths)``: ``hits[i]`` is 1 on hit, 0 on
         miss; ``lengths[i]`` is the true stored byte length on hit."""
         n = len(keys)
-        with access_log("batch_get_auto", lambda: f"{n} keys") as r:
+        with _push_metrics.op("get", num_keys=n) as _m, \
+                access_log("batch_get_auto", lambda: f"{n} keys") as r:
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
             carr = (c_uint64 * n)(*caps)
@@ -132,6 +161,8 @@ class DfkvDeviceClient:
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_get_auto rc={rc}")
             hits, lens = list(out_hit), list(out_len)
+            if _m:
+                _m.bytes = sum(lens)
             r.result = f"hits={sum(hits)}/{n}, {sum(lens)} bytes"
             return hits, lens
 
@@ -147,10 +178,13 @@ class DfkvDeviceClient:
         (max_sge-1); the C ABI reports a >29 key failed. Returns per-key status
         (``0`` = ok, ``1`` = failed), same "0=ok" normalization as ``batch_put``."""
         n = len(keys)
-        with access_log(
-            "batch_put_sg",
-            lambda: f"{n} keys, {sum(sum(s) for s in seg_sizes)} bytes",
-        ) as r:
+        with _push_metrics.op("put", num_keys=n) as _m, \
+                access_log(
+                    "batch_put_sg",
+                    lambda: f"{n} keys, {sum(sum(s) for s in seg_sizes)} bytes",
+                ) as r:
+            if _m:
+                _m.bytes = sum(sum(s) for s in seg_sizes)
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             # Keep the per-key inner arrays alive for the duration of the call.
             inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
@@ -181,7 +215,8 @@ class DfkvDeviceClient:
         ``seg_caps[i][..]`` (the segment sizes define the split). Returns
         ``(hits, lengths)`` where ``lengths[i]`` is the total stored bytes."""
         n = len(keys)
-        with access_log("batch_get_auto_sg", lambda: f"{n} keys") as r:
+        with _push_metrics.op("get", num_keys=n) as _m, \
+                access_log("batch_get_auto_sg", lambda: f"{n} keys") as r:
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
             inner_c = [(c_uint64 * len(c))(*c) for c in seg_caps]
@@ -200,13 +235,16 @@ class DfkvDeviceClient:
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_get_auto_sg rc={rc}")
             hits, lens = list(out_hit), list(out_len)
+            if _m:
+                _m.bytes = sum(lens)
             r.result = f"hits={sum(hits)}/{n}, {sum(lens)} bytes"
             return hits, lens
 
     def batch_exist(self, keys: Sequence[str]) -> list:
         """Return ``[1|0]`` per key (1 = present in the cache)."""
         n = len(keys)
-        with access_log("batch_exist", lambda: f"{n} keys") as r:
+        with _push_metrics.op("exist", num_keys=n), \
+                access_log("batch_exist", lambda: f"{n} keys") as r:
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             out = (c_int * n)()
             rc = self._lib.dfkv_batch_exist(self._h, karr, n, out)
