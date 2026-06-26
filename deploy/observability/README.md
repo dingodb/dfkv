@@ -23,7 +23,7 @@ docker compose -f deploy/observability/docker-compose.yml up -d
 
 | Service | URL | Notes |
 |---|---|---|
-| Grafana | http://localhost:3000 | anon admin; dashboards **"dfkv — cluster overview"** (connectors) + **"dfkv — backend (cache nodes + MDS)"** auto-provisioned |
+| Grafana | http://localhost:3000 | anon admin; dashboards **"Connector"** (connector fleet) + **"Cluster"** (cache nodes + MDS) auto-provisioned |
 | Prometheus | http://localhost:9090 | |
 | Collector OTLP | grpc `localhost:4317`, http `localhost:4318` | connectors push here |
 | Collector scrape | http://localhost:8889/metrics | what Prometheus reads |
@@ -74,7 +74,7 @@ size-triggered — metrics are aggregates, not an event buffer).
 Two dashboards split by audience: **connector / business-traffic view** vs
 **backend / infrastructure-health view**. Both read the same Prometheus.
 
-### 1. "dfkv — cluster overview" (connectors — pushed via OTLP)
+### 1. "Connector" (connector fleet — pushed via OTLP)
 
 1. **Connector instances / by type / inventory table** — how many connectors,
    which type (hicache/lmcache/vllm), by `connector_id`. The inventory table also
@@ -89,7 +89,7 @@ Two dashboards split by audience: **connector / business-traffic view** vs
 Use the **Connector type** / **Connector id** template variables at the top to
 drill into one type or one instance.
 
-### 2. "dfkv — backend (cache nodes + MDS)" (C++ daemons — scraped via pull)
+### 2. "Cluster" (cache nodes + MDS — scraped via pull)
 
 Fed by the `dfkv_server` / `dfkv_mds` Prometheus scrape jobs (start the daemons
 with `--metrics-port`). Three sections:
