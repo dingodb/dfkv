@@ -43,8 +43,11 @@ dfkv_server / dfkv_mds  <--Prometheus pull (/metrics)---------/        ^
   Collector 端点:gRPC `localhost:4317` / HTTP `localhost:4318`,Grafana `localhost:3300`。
 - **指向中心化 Collector**:把下面的 `OTEL_EXPORTER_OTLP_ENDPOINT` 换成中心地址即可。
 
-### 1.2 装可选依赖(一次)
-telemetry 是 opt-in,OTel SDK 是可选依赖,不装就是零成本 no-op:
+### 1.2 依赖(默认零依赖,不用装任何东西)
+telemetry 是 opt-in,且**默认用纯 stdlib 的 OTLP/HTTP-JSON 推送器**(`DFKV_METRICS_EXPORTER=stdlib`,默认)——
+**开 `DFKV_METRICS_ENABLED=1` 就能推,不需要装任何第三方包**。
+
+只有当你想改用 OpenTelemetry SDK 导出器(`DFKV_METRICS_EXPORTER=otel`)时,才装可选依赖:
 
 ```bash
 pip install 'dfkv-vllm[otel]'          # vLLM
@@ -52,6 +55,7 @@ pip install 'dfkv-connector[otel]'     # LMCache
 # SGLang HiCache 随 dfkv 仓库走,单独装 OTel SDK:
 pip install opentelemetry-sdk opentelemetry-exporter-otlp
 ```
+> 不装也能推(走 stdlib);装了且设 `DFKV_METRICS_EXPORTER=otel` 才用 SDK。metrics 关时两者都是零成本 no-op。
 
 ### 1.3 通用配置项
 全部 opt-in。环境变量名 + (SGLang 才支持的)`extra_config` 键 + 默认值:
@@ -60,6 +64,7 @@ pip install opentelemetry-sdk opentelemetry-exporter-otlp
 |---|---|---|---|
 | `DFKV_METRICS_ENABLED` | `metrics` | `0`(关) | 推送指标总开关 |
 | `DFKV_TELEMETRY_ENABLED` | `telemetry` | `0` | 大开关(指标 + 以后的 trace),开它等于也开 metrics |
+| `DFKV_METRICS_EXPORTER` | `metrics_exporter` | `stdlib` | 导出器:`stdlib`(纯标准库 OTLP/HTTP-JSON,**零依赖,默认**) 或 `otel`(用 OpenTelemetry SDK,需装 `[otel]`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otlp_endpoint` | SDK 默认 | Collector 地址(gRPC `:4317` / HTTP `:4318`) |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `otlp_protocol` | `grpc` | `grpc` 或 `http/protobuf` |
 | `DFKV_CONNECTOR_ID` | `connector_id` | `<host>:<pid>:<tp_rank>` | 实例标识(给个稳定可读的名字更好认) |
@@ -210,8 +215,10 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317
 
 ## 速查
 
-| 我在用 | 最小开启 |
+> 默认 stdlib 导出器**零依赖**——下面"最小开启"都不用 pip install;只有想用 OTel SDK 才装 `[otel]` 并设 `DFKV_METRICS_EXPORTER=otel`。
+
+| 我在用 | 最小开启(默认 stdlib,零依赖) |
 |---|---|
-| vLLM | `pip install 'dfkv-vllm[otel]'` → `export DFKV_METRICS_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317` |
-| LMCache | `pip install 'dfkv-connector[otel]'` → 同上两个 env |
-| SGLang HiCache | `pip install opentelemetry-sdk opentelemetry-exporter-otlp` → extra_config 加 `"metrics":1,"otlp_endpoint":"http://<collector>:4317"` |
+| vLLM | `export DFKV_METRICS_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317`（想用 SDK 才 `pip install 'dfkv-vllm[otel]'`） |
+| LMCache | 同上两个 env（想用 SDK 才 `pip install 'dfkv-connector[otel]'`） |
+| SGLang HiCache | extra_config 加 `"metrics":1,"otlp_endpoint":"http://<collector>:4317"`（想用 SDK 才 `pip install opentelemetry-sdk opentelemetry-exporter-otlp`） |

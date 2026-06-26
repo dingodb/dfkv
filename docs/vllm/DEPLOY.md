@@ -106,6 +106,8 @@ vllm serve <model> \
 > `batch_get_auto_sg(20 keys) : hits=20/20, 1310720 bytes <0.007234>`。
 > 每个 vLLM 引擎进程各写各的,多 DP rank 建议用 `DFKV_ACCESS_LOG_PATH` 区分(如带 rank 后缀)或留 stderr 随引擎日志走。
 
+> **车队指标（push，opt-in）**：除访问日志外，可把本实例指标经 OTLP 推到中心 Collector→Grafana（命中率/吞吐/op 延迟 + 逐 peer 延迟）。vLLM 连接器 telemetry **只认环境变量**（不读 `kv_connector_extra_config`）：`export DFKV_METRICS_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317`，默认 stdlib 零依赖；想要空闲节点也出逐 peer 延迟再 `export DFKV_PROBE_INTERVAL_MS=5000`。接法见 [../../deploy/observability/CONNECTOR-USAGE.md](../../deploy/observability/CONNECTOR-USAGE.md)、指标见 [../METRICS.md](../METRICS.md) §3.4。
+
 ### B. `kv_connector_extra_config`
 
 > 成员发现:连接器要求 **`mds_endpoints` 或 `members` 二选一**;设了 `mds_endpoints` 即优先走 MDS,生产推荐 MDS。

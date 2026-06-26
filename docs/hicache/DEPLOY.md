@@ -86,7 +86,8 @@ sglang serve ... \
 > MLA 下插件自动单对象、无 rank 后缀、`backup_skip`（仅 tp_rank0 写）。decode 共享前缀配同 members。
 > 多池模型（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
 > 排查命中率/慢操作：可开启 access log（`access_log`/`access_log_path` 或 `DFKV_ACCESS_LOG_*`），见 [../access_log.md](../access_log.md)。
-> **客户端指标**：插件自动在 SGLang 自带的 `/metrics` 上暴露 `dfkv_client_*{tp_rank}`（set/get 量、命中、IO 错误、peer 熔断切换、set/get 延迟直方图）。后台轮询线程读 C 客户端快照，间隔由 extra_config `client_stats_poll_s`（默认 10s，`DFKV_CLIENT_STATS_POLL_S` 兜底，`0`=关）控制。全指标见 [../METRICS.md](../METRICS.md) §3.3。
+> **客户端指标（pull）**：插件自动在 SGLang 自带的 `/metrics` 上暴露 `dfkv_client_*{tp_rank}`（set/get 量、命中、IO 错误、peer 熔断切换、set/get 延迟直方图）。后台轮询线程读 C 客户端快照，间隔由 extra_config `client_stats_poll_s`（默认 10s，`DFKV_CLIENT_STATS_POLL_S` 兜底，`0`=关）控制。全指标见 [../METRICS.md](../METRICS.md) §3.3。
+> **车队指标（push，opt-in）**：还可把本实例指标经 OTLP 主动推到中心 Collector→Grafana（命中率/吞吐/op 延迟 + 逐 peer 延迟）。HiCache 走 extra_config `"metrics":1,"otlp_endpoint":...` 或 `DFKV_METRICS_ENABLED=1`，默认 stdlib 零依赖。接法见 [../../deploy/observability/CONNECTOR-USAGE.md](../../deploy/observability/CONNECTOR-USAGE.md)、指标见 [../METRICS.md](../METRICS.md) §3.4。
 
 ---
 

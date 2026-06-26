@@ -147,6 +147,8 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
 | `DFKV_CONNECTOR_BATCH_MAX_KEYS` | 512 | 单次 native 批量最大 key 数 |
 | `DFKV_ACCESS_LOG_ENABLED` / `_PATH` | 0 / stderr | 逐操作访问日志 |
 
+> **车队指标（push，opt-in）**：可把本实例指标经 OTLP 推到中心 Collector→Grafana（命中率/吞吐/op 延迟 + 逐 peer 延迟），与 vLLM/SGLang 拉平。LMCache 连接器**只认环境变量**：`export DFKV_METRICS_ENABLED=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4317`，默认 stdlib 零依赖。接法见 [../../deploy/observability/CONNECTOR-USAGE.md](../../deploy/observability/CONNECTOR-USAGE.md)、指标见 [../METRICS.md](../METRICS.md) §3.4。
+
 ---
 
 ## 实测结果（参考）

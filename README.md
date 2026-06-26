@@ -115,6 +115,11 @@ docs/vllm/     vLLM connector docs (DEPLOY — config reference + recommended se
   histogram, eviction/error/per-disk/RDMA counters server-side; client-side counters
   (peer health, IO errors) via `dfkv_stats_snapshot` + a plugin poller. **Opt-in and
   off the datapath** — no `--metrics-port` ⇒ no listener, behavior unchanged.
+  The three connectors (vLLM / LMCache / SGLang HiCache) can also **push** fleet
+  metrics (ops/keys/bytes, op latency, per-peer latency) over OTLP to a central
+  Collector → Grafana — opt-in via `DFKV_METRICS_ENABLED=1`, **zero-dependency stdlib
+  exporter by default**; see [deploy/observability/CONNECTOR-USAGE.md](deploy/observability/CONNECTOR-USAGE.md)
+  and [docs/METRICS.md](docs/METRICS.md) §3.4.
 - **Dynamic membership**: MDS discovery (`dfkv_start_mds_discovery`) polls the MDS
   tier and rebuilds the weighted Ketama ring on each etcd-epoch change. Legacy
   `SetMembers()` hot-swap and `dfkv_refresh_members` (single-seed query) are still

@@ -1,4 +1,6 @@
-# dfkv HiCache access log（访问日志）
+# dfkv 连接器 access log（访问日志）
+
+> 本文以 SGLang HiCache（`DfkvHiCache`）为例；**vLLM 直连连接器与 LMCache 连接器是同一套环境变量（`DFKV_ACCESS_LOG_*`）、同一行格式**，对应配置见 [vllm/DEPLOY.md](vllm/DEPLOY.md)、[lmcache/DEPLOY.md](lmcache/DEPLOY.md)。
 
 给 `DfkvHiCache` 插件的**每个继承接口**逐次操作打一行日志，用于排查命中率、慢操作、失败。
 默认**关闭**，开启后近乎零热路径开销（异步落盘）。格式对齐 dingofs lmcache / vfs 的 access log：

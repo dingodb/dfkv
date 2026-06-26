@@ -74,6 +74,24 @@ RDMA 构建额外（折叠进同一 /metrics）：
 
 C 客户端快照里还含传输级（RDMA 构建）：`dfkv_rdma_client_conns_opened_total`、`mr_regions`、`rail_conns_total{dev}`（NUMA 选轨分布）。
 
+### 3.4 连接器车队指标（三连接器 OTLP **push**，opt-in）
+§3.3 是 SGLang 插件本地 `/metrics`（**pull**）。此外三个连接器（vLLM `dfkv-vllm` / LMCache `dfkv-connector` / SGLang HiCache `dfkv_hicache.py`）可把聚合后的运行指标经 **OTLP 主动推送**到中心 Collector→Prometheus→Grafana，用于"车队级"按实例/类型观测。
+- **opt-in**：`DFKV_METRICS_ENABLED=1` + `OTEL_EXPORTER_OTLP_ENDPOINT`；关时零开销。默认导出器 `DFKV_METRICS_EXPORTER=stdlib`（纯标准库，**零第三方依赖**），可选 `otel`（OpenTelemetry SDK）。完整配置与各引擎接法见 [`../deploy/observability/CONNECTOR-USAGE.md`](../deploy/observability/CONNECTOR-USAGE.md)。
+- **公共标签**：`connector_type`（`hicache`/`lmcache`/`vllm`）、`connector_id`（实例标识）、`version`（连接器包版本，滚动升级可见）。
+
+| 指标 | 类型 | 标签 | 含义 |
+|---|---|---|---|
+| `dfkv_connector_ops_total` | counter | `op` | 各 op 次数（→ 命中率） |
+| `dfkv_connector_keys_total` | counter | `op` | 各 op 涉及的 key 数 |
+| `dfkv_connector_bytes_total` | counter | `op` | 各 op 字节量（→ 吞吐） |
+| `dfkv_connector_op_seconds` | histogram | `op` | 各 op 延迟分布 |
+| `dfkv_connector_op_max_seconds` | gauge | `op` | 各 op 周期内峰值延迟 |
+| `dfkv_connector_info` / `_info_ratio` | gauge | — | 实例信息 / 命中比 |
+| `dfkv_client_peer_latency_avg_seconds` / `_max_seconds` | gauge | `peer` | **逐 dfkv server 节点延迟**（诊断慢节点/慢路径，如跨机房） |
+| `dfkv_client_peer_latency_seconds_count` / `_sum` | counter | `peer` | 逐 peer 延迟采样数 / 总和 |
+
+> 逐 peer 延迟由 C++ 客户端主动探测（`DFKV_PROBE_INTERVAL_MS`）：SGLang HiCache 开 metrics 即自动开；vLLM/LMCache 需手动 `export DFKV_PROBE_INTERVAL_MS=5000`。
+
 ## 4. 性能保证
 
 - 热路径计数：`std::atomic` relaxed `fetch_add`，零锁零分配（与既有模式一致）。
