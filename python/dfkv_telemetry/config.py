@@ -25,6 +25,11 @@ ENV_OTLP_PROTOCOL = "OTEL_EXPORTER_OTLP_PROTOCOL"  # grpc | http/protobuf
 # --- dfkv-namespaced knobs --------------------------------------------------
 ENV_CONNECTOR_ID = "DFKV_CONNECTOR_ID"
 ENV_EXPORT_INTERVAL_MS = "DFKV_METRICS_EXPORT_INTERVAL_MS"   # OTLP push cadence (default 10000)
+# Which exporter pushes the metrics: "stdlib" (default; pure-stdlib OTLP/HTTP-JSON,
+# zero third-party deps) or "otel" (the OpenTelemetry SDK, if installed).
+ENV_METRICS_EXPORTER = "DFKV_METRICS_EXPORTER"
+EXPORTER_STDLIB = "stdlib"
+EXPORTER_OTEL = "otel"
 ENV_PROBE_INTERVAL_MS = "DFKV_PROBE_INTERVAL_MS"             # C++ per-peer probe (default off; 5000 when on)
 ENV_PEER_POLL_S = "DFKV_PEER_LATENCY_POLL_S"                 # snapshot->push cadence (default 10)
 

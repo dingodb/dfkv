@@ -243,6 +243,90 @@ class PeerLatencyTest(TelemetryTestBase):
         self.assertAlmostEqual(res["p"][1], 0.003)  # lifetime max
 
 
+class StdlibExporterTest(TelemetryTestBase):
+    """The default exporter is the pure-stdlib OTLP/HTTP-JSON pusher (no OTel SDK)."""
+
+    def _enabled(self):
+        os.environ[config.ENV_METRICS_ENABLED] = "1"
+        metrics.configure({}, connector_type=config.TYPE_HICACHE, tp_rank=2)
+        return metrics._recorder
+
+    def test_default_exporter_is_stdlib_not_otel(self):
+        rec = self._enabled()
+        self.assertTrue(metrics.is_enabled())
+        self.assertIsNotNone(rec._stdlib)   # stdlib pusher started
+        self.assertIsNone(rec._otel)        # OTel SDK not used
+
+    def test_build_payload_structure_and_values(self):
+        rec = self._enabled()
+        with metrics.op("put", num_keys=3) as m:
+            if m:
+                m.bytes = 4096
+        with metrics.op("get", num_keys=5) as m:
+            if m:
+                m.bytes = 8192
+        try:
+            with metrics.op("put", num_keys=1) as m:
+                raise RuntimeError("io")
+        except RuntimeError:
+            pass
+        rm = rec._stdlib.build()["resourceMetrics"][0]
+        ra = {a["key"]: a["value"] for a in rm["resource"]["attributes"]}
+        self.assertEqual(ra["dfkv.connector_type"]["stringValue"], "hicache")
+        self.assertIn("dfkv.connector_id", ra)
+        by_name = {m["name"]: m for m in rm["scopeMetrics"][0]["metrics"]}
+        for n in ("dfkv_connector_ops_total", "dfkv_connector_keys_total",
+                  "dfkv_connector_bytes_total", "dfkv_connector_op_seconds",
+                  "dfkv_connector_info"):
+            self.assertIn(n, by_name)
+        ops = {}
+        for dp in by_name["dfkv_connector_ops_total"]["sum"]["dataPoints"]:
+            a = {x["key"]: x["value"]["stringValue"] for x in dp["attributes"]}
+            ops[(a["op"], a["status"])] = int(dp["asInt"])
+        self.assertEqual(ops[("put", "ok")], 1)
+        self.assertEqual(ops[("put", "fail")], 1)
+        self.assertEqual(ops[("get", "ok")], 1)
+        # histogram: bucketCounts length == bounds + 1 (overflow)
+        hist = by_name["dfkv_connector_op_seconds"]["histogram"]["dataPoints"][0]
+        self.assertEqual(len(hist["bucketCounts"]), len(hist["explicitBounds"]) + 1)
+
+    def test_push_once_to_local_http_server(self):
+        import http.server
+        import json as _json
+        import socketserver
+        import threading
+        captured = {}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0))
+                captured["body"] = self.rfile.read(n)
+                captured["ctype"] = self.headers.get("Content-Type")
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.handle_request, daemon=True).start()
+
+        rec = self._enabled()
+        with metrics.op("put", num_keys=2) as m:
+            if m:
+                m.bytes = 100
+        from dfkv_telemetry.otlp_json import StdlibExporter
+        exp = StdlibExporter(rec, "http://127.0.0.1:%d" % port, interval_s=0)
+        status = exp.push_once()
+        srv.server_close()
+        self.assertEqual(status, 200)
+        self.assertEqual(captured["ctype"], "application/json")
+        body = _json.loads(captured["body"].decode())
+        names = [m["name"] for m in body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]]
+        self.assertIn("dfkv_connector_ops_total", names)
+
+
 try:
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader  # noqa: F401
     _HAVE_OTEL = True

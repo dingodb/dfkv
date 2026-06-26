@@ -150,31 +150,51 @@ class _Recorder:
 
     def __init__(self, connector_type: str, connector_id: str, tp_rank: int,
                  model: str, endpoint: str, interval_ms: int, protocol: str = "",
-                 readers=None, version: str = "", native_version: str = ""):
+                 readers=None, version: str = "", native_version: str = "",
+                 exporter: str = "stdlib"):
         self.connector_type = connector_type
         self.connector_id = connector_id
         self.tp_rank = int(tp_rank)
         self.model = model
         # version: the connector package version (pip dist, e.g. dfkv-vllm).
         # native_version: the linked libdfkv.so version (C dfkv_version()).
-        # Both ride on the OTel resource so the dashboard can spot version skew.
+        # Both ride on the resource so the dashboard can spot version skew.
         self.version = version or ""
         self.native_version = native_version or ""
         self._lock = threading.Lock()
-        # In-process mirror (tests/debug); keyed for low cardinality.
+        # In-process mirror; the stdlib exporter reads these to build OTLP-JSON.
         self._ops = {(o, s): 0 for o in _OPS for s in ("ok", "fail")}
         self._keys = {o: 0 for o in _OPS}
         self._bytes = {o: 0 for o in _OPS}
         self._dur_sum = {o: 0.0 for o in _OPS}
         self._dur_cnt = {o: 0 for o in _OPS}
         self._dur_max = {o: 0.0 for o in _OPS}  # since last export; reset on read
+        # Per-op latency bucket counts (len = len(_HIST_BUCKETS)+1) for the OTLP
+        # histogram (-> p99 in Grafana). One cheap branchy increment per op.
+        self._nb = len(_HIST_BUCKETS)
+        self._dur_buckets = {o: [0] * (self._nb + 1) for o in _OPS}
         # Per-cache-node latency (peer -> (avg_seconds, max_seconds)), fed by a
-        # PeerLatencyPoller reading the C client's snapshot. Read by observable
-        # gauges. Powers the dashboard "per cache-node latency" panel.
+        # PeerLatencyPoller reading the C client's snapshot.
         self._peer = {}
         self._otel = None
         self._provider = None
-        self._setup_otel(endpoint, interval_ms, protocol, readers)
+        self._stdlib = None
+        # Default exporter = the pure-stdlib OTLP/HTTP-JSON pusher (zero third-party
+        # deps, nothing to pip-install in the container, no dependency shadowing).
+        # `readers` (test seam) or exporter="otel" selects the OpenTelemetry SDK;
+        # if the SDK is requested but absent, fall back to the stdlib pusher.
+        if readers is not None or str(exporter).lower() == config.EXPORTER_OTEL:
+            self._setup_otel(endpoint, interval_ms, protocol, readers)
+            if self._otel is None and readers is None:
+                self._setup_stdlib(endpoint, interval_ms)
+        else:
+            self._setup_stdlib(endpoint, interval_ms)
+
+    def _setup_stdlib(self, endpoint: str, interval_ms: int) -> None:
+        from . import otlp_json
+        self._stdlib = otlp_json.StdlibExporter(
+            self, endpoint, max(1000, int(interval_ms)) / 1000.0)
+        self._stdlib.start()
 
     # -- OTel wiring (guarded; degrades to in-process-only if SDK absent) --
     # `readers` is a test seam: when given (e.g. an InMemoryMetricReader), it is
@@ -255,6 +275,12 @@ class _Recorder:
             self._dur_cnt[op_name] += 1
             if seconds > self._dur_max[op_name]:
                 self._dur_max[op_name] = seconds
+            bi = self._nb
+            for i in range(self._nb):
+                if seconds <= _HIST_BUCKETS[i]:
+                    bi = i
+                    break
+            self._dur_buckets[op_name][bi] += 1
         if self._otel is not None:
             self._otel.record(op_name, keys, nbytes, seconds, status)
 
@@ -274,6 +300,25 @@ class _Recorder:
         with self._lock:
             return dict(self._peer)
 
+    def export_snapshot(self) -> dict:
+        """Consistent aggregate snapshot for the stdlib OTLP/JSON exporter. Reads-
+        and-resets the per-op max (matching the OTel observable-gauge semantics)."""
+        with self._lock:
+            snap = {
+                "ops": dict(self._ops),
+                "keys": dict(self._keys),
+                "bytes": dict(self._bytes),
+                "dur_sum": dict(self._dur_sum),
+                "dur_cnt": dict(self._dur_cnt),
+                "dur_buckets": {o: list(self._dur_buckets[o]) for o in _OPS},
+                "dur_max": dict(self._dur_max),
+                "bounds": list(_HIST_BUCKETS),
+                "peer": dict(self._peer),
+            }
+            for o in _OPS:
+                self._dur_max[o] = 0.0  # read-and-reset
+        return snap
+
     def snapshot(self) -> dict:
         with self._lock:
             snap = {
@@ -289,6 +334,12 @@ class _Recorder:
         return snap
 
     def shutdown(self) -> None:
+        if self._stdlib is not None:
+            try:
+                self._stdlib.stop()
+            except Exception:
+                pass
+            self._stdlib = None
         if self._provider is not None:
             try:
                 self._provider.shutdown()
@@ -402,9 +453,13 @@ def configure(cfg: Optional[dict] = None, connector_type: str = "",
                 cfg, "metrics_export_interval_ms", config.ENV_EXPORT_INTERVAL_MS, 10000))
         except (TypeError, ValueError):
             interval_ms = 10000
+        exporter = str(config.resolve(
+            cfg, "metrics_exporter", config.ENV_METRICS_EXPORTER,
+            config.EXPORTER_STDLIB)).lower()
         _recorder = _Recorder(connector_type, connector_id, tp_rank, model,
                               endpoint, interval_ms, protocol, readers=_readers,
-                              version=version, native_version=native_version)
+                              version=version, native_version=native_version,
+                              exporter=exporter)
 
 
 def op(op_name: str, num_keys: int = 0, num_bytes: int = 0):

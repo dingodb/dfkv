@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SRC="python/dfkv_telemetry"
-FILES="__init__.py config.py metrics_push.py"
+FILES="__init__.py config.py metrics_push.py otlp_json.py"
 DSTS=(
   "integration/vllm/src/dfkv_vllm/_telemetry"
   "integration/lmcache/src/dfkv_connector/_telemetry"
