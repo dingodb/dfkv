@@ -290,6 +290,15 @@ class StdlibExporterTest(TelemetryTestBase):
         hist = by_name["dfkv_connector_op_seconds"]["histogram"]["dataPoints"][0]
         self.assertEqual(len(hist["bucketCounts"]), len(hist["explicitBounds"]) + 1)
 
+    def test_metrics_url_normalization(self):
+        from dfkv_telemetry.otlp_json import metrics_url
+        self.assertEqual(metrics_url("http://h:4318"), "http://h:4318/v1/metrics")
+        self.assertEqual(metrics_url("http://h:4318/"), "http://h:4318/v1/metrics")
+        self.assertEqual(metrics_url("h:4318"), "http://h:4318/v1/metrics")
+        self.assertEqual(metrics_url("http://h:4318/v1/metrics"), "http://h:4318/v1/metrics")
+        self.assertEqual(metrics_url("http://h:4318/v1/metrics/"), "http://h:4318/v1/metrics")
+        self.assertEqual(metrics_url(""), "http://localhost:4318/v1/metrics")
+
     def test_push_once_to_local_http_server(self):
         import http.server
         import json as _json

@@ -49,9 +49,10 @@ def metrics_url(endpoint):
     ep = (endpoint or "http://localhost:4318").strip()
     if "://" not in ep:
         ep = "http://" + ep
-    if ep.rstrip("/").endswith("/v1/metrics"):
+    ep = ep.rstrip("/")
+    if ep.endswith("/v1/metrics"):
         return ep
-    return ep.rstrip("/") + "/v1/metrics"
+    return ep + "/v1/metrics"
 
 
 def _host():
