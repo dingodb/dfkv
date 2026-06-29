@@ -23,6 +23,7 @@
 #include "con_hash.h"
 #include "membership.h"
 #include "mds_member_poller.h"
+#include "op_metrics.h"
 #include "peer_health.h"
 #include "peer_latency.h"
 #include "transport.h"
@@ -145,6 +146,11 @@ class KVClient {
   std::string Route(const std::string& key) const;
   uint64_t NowMs() const;
   void ProbeLoop();
+  // Record a batch op (hits = count of true flags) into op_stats_ and return the
+  // per-item result vector. Called at each batch method's return point.
+  std::vector<bool> RecordBatch(OpMetrics::Op op,
+                                std::chrono::steady_clock::time_point t0,
+                                const std::vector<char>& flags, uint64_t bytes);
 
   mutable std::mutex ring_mu_;  // guards ring_ + addr_
   ConHash ring_;
@@ -157,6 +163,7 @@ class KVClient {
   std::atomic<size_t> batch_concurrency_{8};
   std::unique_ptr<MdsMemberPoller> poller_;
   PeerHealth health_;
+  OpMetrics op_stats_;  // per-op (put/get/exist) counters + latency, snapshot'd
 
   // Active per-peer latency prober (off the datapath; own thread).
   PeerLatency peer_lat_;
