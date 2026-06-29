@@ -398,8 +398,9 @@ class DfkvHiCache(HiCacheStorage):
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"ok {sum(res)}/{n}"
             self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=sum(ss), seconds=dur)
-            if _push_metrics.is_enabled():
-                _push_metrics.record("put", keys=n, nbytes=sum(ss), seconds=dur)
+            # Fleet op metrics (put/get/exist/...) are accumulated in the C++
+            # KVClient (the chokepoint all connectors share) and forwarded over
+            # OTLP by the snapshot poller — see dfkv_telemetry.parse_client_ops.
             return res
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
@@ -414,8 +415,7 @@ class DfkvHiCache(HiCacheStorage):
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"hits={sum(res)}/{n}"
             self._metrics.on_get(pages=n, hit_pages=sum(res), nbytes=sum(ss), seconds=dur)
-            if _push_metrics.is_enabled():
-                _push_metrics.record("get", keys=n, nbytes=sum(ss), seconds=dur)
+            # Fleet op metrics now come from the C++ KVClient snapshot (above).
             return res
 
     def batch_exists(self, keys, extra_info=None) -> int:

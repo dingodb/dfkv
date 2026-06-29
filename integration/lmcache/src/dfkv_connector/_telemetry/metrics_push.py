@@ -95,6 +95,9 @@ class _NoopRecorder:
     def update_peer_latency(self, peer_stats):
         pass
 
+    def update_client_ops(self, client_ops):
+        pass
+
     def peer_latency_snapshot(self):
         return {}
 
@@ -176,6 +179,13 @@ class _Recorder:
         # Per-cache-node latency (peer -> (avg_seconds, max_seconds)), fed by a
         # PeerLatencyPoller reading the C client's snapshot.
         self._peer = {}
+        # Per-op (put/get/exist) metrics, sourced from the C KVClient snapshot
+        # (dfkv_client_op_*) by the same poller. The C++ client is the convergent
+        # chokepoint all connectors funnel through, so the op accounting lives
+        # there once; here we just forward the absolute values over OTLP with this
+        # connector's identity. {op: {requests,keys,hits,bytes,max,lat_sum,
+        # lat_count, buckets:[(le_str, cum_count)]}}.
+        self._client_ops = {}
         self._otel = None
         self._provider = None
         self._stdlib = None
@@ -261,13 +271,29 @@ class _Recorder:
         # is a no-op for the in-process-only path. Kept for API symmetry.
         pass
 
+    def _ensure_op(self, op_name: str) -> None:
+        """Register the per-op accumulators the first time an op is seen. The
+        seed set (_OPS) is created up front so common series are always present;
+        any other op (e.g. put_indexer/get_indexer/exist_v2) is added on demand.
+        Caller holds self._lock (or is __init__)."""
+        if op_name not in self._dur_sum:
+            self._keys[op_name] = 0
+            self._bytes[op_name] = 0
+            self._dur_sum[op_name] = 0.0
+            self._dur_cnt[op_name] = 0
+            self._dur_max[op_name] = 0.0
+            self._dur_buckets[op_name] = [0] * (self._nb + 1)
+
+    def op_names(self) -> list:
+        with self._lock:
+            return list(self._dur_sum.keys())
+
     def _record(self, op_name: str, keys: int, nbytes: int,
                 seconds: float, status: str) -> None:
-        if op_name not in self._bytes:  # tolerate unknown op names
-            op_name = "exist" if op_name not in _OPS else op_name
         if seconds < 0:
             seconds = 0.0
         with self._lock:
+            self._ensure_op(op_name)
             self._ops[(op_name, status)] = self._ops.get((op_name, status), 0) + 1
             self._keys[op_name] += int(keys)
             self._bytes[op_name] += int(nbytes)
@@ -296,6 +322,12 @@ class _Recorder:
         with self._lock:
             self._peer = dict(peer_stats)
 
+    def update_client_ops(self, client_ops: dict) -> None:
+        """Absolute per-op metrics parsed from the C KVClient snapshot
+        (dfkv_client_op_*). Forwarded as-is (cumulative) by the OTLP exporter."""
+        with self._lock:
+            self._client_ops = dict(client_ops)
+
     def peer_latency_snapshot(self) -> dict:
         with self._lock:
             return dict(self._peer)
@@ -310,12 +342,13 @@ class _Recorder:
                 "bytes": dict(self._bytes),
                 "dur_sum": dict(self._dur_sum),
                 "dur_cnt": dict(self._dur_cnt),
-                "dur_buckets": {o: list(self._dur_buckets[o]) for o in _OPS},
+                "dur_buckets": {o: list(b) for o, b in self._dur_buckets.items()},
                 "dur_max": dict(self._dur_max),
                 "bounds": list(_HIST_BUCKETS),
                 "peer": dict(self._peer),
+                "client_ops": {o: dict(d) for o, d in self._client_ops.items()},
             }
-            for o in _OPS:
+            for o in list(self._dur_max):
                 self._dur_max[o] = 0.0  # read-and-reset
         return snap
 
@@ -392,7 +425,8 @@ class _OtelInstruments:
 
     def _observe_max(self, options):
         from opentelemetry.metrics import Observation
-        return [Observation(self._rec.take_max(o), {"op": o}) for o in _OPS]
+        return [Observation(self._rec.take_max(o), {"op": o})
+                for o in self._rec.op_names()]
 
     def _observe_peer_avg(self, options):
         from opentelemetry.metrics import Observation
@@ -529,10 +563,61 @@ def parse_peer_latency(text: str) -> dict:
     return out
 
 
+# Scalar dfkv_client_op_* families (cumulative counters + a max gauge) keyed by
+# the field name we store them under for the OTLP forwarder.
+_OP_SCALARS = {
+    "dfkv_client_op_requests_total": "requests",
+    "dfkv_client_op_keys_total": "keys",
+    "dfkv_client_op_hits_total": "hits",
+    "dfkv_client_op_bytes_total": "bytes",
+    "dfkv_client_op_max_seconds": "max",
+    "dfkv_client_op_latency_seconds_sum": "lat_sum",
+    "dfkv_client_op_latency_seconds_count": "lat_count",
+}
+
+
+def parse_client_ops(text: str) -> dict:
+    """Parse dfkv_client_op_* lines from the C KVClient snapshot into
+    {op: {requests,keys,hits,bytes,max,lat_sum,lat_count, buckets:[(le_str,cum)]}}.
+    The op accounting is done once in C++ (the convergent chokepoint); this just
+    forwards it. buckets keep the cumulative (le) counts for OTLP conversion."""
+    out = {}
+    for line in (text or "").splitlines():
+        if not line or line[0] == "#":
+            continue
+        sp = line.rfind(" ")
+        if sp <= 0:
+            continue
+        name_labels, val = line[:sp], line[sp + 1:]
+        brace = name_labels.find("{")
+        if brace == -1:
+            continue
+        name = name_labels[:brace]
+        rb = name_labels.rfind("}")
+        labels = name_labels[brace + 1:rb] if rb != -1 else ""
+        op = _extract_label(labels, "op")
+        if op is None:
+            continue
+        try:
+            v = float(val)
+        except ValueError:
+            continue
+        d = out.setdefault(op, {})
+        field = _OP_SCALARS.get(name)
+        if field is not None:
+            d[field] = v
+        elif name == "dfkv_client_op_latency_seconds_bucket":
+            le = _extract_label(labels, "le")
+            if le is not None:
+                d.setdefault("buckets", []).append((le, v))
+    return out
+
+
 class PeerLatencyPoller:
     """Sleeping daemon thread: polls the C client's metrics snapshot, computes a
-    windowed avg (delta-sum / delta-count) + lifetime max per peer, and feeds the
-    recorder's observable gauges. Off the request hot path."""
+    windowed avg (delta-sum / delta-count) + lifetime max per peer, AND forwards
+    the per-op metrics (dfkv_client_op_*) so all connectors report their full
+    request mix from the one C++ chokepoint. Off the request hot path."""
 
     def __init__(self, get_text, recorder, interval_s=10.0):
         self._get_text = get_text
@@ -543,7 +628,11 @@ class PeerLatencyPoller:
         self._thread = None
 
     def poll_once(self):
-        stats = parse_peer_latency(self._get_text() or "")
+        text = self._get_text() or ""
+        # Forward the per-op metrics (computed once in C++) over OTLP, with this
+        # connector's identity. Absolute/cumulative — no windowing needed.
+        self._rec.update_client_ops(parse_client_ops(text))
+        stats = parse_peer_latency(text)
         result = {}
         for peer, d in stats.items():
             s = d.get("sum", 0.0)

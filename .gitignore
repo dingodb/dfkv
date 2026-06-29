@@ -13,3 +13,5 @@ compile_commands.json
 integration/lmcache/build/
 integration/lmcache/dist/
 .cache/
+.analysis/
+

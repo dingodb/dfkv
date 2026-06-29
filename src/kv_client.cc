@@ -166,8 +166,21 @@ std::string KVClient::MetricsSnapshot() const {
   s += "dfkv_client_transport_info{transport=\"" + transport_reason_ + "\"} 1\n";
   s += health_.Render();
   s += peer_lat_.Render();
+  s += op_stats_.Render();
   if (t_) s += t_->MetricsText();
   return s;
+}
+
+std::vector<bool> KVClient::RecordBatch(OpMetrics::Op op,
+                                        std::chrono::steady_clock::time_point t0,
+                                        const std::vector<char>& flags,
+                                        uint64_t bytes) {
+  uint64_t hits = 0;
+  for (char c : flags) if (c) ++hits;
+  double s = std::chrono::duration<double>(
+                 std::chrono::steady_clock::now() - t0).count();
+  op_stats_.Record(op, flags.size(), hits, bytes, s);
+  return std::vector<bool>(flags.begin(), flags.end());
 }
 
 uint64_t KVClient::NowMs() const {
@@ -333,6 +346,7 @@ bool KVClient::Exist(const std::string& key) {
 }
 
 std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
+  auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
@@ -371,10 +385,14 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
     if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
   });
-  return std::vector<bool>(ok.begin(), ok.end());
+  // RDMA path records the batch once (TCP path above is counted per-key by Put()).
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < N; ++i) if (ok[i]) bytes += items[i].n;
+  return RecordBatch(OpMetrics::kPut, t0, ok, bytes);
 }
 
 std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
+  auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
@@ -421,11 +439,14 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
       hit[idx[m]] = 1;
     }
   });
-  return std::vector<bool>(hit.begin(), hit.end());
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < N; ++i) if (hit[i]) bytes += items[i].n;
+  return RecordBatch(OpMetrics::kGet, t0, hit, bytes);
 }
 
 std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
                                          std::vector<size_t>* out_lens) {
+  auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
@@ -476,11 +497,14 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
       hit[idx[m]] = 1;
     }
   });
+  uint64_t bytes = 0;
+  for (size_t x : lens) bytes += x;
   if (out_lens) *out_lens = std::move(lens);
-  return std::vector<bool>(hit.begin(), hit.end());
+  return RecordBatch(OpMetrics::kGet, t0, hit, bytes);
 }
 
 std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
+  auto t0 = std::chrono::steady_clock::now();
   const size_t N = keys.size();
   std::vector<char> e(N, 0);
   if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
@@ -514,10 +538,11 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
     if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
     for (size_t m = 0; m < idx.size(); ++m) e[idx[m]] = (m < ex.size() && ex[m]) ? 1 : 0;
   });
-  return std::vector<bool>(e.begin(), e.end());
+  return RecordBatch(OpMetrics::kExist, t0, e, 0);
 }
 
 std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
+  auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
 
@@ -572,11 +597,14 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
     if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
   });
-  return std::vector<bool>(ok.begin(), ok.end());
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < N; ++i) if (ok[i]) for (size_t s : items[i].sizes) bytes += s;
+  return RecordBatch(OpMetrics::kPut, t0, ok, bytes);
 }
 
 std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                            std::vector<size_t>* out_lens) {
+  auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
   std::vector<size_t> lens(N, 0);  // distinct indices => thread-safe writes
@@ -638,8 +666,10 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       hit[idx[m]] = 1;
     }
   });
+  uint64_t bytes = 0;
+  for (size_t x : lens) bytes += x;
   if (out_lens) *out_lens = std::move(lens);
-  return std::vector<bool>(hit.begin(), hit.end());
+  return RecordBatch(OpMetrics::kGet, t0, hit, bytes);
 }
 
 }  // namespace dfkv
