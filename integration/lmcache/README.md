@@ -53,6 +53,45 @@ extra_config:
 The library is found via (highest first) `remote_storage_plugin.dfkv.lib` →
 env `DFKV_LIB` → `$DFKV_BUILD/libdfkv.so`.
 
+## Configure LMCache (MP-server mode — L2 adapter)
+
+LMCache's multiprocess server (`lmcache server` + `LMCacheMPConnector` on the
+vLLM side, the path used by models that split the KV cache into multiple groups
+such as **GLM-5.1/5.2 DSA** and **DeepSeek-V4-Flash**) drives its remote tier
+through `L2AdapterInterface`, **not** the in-process `remote_storage_plugins`
+mechanism above. `dfkv_connector.l2_adapter.DfkvL2Adapter` implements that
+interface and is loaded through LMCache's built-in `plugin` L2 adapter:
+
+```bash
+# 1) Start the MP server with dfkv as the remote (L2) tier:
+lmcache server --port 6555 --max-workers 8 --l1-size-gb 80 \
+  --eviction-policy LRU --chunk-size 256 \
+  --l2-adapter '{"type":"plugin",
+    "module_path":"dfkv_connector.l2_adapter",
+    "class_name":"DfkvL2Adapter",
+    "config_class_name":"DfkvL2AdapterConfig",
+    "adapter_params":{
+      "url":"dfkv://<mds_ip:port,...>/<group>",
+      "membership":"mds",
+      "lib":"/path/to/libdfkv.so",
+      "model_name":"<deployment-name>"}}'
+
+# 2) Point vLLM at the MP server (NOTE: --no-enable-prefix-caching routes all
+#    KV reuse through LMCache):
+vllm serve <model> --tensor-parallel-size 8 --no-enable-prefix-caching \
+  --kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both",
+    "kv_connector_extra_config":{"lmcache.mp.port":6555}}'
+```
+
+`adapter_params` keys: `url` (required, same grammar as in-process),
+`membership` (`mds`|`static`), `lib` (else `DFKV_LIB`), `model_name`
+(isolation namespace → stable dfkv `model_hash`), `mds_poll_ms` (3000),
+`page_size` (0 = geometry guard off), `num_workers` (8), `max_capacity_gb`
+(0 = dfkv manages its own capacity; >0 enables aggregate L2 eviction). The
+server's pinned L1 arena is auto-registered for RDMA zero-copy when LMCache
+passes an `l1_memory_desc`. Validated on GLM-5.2 (vLLM 0.23.0 + LMCache 0.4.7):
+store → restart (L1 wiped) → reload from dfkv with prefill skipped.
+
 ## Environment variables
 
 | Variable | Default | Meaning |
@@ -66,6 +105,13 @@ env `DFKV_LIB` → `$DFKV_BUILD/libdfkv.so`.
 
 ## Limitations
 
-- No L2-adapter path (the dingofs L2 adapter was bound to the native eventfd
-  model dfkv doesn't have). Only the `remote_storage_plugin` path is supported.
-- No `remove` / enumeration (`list()` returns `[]`) — dfkv has no such RPC.
+- Two integration paths, pick by LMCache mode: the in-process
+  `remote_storage_plugin` path (`adapter.py`, `RemoteConnector`) for the legacy
+  in-process connector, and the **MP-server L2-adapter path** (`l2_adapter.py`,
+  `DfkvL2Adapter`) for `LMCacheMPConnector`. The L2 adapter bridges dfkv's
+  synchronous ctypes client to LMCache's eventfd model with a background asyncio
+  loop (dfkv has no native eventfd, so no pybind/`NativeConnectorL2Adapter`
+  path is used).
+- No `remove` / enumeration (`list()` returns `[]`) — dfkv has no such RPC. L2
+  eviction (`max_capacity_gb > 0`) reports usage but cannot delete (dfkv manages
+  its own capacity).

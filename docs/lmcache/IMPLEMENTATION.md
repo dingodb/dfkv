@@ -40,7 +40,11 @@ integration/lmcache/
 | `native_client.py` | ctypes 加载 `libdfkv.so`，异步封装 batch_set/get/exists | **重写**（核心） |
 | `remote_connector.py` | `RemoteConnector` 全部接口 | 移植改名；删 cap；接 reshape；改名环境变量 |
 
-`l2_adapter.py` / `l2_factory.py` 初版**丢弃**（依赖 dfkv 没有的原生 eventfd 模型）。
+`l2_adapter.py`：⚠️【2026-06-29】初版丢弃（dingofs 版依赖原生 eventfd）；**现已重新实现** `DfkvL2Adapter`
+——纯 Python，后台 asyncio loop 跑 `DfkvNativeClient` 的 batch_set/get/exists 协程，三个 `create_event_notifier`
+（store/lookup/load）+ done-callback 桥接到 LMCache `L2AdapterInterface`；`ObjectKey`→`model_name@kv_rank@group@hash[@salt]`；
+经 LMCache 内置 `plugin` L2 adapter（`--l2-adapter {"type":"plugin",...}`）加载，给 `LMCacheMPConnector`（多 KV-group 模型）用。
+单测 `tests/test_l2_adapter.py`（fake client）+ GLM-5.2 真机 store/重启/回载已验证。
 
 ---
 

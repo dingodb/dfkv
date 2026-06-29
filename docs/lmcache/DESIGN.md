@@ -147,7 +147,10 @@ cache miss 重算）。
 - **geometry 稳定性** —— 所有字段确定性推导。
 - **大 chunk 传输** —— dfkv 无 4 MiB cap，但部署前应用真实 `full_chunk_size_bytes` 冒烟一次，
   确认 wire frame 不会拒绝大 value。
-- **无 L2 adapter 路径** —— dingofs 的 L2 adapter 绑定原生 eventfd 模型，dfkv 没有，故初版只支持
-  `remote_storage_plugin` 路径。
+- **L2 adapter 路径** —— ⚠️【2026-06-29 更新】初版只支持 `remote_storage_plugin`（in-process）路径，
+  因 dingofs 的 L2 adapter 绑定原生 eventfd 模型。**现已补齐 MP-server L2 adapter**（`l2_adapter.py`,
+  `DfkvL2Adapter`）：用后台 asyncio loop + 三 eventfd 把 dfkv 同步 ctypes 客户端桥接到 LMCache 的
+  `L2AdapterInterface`，经内置 `plugin` L2 adapter 加载（`--l2-adapter`）。GLM-5.2 上实测 store→重启→
+  从 dfkv 回载、prefill 跳过。这是 `LMCacheMPConnector`（多 KV-group 模型，如 GLM-5.x DSA）的唯一可用路径。
 - **无 remove / 枚举** —— dfkv 无此 RPC，`list()` 返回 `[]`。
 - **RDMA 可达性** —— a100↔jg29/jg31 需在同一 IB 网络，否则回退 TCP。
