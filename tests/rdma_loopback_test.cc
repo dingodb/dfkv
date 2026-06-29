@@ -609,6 +609,58 @@ TEST(RdmaLoopback, ReclaimsAndReapsIdleConnThreads) {
   ::unsetenv("DFKV_RDMA_IDLE_MS");
 }
 
+// Regression: a BATCH op whose pooled connection the server reclaimed on idle
+// must transparently re-dial and succeed — NOT return kIOError for the batch.
+// Before the fix only the single-op RoundTrip retried a stale pooled conn; the
+// batch paths (CacheMany/CacheFrom/RangeInto/ExistMany/...) gave up on the first
+// failed window, which surfaced to SGLang as "Write page to storage: N pages
+// failed" on writes and 0-hit prefixes on reads after an idle gap.
+TEST(RdmaLoopback, BatchRetriesAfterServerReclaim) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_IDLE_MS", "120", 1);   // server reclaims idle conns fast
+  RdmaNode node("brc");
+  RdmaTransport rt(kMaxMsg);                   // long-lived: holds the device ctx
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  const int N = 24;
+  for (int i = 0; i < N; ++i) {
+    std::string v = "val" + std::to_string(i);
+    ASSERT_TRUE(c.Put("b" + std::to_string(i), v.data(), v.size())) << "warm i=" << i;
+  }
+  // Warm the pool so a connection is parked for the node, then snapshot the dial
+  // counter — the batch op below must open a NEW one when it finds it stale.
+  EXPECT_TRUE(c.Exist("b0"));
+  long opened_warm =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  ASSERT_GE(opened_warm, 1);
+
+  // Let the server reclaim the now-idle pooled connection (idle window 120 ms).
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+  // The pooled conn is stale (its server peer was reclaimed). A batch existence
+  // probe must detect that on the first window and re-dial a fresh conn, returning
+  // CORRECT results — not kIOError for the whole batch. Direct transport call so no
+  // KVClient-level health retry can mask a transport that failed to recover.
+  std::vector<BlockKey> keys;
+  for (int i = 0; i < N; ++i) {
+    keys.push_back(ToBlockKey("b" + std::to_string(i)));     // present (warm)
+    keys.push_back(ToBlockKey("nope" + std::to_string(i)));  // absent
+  }
+  std::vector<char> exists;
+  auto sts = rt.ExistMany(node.addr, keys, &exists);
+  ASSERT_EQ(exists.size(), keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    EXPECT_NE(sts[i], Status::kIOError) << "i=" << i << " (stale conn not retried)";
+    EXPECT_EQ(exists[i] != 0, (i % 2 == 0)) << "i=" << i;
+  }
+  // The retry re-dialed: a new client connection was opened after the warm-up.
+  long opened_after =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  EXPECT_GT(opened_after, opened_warm) << "batch op did not re-dial after reclaim";
+
+  ::unsetenv("DFKV_RDMA_IDLE_MS");
+}
+
 // A cache node that ALSO wires the async-GET prep + complete hooks, so the server
 // uses the io_uring batch-and-wait GET path when DFKV_SERVER_URING=1 (and the
 // binary was built with -DDFKV_WITH_URING). With the env off / unbuilt these
