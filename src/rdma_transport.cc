@@ -63,7 +63,7 @@ size_t ControlCapFor(size_t max_payload) {
 // for request j lands in ep.rbuf[j] (RC in-order delivery). rbytes[j] = reply
 // length. Returns false (connection unusable) on any error completion.
 bool RunWindow(rdma::RcEndpoint& ep, const std::vector<size_t>& slen,
-               std::vector<uint32_t>* rbytes) {
+               std::vector<uint32_t>* rbytes, int timeout_ms) {
   const size_t w = slen.size();
   rbytes->assign(w, 0);
   for (size_t j = 0; j < w; ++j)
@@ -71,8 +71,8 @@ bool RunWindow(rdma::RcEndpoint& ep, const std::vector<size_t>& slen,
   std::vector<ibv_wc> wcs(2 * w);
   int need = static_cast<int>(2 * w);
   while (need > 0) {
-    int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
-    if (g <= 0) return false;
+    int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), timeout_ms);
+    if (g <= 0) return false;  // <0 error, 0 timeout => conn unusable, caller retries
     for (int i = 0; i < g; ++i) {
       if (wcs[i].status != IBV_WC_SUCCESS) return false;
       if (wcs[i].opcode == IBV_WC_RECV)
@@ -115,6 +115,15 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
   connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);
   io_ms_ = EnvInt("DFKV_RDMA_IO_MS", 10000);
+  // Datapath completion timeout. EnvInt maps non-positive => default; treat an
+  // explicit "0" as -1 (block forever, the legacy behavior) for an escape hatch.
+  {
+    const char* v = std::getenv("DFKV_RDMA_OP_TIMEOUT_MS");
+    if (v && *v) {
+      long x = std::strtol(v, nullptr, 10);
+      op_timeout_ms_ = (x == 0) ? -1 : (x > 0 ? static_cast<int>(x) : 5000);
+    }
+  }
   // Idle-connection pool cap. The pool naturally bounds at peak concurrency
   // (each thread holds <=1 conn); this only guards against a thread-count spike
   // leaving many idle conns. Must be >= peak concurrency or releases churn
@@ -132,15 +141,21 @@ RdmaTransport::~RdmaTransport() {
 
 void RdmaTransport::Destroy(Conn* c) { delete c; }  // RcEndpoint dtor tears down QP/MRs
 
-RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_pool) {
+RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_pool,
+                                            bool force_new) {
   std::vector<std::pair<void*, size_t>> pools;
   Conn* pooled = nullptr;
   {
     std::lock_guard<std::mutex> lk(mu_);
     pools = pools_;  // snapshot (a few regions); register on the conn outside the lock
-    auto it = pool_.find(node);
-    if (it != pool_.end() && !it->second.empty()) {
-      pooled = it->second.back(); it->second.pop_back();
+    // A retry (force_new) skips the pool: the conn we just tore down was reclaimed
+    // by the server, and the pool may hold more reclaimed conns — bootstrapping a
+    // fresh one guarantees the retry isn't handed another dead conn.
+    if (!force_new) {
+      auto it = pool_.find(node);
+      if (it != pool_.end() && !it->second.empty()) {
+        pooled = it->second.back(); it->second.pop_back();
+      }
     }
   }
   if (pooled) { pooled->ep.EnsurePoolMrs(pools); *from_pool = true; return pooled; }
@@ -231,7 +246,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     return Status::kInvalid;
   for (int attempt = 0; attempt < 2; ++attempt) {
     bool from_pool = false;
-    Conn* c = Acquire(node, &from_pool);
+    Conn* c = Acquire(node, &from_pool, attempt > 0);
     if (!c) return Status::kIOError;
     rdma::RcEndpoint& ep = c->ep;
 
@@ -244,7 +259,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     bool need_send = ok, need_recv = ok;
     while (ok && (need_send || need_recv)) {
       ibv_wc wc{};
-      int g = ep.WaitComp(&wc, 1);
+      int g = ep.WaitComp(&wc, 1, op_timeout_ms_);
       if (g <= 0 || wc.status != IBV_WC_SUCCESS) { ok = false; break; }
       if (wc.opcode == IBV_WC_SEND) need_send = false;
       else if (wc.opcode == IBV_WC_RECV) { need_recv = false; recv_bytes = wc.byte_len; }
@@ -299,29 +314,38 @@ std::vector<Status> RdmaTransport::CacheMany(const std::string& node,
     }
   }
 
-  bool from_pool = false;
-  Conn* c = Acquire(node, &from_pool);
-  if (!c) return res;
-  rdma::RcEndpoint& ep = c->ep;
-  const size_t W = ep.depth();
-  bool conn_ok = true;
-  for (size_t base = 0; base < n && conn_ok; base += W) {
-    const size_t w = std::min(W, n - base);
-    std::vector<size_t> slen(w);
-    for (size_t j = 0; j < w; ++j) {
-      const CacheItem& it = items[base + j];
-      EncodeReq(ep.sbuf(j), WireOp::kCache, it.key, 0, 0, it.len);
-      if (it.len) std::memcpy(ep.sbuf(j) + kReqPrefix, it.data, it.len);
-      slen[j] = kReqPrefix + it.len;
+  // 2-attempt loop: a stale pooled conn (peer reclaimed it after idle) fails fast
+  // on the first window; tear it down and retry once on a fresh conn. Cache is
+  // idempotent, so replaying the whole batch is harmless. Mirrors RoundTrip.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::fill(res.begin(), res.end(), Status::kIOError);
+    bool from_pool = false;
+    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    if (!c) return res;
+    rdma::RcEndpoint& ep = c->ep;
+    const size_t W = ep.depth();
+    bool conn_ok = true;
+    for (size_t base = 0; base < n && conn_ok; base += W) {
+      const size_t w = std::min(W, n - base);
+      std::vector<size_t> slen(w);
+      for (size_t j = 0; j < w; ++j) {
+        const CacheItem& it = items[base + j];
+        EncodeReq(ep.sbuf(j), WireOp::kCache, it.key, 0, 0, it.len);
+        if (it.len) std::memcpy(ep.sbuf(j) + kReqPrefix, it.data, it.len);
+        slen[j] = kReqPrefix + it.len;
+      }
+      std::vector<uint32_t> rbytes;
+      if (!RunWindow(ep, slen, &rbytes, op_timeout_ms_)) { conn_ok = false; break; }
+      for (size_t j = 0; j < w; ++j) {
+        Status st; uint64_t dl = 0;
+        if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
+      }
     }
-    std::vector<uint32_t> rbytes;
-    if (!RunWindow(ep, slen, &rbytes)) { conn_ok = false; break; }
-    for (size_t j = 0; j < w; ++j) {
-      Status st; uint64_t dl = 0;
-      if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
-    }
+    if (conn_ok) { Release(node, c); return res; }
+    Destroy(c);
+    if (from_pool) continue;  // stale pooled conn -> one fresh retry
+    return res;               // fresh conn failed -> terminal
   }
-  if (conn_ok) Release(node, c); else Destroy(c);
   return res;
 }
 
@@ -338,34 +362,43 @@ std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
     return res;
   }
 
-  bool from_pool = false;
-  Conn* c = Acquire(node, &from_pool);
-  if (!c) return res;
-  rdma::RcEndpoint& ep = c->ep;
-  const size_t W = ep.depth();
-  bool conn_ok = true;
-  for (size_t base = 0; base < n && conn_ok; base += W) {
-    const size_t w = std::min(W, n - base);
-    std::vector<size_t> slen(w);
-    for (size_t j = 0; j < w; ++j) {
-      EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], offset, length, 0);
-      slen[j] = kReqPrefix;
-    }
-    std::vector<uint32_t> rbytes;
-    if (!RunWindow(ep, slen, &rbytes)) { conn_ok = false; break; }
-    for (size_t j = 0; j < w; ++j) {
-      uint32_t rb = rbytes[j];
-      if (rb < kRespPrefix) continue;
-      Status st; uint64_t dlen = 0;
-      if (!DecodeResp(ep.rbuf(j), &st, &dlen)) continue;
-      res[base + j] = st;
-      if (st == Status::kOk) {
-        if (kRespPrefix + dlen <= rb) (*outs)[base + j].assign(ep.rbuf(j) + kRespPrefix, dlen);
-        else res[base + j] = Status::kIOError;
+  // 2-attempt loop: retry a stale pooled conn once on a fresh one. Range is a
+  // read (idempotent), so replaying the whole batch is harmless. Mirrors RoundTrip.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::fill(res.begin(), res.end(), Status::kIOError);
+    outs->assign(n, std::string());
+    bool from_pool = false;
+    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    if (!c) return res;
+    rdma::RcEndpoint& ep = c->ep;
+    const size_t W = ep.depth();
+    bool conn_ok = true;
+    for (size_t base = 0; base < n && conn_ok; base += W) {
+      const size_t w = std::min(W, n - base);
+      std::vector<size_t> slen(w);
+      for (size_t j = 0; j < w; ++j) {
+        EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], offset, length, 0);
+        slen[j] = kReqPrefix;
+      }
+      std::vector<uint32_t> rbytes;
+      if (!RunWindow(ep, slen, &rbytes, op_timeout_ms_)) { conn_ok = false; break; }
+      for (size_t j = 0; j < w; ++j) {
+        uint32_t rb = rbytes[j];
+        if (rb < kRespPrefix) continue;
+        Status st; uint64_t dlen = 0;
+        if (!DecodeResp(ep.rbuf(j), &st, &dlen)) continue;
+        res[base + j] = st;
+        if (st == Status::kOk) {
+          if (kRespPrefix + dlen <= rb) (*outs)[base + j].assign(ep.rbuf(j) + kRespPrefix, dlen);
+          else res[base + j] = Status::kIOError;
+        }
       }
     }
+    if (conn_ok) { Release(node, c); return res; }
+    Destroy(c);
+    if (from_pool) continue;  // stale pooled conn -> one fresh retry
+    return res;               // fresh conn failed -> terminal
   }
-  if (conn_ok) Release(node, c); else Destroy(c);
   return res;
 }
 
@@ -379,30 +412,39 @@ std::vector<Status> RdmaTransport::ExistMany(const std::string& node,
   // kExist carries no payload and gets a status-only reply, so each request is
   // exactly kReqPrefix bytes and always fits the control buffer (no size guard).
 
-  bool from_pool = false;
-  Conn* c = Acquire(node, &from_pool);
-  if (!c) return res;
-  rdma::RcEndpoint& ep = c->ep;
-  const size_t W = ep.depth();
-  bool conn_ok = true;
-  for (size_t base = 0; base < n && conn_ok; base += W) {
-    const size_t w = std::min(W, n - base);
-    std::vector<size_t> slen(w);
-    for (size_t j = 0; j < w; ++j) {
-      EncodeReq(ep.sbuf(j), WireOp::kExist, keys[base + j], 0, 0, 0);
-      slen[j] = kReqPrefix;
+  // 2-attempt loop: retry a stale pooled conn once on a fresh one. Exist is a
+  // read (idempotent), so replaying the whole batch is harmless. Mirrors RoundTrip.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::fill(res.begin(), res.end(), Status::kIOError);
+    std::fill(exists->begin(), exists->end(), 0);
+    bool from_pool = false;
+    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    if (!c) return res;
+    rdma::RcEndpoint& ep = c->ep;
+    const size_t W = ep.depth();
+    bool conn_ok = true;
+    for (size_t base = 0; base < n && conn_ok; base += W) {
+      const size_t w = std::min(W, n - base);
+      std::vector<size_t> slen(w);
+      for (size_t j = 0; j < w; ++j) {
+        EncodeReq(ep.sbuf(j), WireOp::kExist, keys[base + j], 0, 0, 0);
+        slen[j] = kReqPrefix;
+      }
+      std::vector<uint32_t> rbytes;
+      if (!RunWindow(ep, slen, &rbytes, op_timeout_ms_)) { conn_ok = false; break; }
+      for (size_t j = 0; j < w; ++j) {
+        if (rbytes[j] < kRespPrefix) continue;
+        Status st; uint64_t dl = 0;
+        if (!DecodeResp(ep.rbuf(j), &st, &dl)) continue;
+        res[base + j] = st;                              // kOk=present, kNotFound=absent
+        (*exists)[base + j] = (st == Status::kOk) ? 1 : 0;
+      }
     }
-    std::vector<uint32_t> rbytes;
-    if (!RunWindow(ep, slen, &rbytes)) { conn_ok = false; break; }
-    for (size_t j = 0; j < w; ++j) {
-      if (rbytes[j] < kRespPrefix) continue;
-      Status st; uint64_t dl = 0;
-      if (!DecodeResp(ep.rbuf(j), &st, &dl)) continue;
-      res[base + j] = st;                              // kOk=present, kNotFound=absent
-      (*exists)[base + j] = (st == Status::kOk) ? 1 : 0;
-    }
+    if (conn_ok) { Release(node, c); return res; }
+    Destroy(c);
+    if (from_pool) continue;  // stale pooled conn -> one fresh retry
+    return res;               // fresh conn failed -> terminal
   }
-  if (conn_ok) Release(node, c); else Destroy(c);
   return res;
 }
 
@@ -427,62 +469,73 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
     }
   }
 
-  bool from_pool = false;
-  Conn* c = Acquire(node, &from_pool);
-  if (!c) return res;
-  rdma::RcEndpoint& ep = c->ep;
-  const size_t W = ep.depth();
-  bool conn_ok = true;
-  for (size_t base = 0; base < n && conn_ok; base += W) {
-    const size_t w = std::min(W, n - base);
-    // Register the destination buffers (cached). Any failure => give the conn
-    // back and fall back to the copy-based path for the whole call.
-    std::vector<ibv_mr*> mrs(w, nullptr);
-    bool regok = true;
-    for (size_t j = 0; j < w && regok; ++j) {
-      if (dsts[base + j].n == 0) continue;  // empty: header-only reply into rbuf, no MR
-      mrs[j] = ep.RegisterUser(dsts[base + j].payload, dsts[base + j].n);
-      if (!mrs[j]) regok = false;
-    }
-    if (!regok) { Release(node, c); return res; }
-    // Scatter recv [hdr -> rbuf | payload -> caller buffer], then send the Range req.
-    // Empty (n==0) dsts use a plain recv (the reply is just resp-prefix + header).
-    for (size_t j = 0; j < w && conn_ok; ++j) {
-      bool armed = dsts[base + j].n
-                       ? ep.PostRecvScatter(j, dsts[base + j].payload, dsts[base + j].n, mrs[j], hdr_bytes)
-                       : ep.PostRecv(j);
-      if (!armed) { conn_ok = false; break; }
-      EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + dsts[base + j].n, 0);
-      if (!ep.PostSend(j, kReqPrefix)) { conn_ok = false; break; }
-    }
-    if (!conn_ok) break;
-    std::vector<ibv_wc> wcs(2 * w);
-    std::vector<uint32_t> rbytes(w, 0);
-    int need = static_cast<int>(2 * w);
-    while (need > 0) {
-      int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
-      if (g <= 0) { conn_ok = false; break; }
-      for (int i = 0; i < g; ++i) {
-        if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
-        if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
-        --need;
+  // 2-attempt loop: retry a stale pooled conn once on a fresh one. Range is a read
+  // (idempotent) and the scatter lands in the caller's buffers, so replaying the
+  // whole batch is harmless. Mirrors RoundTrip. (MR-registration failure is a
+  // local resource issue, not staleness, so it stays terminal — no retry.)
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::fill(res.begin(), res.end(), Status::kIOError);
+    hdrs->assign(n, std::string());
+    bool from_pool = false;
+    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    if (!c) return res;
+    rdma::RcEndpoint& ep = c->ep;
+    const size_t W = ep.depth();
+    bool conn_ok = true;
+    for (size_t base = 0; base < n && conn_ok; base += W) {
+      const size_t w = std::min(W, n - base);
+      // Register the destination buffers (cached). Any failure => give the conn
+      // back and fall back to the copy-based path for the whole call.
+      std::vector<ibv_mr*> mrs(w, nullptr);
+      bool regok = true;
+      for (size_t j = 0; j < w && regok; ++j) {
+        if (dsts[base + j].n == 0) continue;  // empty: header-only reply into rbuf, no MR
+        mrs[j] = ep.RegisterUser(dsts[base + j].payload, dsts[base + j].n);
+        if (!mrs[j]) regok = false;
+      }
+      if (!regok) { Release(node, c); return res; }
+      // Scatter recv [hdr -> rbuf | payload -> caller buffer], then send the Range req.
+      // Empty (n==0) dsts use a plain recv (the reply is just resp-prefix + header).
+      for (size_t j = 0; j < w && conn_ok; ++j) {
+        bool armed = dsts[base + j].n
+                         ? ep.PostRecvScatter(j, dsts[base + j].payload, dsts[base + j].n, mrs[j], hdr_bytes)
+                         : ep.PostRecv(j);
+        if (!armed) { conn_ok = false; break; }
+        EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + dsts[base + j].n, 0);
+        if (!ep.PostSend(j, kReqPrefix)) { conn_ok = false; break; }
       }
       if (!conn_ok) break;
-    }
-    if (!conn_ok) break;
-    for (size_t j = 0; j < w; ++j) {
-      uint32_t rb = rbytes[j];
-      if (rb < kRespPrefix) continue;
-      Status st; uint64_t dl = 0;
-      if (!DecodeResp(ep.rbuf(j), &st, &dl)) continue;
-      res[base + j] = st;            // payload (if any) already in dsts[].payload
-      if (st == Status::kOk) {
-        if (rb >= hdr_bytes) (*hdrs)[base + j].assign(ep.rbuf(j) + kRespPrefix, header_size);
-        else res[base + j] = Status::kIOError;
+      std::vector<ibv_wc> wcs(2 * w);
+      std::vector<uint32_t> rbytes(w, 0);
+      int need = static_cast<int>(2 * w);
+      while (need > 0) {
+        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), op_timeout_ms_);
+        if (g <= 0) { conn_ok = false; break; }
+        for (int i = 0; i < g; ++i) {
+          if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
+          if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
+          --need;
+        }
+        if (!conn_ok) break;
+      }
+      if (!conn_ok) break;
+      for (size_t j = 0; j < w; ++j) {
+        uint32_t rb = rbytes[j];
+        if (rb < kRespPrefix) continue;
+        Status st; uint64_t dl = 0;
+        if (!DecodeResp(ep.rbuf(j), &st, &dl)) continue;
+        res[base + j] = st;            // payload (if any) already in dsts[].payload
+        if (st == Status::kOk) {
+          if (rb >= hdr_bytes) (*hdrs)[base + j].assign(ep.rbuf(j) + kRespPrefix, header_size);
+          else res[base + j] = Status::kIOError;
+        }
       }
     }
+    if (conn_ok) { Release(node, c); return res; }
+    Destroy(c);
+    if (from_pool) continue;  // stale pooled conn -> one fresh retry
+    return res;               // fresh conn failed -> terminal
   }
-  if (conn_ok) Release(node, c); else Destroy(c);
   return res;
 }
 
@@ -500,63 +553,72 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
     }
   }
 
-  bool from_pool = false;
-  Conn* c = Acquire(node, &from_pool);
-  if (!c) return res;
-  rdma::RcEndpoint& ep = c->ep;
-  const size_t W = ep.depth();
-  bool conn_ok = true;
-  for (size_t base = 0; base < n && conn_ok; base += W) {
-    const size_t w = std::min(W, n - base);
-    // Register the payload buffers (cached). Any failure => give the conn back
-    // and fall back to the copy path for the whole call (Cache is idempotent, so
-    // re-sending already-sent earlier windows is harmless — same as RangeInto).
-    std::vector<ibv_mr*> mrs(w, nullptr);
-    bool regok = true;
-    for (size_t j = 0; j < w && regok; ++j) {
-      const CacheSrc& s = srcs[base + j];
-      if (s.payload_len == 0) continue;  // empty value: header-only 1-SGE send, no MR
-      // const_cast: a SEND source is only read by the NIC; the LOCAL_WRITE-only
-      // MR is never written, and RegisterUser keys its cache by address.
-      mrs[j] = ep.RegisterUser(const_cast<void*>(s.payload), s.payload_len);
-      if (!mrs[j]) regok = false;
-    }
-    if (!regok) { Release(node, c); return res; }
-    // Build [req prefix | value header] into sbuf[j], scatter-send with the
-    // payload coming straight from the caller's registered buffer. The wire
-    // payload_len field is header_len + user payload_len (the full stored blob).
-    for (size_t j = 0; j < w && conn_ok; ++j) {
-      const CacheSrc& s = srcs[base + j];
-      EncodeReq(ep.sbuf(j), WireOp::kCache, s.key, 0, 0, s.header_len + s.payload_len);
-      if (s.header_len) std::memcpy(ep.sbuf(j) + kReqPrefix, s.header, s.header_len);
-      if (!ep.PostRecv(j)) { conn_ok = false; break; }
-      if (!ep.PostSendScatter(j, kReqPrefix + s.header_len, s.payload, s.payload_len, mrs[j])) {
-        conn_ok = false; break;
+  // 2-attempt loop: retry a stale pooled conn once on a fresh one. Cache is
+  // idempotent, so replaying the whole batch (re-sending earlier windows) is
+  // harmless. Mirrors RoundTrip. (MR-registration failure stays terminal.)
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::fill(res.begin(), res.end(), Status::kIOError);
+    bool from_pool = false;
+    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    if (!c) return res;
+    rdma::RcEndpoint& ep = c->ep;
+    const size_t W = ep.depth();
+    bool conn_ok = true;
+    for (size_t base = 0; base < n && conn_ok; base += W) {
+      const size_t w = std::min(W, n - base);
+      // Register the payload buffers (cached). Any failure => give the conn back
+      // and fall back to the copy path for the whole call (Cache is idempotent, so
+      // re-sending already-sent earlier windows is harmless — same as RangeInto).
+      std::vector<ibv_mr*> mrs(w, nullptr);
+      bool regok = true;
+      for (size_t j = 0; j < w && regok; ++j) {
+        const CacheSrc& s = srcs[base + j];
+        if (s.payload_len == 0) continue;  // empty value: header-only 1-SGE send, no MR
+        // const_cast: a SEND source is only read by the NIC; the LOCAL_WRITE-only
+        // MR is never written, and RegisterUser keys its cache by address.
+        mrs[j] = ep.RegisterUser(const_cast<void*>(s.payload), s.payload_len);
+        if (!mrs[j]) regok = false;
       }
-    }
-    if (!conn_ok) break;
-    // Reap 2*w completions (send + recv per slot) before reusing any slot or
-    // returning — the NIC reads the user payload until the SEND completes.
-    std::vector<ibv_wc> wcs(2 * w);
-    std::vector<uint32_t> rbytes(w, 0);
-    int need = static_cast<int>(2 * w);
-    while (need > 0) {
-      int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
-      if (g <= 0) { conn_ok = false; break; }
-      for (int i = 0; i < g; ++i) {
-        if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
-        if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
-        --need;
+      if (!regok) { Release(node, c); return res; }
+      // Build [req prefix | value header] into sbuf[j], scatter-send with the
+      // payload coming straight from the caller's registered buffer. The wire
+      // payload_len field is header_len + user payload_len (the full stored blob).
+      for (size_t j = 0; j < w && conn_ok; ++j) {
+        const CacheSrc& s = srcs[base + j];
+        EncodeReq(ep.sbuf(j), WireOp::kCache, s.key, 0, 0, s.header_len + s.payload_len);
+        if (s.header_len) std::memcpy(ep.sbuf(j) + kReqPrefix, s.header, s.header_len);
+        if (!ep.PostRecv(j)) { conn_ok = false; break; }
+        if (!ep.PostSendScatter(j, kReqPrefix + s.header_len, s.payload, s.payload_len, mrs[j])) {
+          conn_ok = false; break;
+        }
       }
       if (!conn_ok) break;
+      // Reap 2*w completions (send + recv per slot) before reusing any slot or
+      // returning — the NIC reads the user payload until the SEND completes.
+      std::vector<ibv_wc> wcs(2 * w);
+      std::vector<uint32_t> rbytes(w, 0);
+      int need = static_cast<int>(2 * w);
+      while (need > 0) {
+        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), op_timeout_ms_);
+        if (g <= 0) { conn_ok = false; break; }
+        for (int i = 0; i < g; ++i) {
+          if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
+          if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
+          --need;
+        }
+        if (!conn_ok) break;
+      }
+      if (!conn_ok) break;
+      for (size_t j = 0; j < w; ++j) {
+        Status st; uint64_t dl = 0;
+        if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
+      }
     }
-    if (!conn_ok) break;
-    for (size_t j = 0; j < w; ++j) {
-      Status st; uint64_t dl = 0;
-      if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
-    }
+    if (conn_ok) { Release(node, c); return res; }
+    Destroy(c);
+    if (from_pool) continue;  // stale pooled conn -> one fresh retry
+    return res;               // fresh conn failed -> terminal
   }
-  if (conn_ok) Release(node, c); else Destroy(c);
   return res;
 }
 
@@ -568,91 +630,99 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   // Validate: header fits the control buffer, total payload fits one message, and
   // the segment count fits one work request (1 header SGE + segs). Like CacheFrom,
   // do not silently fall back — this is the zero-copy SG PUT route.
-  bool from_pool = false;
-  Conn* c = Acquire(node, &from_pool);
-  if (!c) return res;
-  rdma::RcEndpoint& ep = c->ep;
-  const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
-  // Per-item validation: an oversized key must fail ONLY itself (kInvalid), not
-  // poison its node batch. The connector treats per-key kInvalid as a save miss
-  // (fail-soft recompute), so we mark offenders and skip them in the window below.
-  std::vector<char> bad(n, 0);
-  for (size_t i = 0; i < n; ++i) {
-    const auto& s = srcs[i];
-    size_t total = 0;
-    for (const auto& p : s.payloads) total += p.second;
-    if (s.header_len > control_cap_ - kReqPrefix || total > max_payload_ ||
-        s.payloads.size() > max_payload_segs) {
-      bad[i] = 1;
-      res[i] = Status::kInvalid;
-    }
-  }
-
-  const size_t W = ep.depth();
-  bool conn_ok = true;
-  for (size_t base = 0; base < n && conn_ok; base += W) {
-    const size_t w = std::min(W, n - base);
-    // Register every payload segment of every key in this window (cached MR lookup).
-    // mrs_per[j] holds the per-segment MRs for slot j. Any failure => give the conn
-    // back; Cache is idempotent so re-sending earlier windows on retry is harmless.
-    // Oversized slots (bad[base+j]) are skipped: no MR, no recv/send, and they do
-    // not consume a completion (need is sized to the posted slots only).
-    std::vector<std::vector<ibv_mr*>> mrs_per(w);
-    bool regok = true;
-    for (size_t j = 0; j < w && regok; ++j) {
-      if (bad[base + j]) continue;
-      const CacheSrcMulti& s = srcs[base + j];
-      mrs_per[j].assign(s.payloads.size(), nullptr);
-      for (size_t e = 0; e < s.payloads.size() && regok; ++e) {
-        if (s.payloads[e].second == 0) continue;  // empty segment: lkey 0, no MR
-        mrs_per[j][e] = ep.RegisterUser(const_cast<void*>(s.payloads[e].first),
-                                        s.payloads[e].second);
-        if (!mrs_per[j][e]) regok = false;
-      }
-    }
-    if (!regok) { Release(node, c); return res; }
-    size_t posted = 0;
-    for (size_t j = 0; j < w && conn_ok; ++j) {
-      if (bad[base + j]) continue;
-      const CacheSrcMulti& s = srcs[base + j];
+  // 2-attempt loop: retry a stale pooled conn once on a fresh one. Cache is
+  // idempotent, so replaying the whole batch is harmless. Mirrors RoundTrip.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::fill(res.begin(), res.end(), Status::kIOError);
+    bool from_pool = false;
+    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    if (!c) return res;
+    rdma::RcEndpoint& ep = c->ep;
+    const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
+    // Per-item validation: an oversized key must fail ONLY itself (kInvalid), not
+    // poison its node batch. The connector treats per-key kInvalid as a save miss
+    // (fail-soft recompute), so we mark offenders and skip them in the window below.
+    std::vector<char> bad(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+      const auto& s = srcs[i];
       size_t total = 0;
-      std::vector<std::pair<const void*, uint32_t>> segs;
-      segs.reserve(s.payloads.size());
-      for (const auto& p : s.payloads) {
-        segs.emplace_back(p.first, static_cast<uint32_t>(p.second));
-        total += p.second;
+      for (const auto& p : s.payloads) total += p.second;
+      if (s.header_len > control_cap_ - kReqPrefix || total > max_payload_ ||
+          s.payloads.size() > max_payload_segs) {
+        bad[i] = 1;
+        res[i] = Status::kInvalid;
       }
-      // Wire payload_len = header_len + total user payload (the full stored blob).
-      EncodeReq(ep.sbuf(j), WireOp::kCache, s.key, 0, 0, s.header_len + total);
-      if (s.header_len) std::memcpy(ep.sbuf(j) + kReqPrefix, s.header, s.header_len);
-      if (!ep.PostRecv(j)) { conn_ok = false; break; }
-      if (!ep.PostSendScatterMulti(j, kReqPrefix + s.header_len, segs, mrs_per[j])) {
-        conn_ok = false; break;
-      }
-      ++posted;
     }
-    if (!conn_ok) break;
-    if (posted == 0) continue;  // whole window was oversized: nothing to reap
-    std::vector<ibv_wc> wcs(2 * w);
-    std::vector<uint32_t> rbytes(w, 0);
-    int need = static_cast<int>(2 * posted);
-    while (need > 0) {
-      int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
-      if (g <= 0) { conn_ok = false; break; }
-      for (int i = 0; i < g; ++i) {
-        if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
-        if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
-        --need;
+
+    const size_t W = ep.depth();
+    bool conn_ok = true;
+    for (size_t base = 0; base < n && conn_ok; base += W) {
+      const size_t w = std::min(W, n - base);
+      // Register every payload segment of every key in this window (cached MR lookup).
+      // mrs_per[j] holds the per-segment MRs for slot j. Any failure => give the conn
+      // back; Cache is idempotent so re-sending earlier windows on retry is harmless.
+      // Oversized slots (bad[base+j]) are skipped: no MR, no recv/send, and they do
+      // not consume a completion (need is sized to the posted slots only).
+      std::vector<std::vector<ibv_mr*>> mrs_per(w);
+      bool regok = true;
+      for (size_t j = 0; j < w && regok; ++j) {
+        if (bad[base + j]) continue;
+        const CacheSrcMulti& s = srcs[base + j];
+        mrs_per[j].assign(s.payloads.size(), nullptr);
+        for (size_t e = 0; e < s.payloads.size() && regok; ++e) {
+          if (s.payloads[e].second == 0) continue;  // empty segment: lkey 0, no MR
+          mrs_per[j][e] = ep.RegisterUser(const_cast<void*>(s.payloads[e].first),
+                                          s.payloads[e].second);
+          if (!mrs_per[j][e]) regok = false;
+        }
+      }
+      if (!regok) { Release(node, c); return res; }
+      size_t posted = 0;
+      for (size_t j = 0; j < w && conn_ok; ++j) {
+        if (bad[base + j]) continue;
+        const CacheSrcMulti& s = srcs[base + j];
+        size_t total = 0;
+        std::vector<std::pair<const void*, uint32_t>> segs;
+        segs.reserve(s.payloads.size());
+        for (const auto& p : s.payloads) {
+          segs.emplace_back(p.first, static_cast<uint32_t>(p.second));
+          total += p.second;
+        }
+        // Wire payload_len = header_len + total user payload (the full stored blob).
+        EncodeReq(ep.sbuf(j), WireOp::kCache, s.key, 0, 0, s.header_len + total);
+        if (s.header_len) std::memcpy(ep.sbuf(j) + kReqPrefix, s.header, s.header_len);
+        if (!ep.PostRecv(j)) { conn_ok = false; break; }
+        if (!ep.PostSendScatterMulti(j, kReqPrefix + s.header_len, segs, mrs_per[j])) {
+          conn_ok = false; break;
+        }
+        ++posted;
       }
       if (!conn_ok) break;
+      if (posted == 0) continue;  // whole window was oversized: nothing to reap
+      std::vector<ibv_wc> wcs(2 * w);
+      std::vector<uint32_t> rbytes(w, 0);
+      int need = static_cast<int>(2 * posted);
+      while (need > 0) {
+        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), op_timeout_ms_);
+        if (g <= 0) { conn_ok = false; break; }
+        for (int i = 0; i < g; ++i) {
+          if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
+          if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
+          --need;
+        }
+        if (!conn_ok) break;
+      }
+      if (!conn_ok) break;
+      for (size_t j = 0; j < w; ++j) {
+        Status st; uint64_t dl = 0;
+        if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
+      }
     }
-    if (!conn_ok) break;
-    for (size_t j = 0; j < w; ++j) {
-      Status st; uint64_t dl = 0;
-      if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
-    }
+    if (conn_ok) { Release(node, c); return res; }
+    Destroy(c);
+    if (from_pool) continue;  // stale pooled conn -> one fresh retry
+    return res;               // fresh conn failed -> terminal
   }
-  if (conn_ok) Release(node, c); else Destroy(c);
   return res;
 }
 
@@ -670,97 +740,108 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     std::fill(res.begin(), res.end(), Status::kInvalid);
     return res;
   }
-  bool from_pool = false;
-  Conn* c = Acquire(node, &from_pool);
-  if (!c) return res;
-  rdma::RcEndpoint& ep = c->ep;
-  const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
-  // Per-item validation: an oversized destination must fail ONLY itself (kInvalid),
-  // not poison its node batch. Offenders are marked and skipped in the window below.
-  std::vector<char> bad(n, 0);
-  for (size_t i = 0; i < n; ++i) {
-    size_t cap = 0;
-    for (const auto& p : dsts[i].payloads) cap += p.second;
-    if (cap > max_payload_ || dsts[i].payloads.size() > max_payload_segs) {
-      bad[i] = 1;
-      res[i] = Status::kInvalid;
+  // 2-attempt loop: retry a stale pooled conn once on a fresh one. Range is a read
+  // (idempotent) and the scatter lands in the caller's buffers, so replaying the
+  // whole batch is harmless. Mirrors RoundTrip.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::fill(res.begin(), res.end(), Status::kIOError);
+    hdrs->assign(n, std::string());
+    if (out_lens) out_lens->assign(n, 0);
+    bool from_pool = false;
+    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    if (!c) return res;
+    rdma::RcEndpoint& ep = c->ep;
+    const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
+    // Per-item validation: an oversized destination must fail ONLY itself (kInvalid),
+    // not poison its node batch. Offenders are marked and skipped in the window below.
+    std::vector<char> bad(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+      size_t cap = 0;
+      for (const auto& p : dsts[i].payloads) cap += p.second;
+      if (cap > max_payload_ || dsts[i].payloads.size() > max_payload_segs) {
+        bad[i] = 1;
+        res[i] = Status::kInvalid;
+      }
     }
-  }
 
-  const size_t W = ep.depth();
-  bool conn_ok = true;
-  for (size_t base = 0; base < n && conn_ok; base += W) {
-    const size_t w = std::min(W, n - base);
-    // Register every destination segment of every key in this window. Oversized
-    // slots (bad[base+j]) are skipped: no MR, no recv/send, no completion consumed.
-    std::vector<std::vector<ibv_mr*>> mrs_per(w);
-    std::vector<size_t> caps(w, 0);
-    bool regok = true;
-    for (size_t j = 0; j < w && regok; ++j) {
-      if (bad[base + j]) continue;
-      const RangeDstMulti& d = dsts[base + j];
-      mrs_per[j].assign(d.payloads.size(), nullptr);
-      for (size_t e = 0; e < d.payloads.size() && regok; ++e) {
-        caps[j] += d.payloads[e].second;
-        if (d.payloads[e].second == 0) continue;
-        mrs_per[j][e] = ep.RegisterUser(d.payloads[e].first, d.payloads[e].second);
-        if (!mrs_per[j][e]) regok = false;
+    const size_t W = ep.depth();
+    bool conn_ok = true;
+    for (size_t base = 0; base < n && conn_ok; base += W) {
+      const size_t w = std::min(W, n - base);
+      // Register every destination segment of every key in this window. Oversized
+      // slots (bad[base+j]) are skipped: no MR, no recv/send, no completion consumed.
+      std::vector<std::vector<ibv_mr*>> mrs_per(w);
+      std::vector<size_t> caps(w, 0);
+      bool regok = true;
+      for (size_t j = 0; j < w && regok; ++j) {
+        if (bad[base + j]) continue;
+        const RangeDstMulti& d = dsts[base + j];
+        mrs_per[j].assign(d.payloads.size(), nullptr);
+        for (size_t e = 0; e < d.payloads.size() && regok; ++e) {
+          caps[j] += d.payloads[e].second;
+          if (d.payloads[e].second == 0) continue;
+          mrs_per[j][e] = ep.RegisterUser(d.payloads[e].first, d.payloads[e].second);
+          if (!mrs_per[j][e]) regok = false;
+        }
       }
-    }
-    if (!regok) { Release(node, c); return res; }
-    size_t posted = 0;
-    for (size_t j = 0; j < w && conn_ok; ++j) {
-      if (bad[base + j]) continue;
-      const RangeDstMulti& d = dsts[base + j];
-      bool armed;
-      if (caps[j]) {
-        std::vector<std::pair<void*, uint32_t>> segs;
-        segs.reserve(d.payloads.size());
-        for (const auto& p : d.payloads)
-          segs.emplace_back(p.first, static_cast<uint32_t>(p.second));
-        armed = ep.PostRecvScatterMulti(j, segs, mrs_per[j], hdr_bytes);
-      } else {
-        armed = ep.PostRecv(j);  // header-only reply
-      }
-      if (!armed) { conn_ok = false; break; }
-      EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + caps[j], 0);
-      if (!ep.PostSend(j, kReqPrefix)) { conn_ok = false; break; }
-      ++posted;
-    }
-    if (!conn_ok) break;
-    if (posted == 0) continue;  // whole window was oversized: nothing to reap
-    std::vector<ibv_wc> wcs(2 * w);
-    std::vector<uint32_t> rbytes(w, 0);
-    int need = static_cast<int>(2 * posted);
-    while (need > 0) {
-      int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w));
-      if (g <= 0) { conn_ok = false; break; }
-      for (int i = 0; i < g; ++i) {
-        if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
-        if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
-        --need;
+      if (!regok) { Release(node, c); return res; }
+      size_t posted = 0;
+      for (size_t j = 0; j < w && conn_ok; ++j) {
+        if (bad[base + j]) continue;
+        const RangeDstMulti& d = dsts[base + j];
+        bool armed;
+        if (caps[j]) {
+          std::vector<std::pair<void*, uint32_t>> segs;
+          segs.reserve(d.payloads.size());
+          for (const auto& p : d.payloads)
+            segs.emplace_back(p.first, static_cast<uint32_t>(p.second));
+          armed = ep.PostRecvScatterMulti(j, segs, mrs_per[j], hdr_bytes);
+        } else {
+          armed = ep.PostRecv(j);  // header-only reply
+        }
+        if (!armed) { conn_ok = false; break; }
+        EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + caps[j], 0);
+        if (!ep.PostSend(j, kReqPrefix)) { conn_ok = false; break; }
+        ++posted;
       }
       if (!conn_ok) break;
-    }
-    if (!conn_ok) break;
-    for (size_t j = 0; j < w; ++j) {
-      uint32_t rb = rbytes[j];
-      if (rb < kRespPrefix) continue;
-      Status st; uint64_t dl = 0;
-      if (!DecodeResp(ep.rbuf(j), &st, &dl)) continue;
-      res[base + j] = st;  // payload (if any) already scattered into dsts[].payloads
-      if (st == Status::kOk) {
-        if (rb >= hdr_bytes) {
-          (*hdrs)[base + j].assign(ep.rbuf(j) + kRespPrefix, header_size);
-          // True stored payload bytes received = rb - resp-prefix - value header.
-          if (out_lens) (*out_lens)[base + j] = rb - hdr_bytes;
-        } else {
-          res[base + j] = Status::kIOError;
+      if (posted == 0) continue;  // whole window was oversized: nothing to reap
+      std::vector<ibv_wc> wcs(2 * w);
+      std::vector<uint32_t> rbytes(w, 0);
+      int need = static_cast<int>(2 * posted);
+      while (need > 0) {
+        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), op_timeout_ms_);
+        if (g <= 0) { conn_ok = false; break; }
+        for (int i = 0; i < g; ++i) {
+          if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
+          if (wcs[i].opcode == IBV_WC_RECV) rbytes[static_cast<size_t>(wcs[i].wr_id)] = wcs[i].byte_len;
+          --need;
+        }
+        if (!conn_ok) break;
+      }
+      if (!conn_ok) break;
+      for (size_t j = 0; j < w; ++j) {
+        uint32_t rb = rbytes[j];
+        if (rb < kRespPrefix) continue;
+        Status st; uint64_t dl = 0;
+        if (!DecodeResp(ep.rbuf(j), &st, &dl)) continue;
+        res[base + j] = st;  // payload (if any) already scattered into dsts[].payloads
+        if (st == Status::kOk) {
+          if (rb >= hdr_bytes) {
+            (*hdrs)[base + j].assign(ep.rbuf(j) + kRespPrefix, header_size);
+            // True stored payload bytes received = rb - resp-prefix - value header.
+            if (out_lens) (*out_lens)[base + j] = rb - hdr_bytes;
+          } else {
+            res[base + j] = Status::kIOError;
+          }
         }
       }
     }
+    if (conn_ok) { Release(node, c); return res; }
+    Destroy(c);
+    if (from_pool) continue;  // stale pooled conn -> one fresh retry
+    return res;               // fresh conn failed -> terminal
   }
-  if (conn_ok) Release(node, c); else Destroy(c);
   return res;
 }
 

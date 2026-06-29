@@ -74,7 +74,10 @@ class RdmaTransport : public Transport {
 
  private:
   struct Conn;
-  Conn* Acquire(const std::string& node, bool* from_pool);
+  // force_new (set on a retry after a stale pooled conn) skips the pool and
+  // bootstraps a fresh connection, so a second server-reclaimed conn can't be
+  // handed back on the retry. *from_pool reports whether a pooled conn was used.
+  Conn* Acquire(const std::string& node, bool* from_pool, bool force_new = false);
   void Release(const std::string& node, Conn* c);
   void Destroy(Conn* c);
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
@@ -91,6 +94,15 @@ class RdmaTransport : public Transport {
   size_t depth_;
   int connect_ms_ = 3000;             // bootstrap TCP connect timeout (DFKV_RDMA_CONNECT_MS)
   int io_ms_ = 10000;                 // bootstrap TCP IO timeout (DFKV_RDMA_IO_MS)
+  // Per-window completion timeout for the datapath (DFKV_RDMA_OP_TIMEOUT_MS).
+  // WaitComp default is -1 (block forever): a connection whose completions are
+  // delayed (RC retransmit storm, congested NIC, a peer reclaimed mid-op) would
+  // otherwise hang the whole batch for tens of seconds, freezing a wait_complete
+  // scheduler until a liveness probe kills it. A finite timeout bounds that wait;
+  // the batch then tears the conn down and retries once on a fresh one (see the
+  // 2-attempt loop in every batch op, mirroring RoundTrip). 0/negative => -1
+  // (legacy block-forever). Normal ops finish in ms, so 5s never false-aborts.
+  int op_timeout_ms_ = 5000;          // datapath completion timeout (DFKV_RDMA_OP_TIMEOUT_MS)
   size_t pool_max_ = 256;             // idle conns kept per node (DFKV_RDMA_POOL_MAX)
   std::vector<std::string> devs_;     // RDMA devices (multi-rail); "" = first
   std::vector<int> dev_node_;         // NUMA node per devs_ entry (-1 unknown)
