@@ -1,12 +1,12 @@
 {
-  "uid": "dfkv-connector",
   "title": "Connector",
+  "uid": "dfkv-connector",
   "tags": [
     "dfkv",
     "telemetry"
   ],
   "schemaVersion": 39,
-  "version": 1,
+  "version": 3,
   "refresh": "10s",
   "time": {
     "from": "now-30m",
@@ -70,19 +70,15 @@
         "uid": "prometheus"
       },
       "gridPos": {
-        "h": 6,
+        "h": 4,
         "w": 4,
         "x": 0,
         "y": 0
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          }
-        },
-        "overrides": []
+          "unit": ""
+        }
       },
       "options": {
         "reduceOptions": {
@@ -90,8 +86,7 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "background",
-        "graphMode": "none"
+        "colorMode": "value"
       },
       "targets": [
         {
@@ -100,13 +95,12 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count(dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
-          "instant": true
+          "expr": "count(group by (dfkv_connector_id) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}))"
         }
       ]
     },
     {
-      "id": 4,
+      "id": 2,
       "type": "stat",
       "title": "Total requests/s",
       "datasource": {
@@ -114,19 +108,15 @@
         "uid": "prometheus"
       },
       "gridPos": {
-        "h": 6,
+        "h": 4,
         "w": 4,
         "x": 4,
         "y": 0
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
-          "color": {
-            "mode": "fixed"
-          }
-        },
-        "overrides": []
+          "unit": "reqps"
+        }
       },
       "options": {
         "reduceOptions": {
@@ -134,8 +124,7 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "value",
-        "graphMode": "area"
+        "colorMode": "value"
       },
       "targets": [
         {
@@ -144,12 +133,50 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(dfkv_connector_ops_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))"
+          "expr": "(sum(rate(dfkv_connector_op_requests_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum(rate(dfkv_connector_ops_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))"
         }
       ]
     },
     {
-      "id": 5,
+      "id": 3,
+      "type": "stat",
+      "title": "Total keys/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "/ s"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum(rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum(rate(dfkv_connector_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))"
+        }
+      ]
+    },
+    {
+      "id": 4,
       "type": "stat",
       "title": "Total bandwidth",
       "datasource": {
@@ -157,19 +184,15 @@
         "uid": "prometheus"
       },
       "gridPos": {
-        "h": 6,
+        "h": 4,
         "w": 4,
-        "x": 8,
+        "x": 12,
         "y": 0
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
-          "color": {
-            "mode": "fixed"
-          }
-        },
-        "overrides": []
+          "unit": "Bps"
+        }
       },
       "options": {
         "reduceOptions": {
@@ -177,8 +200,7 @@
             "lastNotNull"
           ]
         },
-        "colorMode": "value",
-        "graphMode": "area"
+        "colorMode": "value"
       },
       "targets": [
         {
@@ -187,54 +209,39 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(dfkv_connector_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))"
+          "expr": "(sum(rate(dfkv_connector_op_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum(rate(dfkv_connector_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))"
         }
       ]
     },
     {
-      "id": 2,
+      "id": 5,
       "type": "piechart",
-      "title": "Type",
+      "title": "By type",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
-        "h": 6,
-        "w": 6,
-        "x": 12,
+        "h": 4,
+        "w": 4,
+        "x": 16,
         "y": 0
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "palette-classic"
-          }
-        },
-        "overrides": []
+          "unit": "short"
+        }
       },
       "options": {
-        "pieType": "pie",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ],
-          "values": false
+          ]
         },
         "legend": {
           "displayMode": "list",
-          "placement": "bottom",
-          "values": [
-            "percent"
-          ]
-        },
-        "tooltip": {
-          "mode": "single"
-        },
-        "displayLabels": [
-          "percent"
-        ]
+          "placement": "right"
+        }
       },
       "targets": [
         {
@@ -244,55 +251,39 @@
             "uid": "prometheus"
           },
           "expr": "count by (dfkv_connector_type) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
-          "legendFormat": "{{dfkv_connector_type}}",
-          "instant": true
+          "legendFormat": "{{dfkv_connector_type}}"
         }
       ]
     },
     {
-      "id": 7,
+      "id": 6,
       "type": "piechart",
-      "title": "Version",
+      "title": "By native version",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
-        "h": 6,
-        "w": 6,
-        "x": 18,
+        "h": 4,
+        "w": 4,
+        "x": 20,
         "y": 0
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "palette-classic"
-          }
-        },
-        "overrides": []
+          "unit": "short"
+        }
       },
       "options": {
-        "pieType": "pie",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ],
-          "values": false
+          ]
         },
         "legend": {
           "displayMode": "list",
-          "placement": "bottom",
-          "values": [
-            "percent"
-          ]
-        },
-        "tooltip": {
-          "mode": "single"
-        },
-        "displayLabels": [
-          "percent"
-        ]
+          "placement": "right"
+        }
       },
       "targets": [
         {
@@ -301,56 +292,60 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count by (dfkv_version) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
-          "legendFormat": "{{dfkv_version}}",
-          "instant": true
+          "expr": "count by (dfkv_native_version) (dfkv_connector_info{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
+          "legendFormat": "{{dfkv_native_version}}"
         }
       ]
     },
     {
-      "id": 10,
+      "id": 7,
       "type": "row",
-      "title": "PUT",
+      "title": "By operation (put / get / exist \u2014 C++ chokepoint; old put/get shown until the connector rollout)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 6
+        "y": 4
       },
       "panels": []
     },
     {
-      "id": 11,
-      "type": "stat",
-      "title": "Total bytes",
+      "id": 8,
+      "type": "timeseries",
+      "title": "Requests/s by op",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "h": 7,
-        "w": 4,
+        "w": 12,
         "x": 0,
-        "y": 7
+        "y": 5
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "decbytes",
-          "color": {
-            "mode": "fixed"
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
           }
-        },
-        "overrides": []
+        }
       },
       "options": {
-        "reduceOptions": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
           "calcs": [
-            "lastNotNull"
+            "mean",
+            "max"
           ]
         },
-        "colorMode": "value",
-        "graphMode": "area"
+        "tooltip": {
+          "mode": "multi"
+        }
       },
       "targets": [
         {
@@ -359,41 +354,190 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(dfkv_connector_bytes_total{op=\"put\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})"
+          "expr": "(sum by (op) (rate(dfkv_connector_op_requests_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum by (op) (rate(dfkv_connector_ops_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))",
+          "legendFormat": "{{op}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Keys/s by op",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "/ s",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum by (op) (rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum by (op) (rate(dfkv_connector_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))",
+          "legendFormat": "{{op}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Bandwidth by op",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum by (op) (rate(dfkv_connector_op_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))) or (sum by (op) (rate(dfkv_connector_bytes_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))",
+          "legendFormat": "{{op}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Success ratio by op (put=write-ok, get=hit, exist=present) \u2014 needs rollout",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (op)(rate(dfkv_connector_op_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])) / clamp_min(sum by (op)(rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])),1)",
+          "legendFormat": "{{op}}"
         }
       ]
     },
     {
       "id": 12,
       "type": "timeseries",
-      "title": "Requests/s",
+      "title": "Failed / missed keys/s by op (put = 'Write page' failures) \u2014 needs rollout",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "h": 7,
-        "w": 7,
-        "x": 4,
-        "y": 7
+        "w": 12,
+        "x": 0,
+        "y": 19
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
+          "unit": "/ s",
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "stacking": {
-              "mode": "normal"
-            }
+            "showPoints": "never"
           }
-        },
-        "overrides": []
+        }
       },
       "options": {
         "legend": {
           "displayMode": "list",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -406,39 +550,44 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (status) (rate(dfkv_connector_ops_total{op=\"put\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))",
-          "legendFormat": "{{status}}"
+          "expr": "sum by (op)(rate(dfkv_connector_op_keys_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]) - rate(dfkv_connector_op_hits_total{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))",
+          "legendFormat": "{{op}}"
         }
-      ]
+      ],
+      "description": "put: pages that failed to write (SGLang 'Write page to storage: N pages failed'); get/exist: misses. Populates after the new connector rollout."
     },
     {
       "id": 13,
       "type": "timeseries",
-      "title": "Bandwidth",
+      "title": "Latency avg by op",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "h": 7,
-        "w": 6,
-        "x": 11,
-        "y": 7
+        "w": 12,
+        "x": 12,
+        "y": 19
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
+          "unit": "s",
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10
+            "fillOpacity": 10,
+            "showPoints": "never"
           }
-        },
-        "overrides": []
+        }
       },
       "options": {
         "legend": {
           "displayMode": "list",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -451,39 +600,43 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(dfkv_connector_bytes_total{op=\"put\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))",
-          "legendFormat": "put"
+          "expr": "(sum by (op)(rate(dfkv_connector_op_latency_seconds_sum{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])) / clamp_min(sum by (op)(rate(dfkv_connector_op_latency_seconds_count{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])),1)) or (sum by (op)(rate(dfkv_connector_op_seconds_sum{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])) / clamp_min(sum by (op)(rate(dfkv_connector_op_seconds_count{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])),1))",
+          "legendFormat": "{{op}}"
         }
       ]
     },
     {
       "id": 14,
       "type": "timeseries",
-      "title": "Latency (avg / p99 / max)",
+      "title": "Latency p99 by op",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "h": 7,
-        "w": 7,
-        "x": 17,
-        "y": 7
+        "w": 12,
+        "x": 0,
+        "y": 26
       },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 0
+            "fillOpacity": 10,
+            "showPoints": "never"
           }
-        },
-        "overrides": []
+        }
       },
       "options": {
         "legend": {
           "displayMode": "list",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -496,116 +649,107 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(dfkv_connector_op_seconds_sum{op=\"put\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])) / clamp_min(sum(rate(dfkv_connector_op_seconds_count{op=\"put\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "avg"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dfkv_connector_op_seconds_bucket{op=\"put\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))",
-          "legendFormat": "p99"
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "max(dfkv_connector_op_max_seconds{op=\"put\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
-          "legendFormat": "max"
+          "expr": "(histogram_quantile(0.99, sum by (op,le)(rate(dfkv_connector_op_latency_seconds_bucket{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))) or (histogram_quantile(0.99, sum by (op,le)(rate(dfkv_connector_op_seconds_bucket{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))))",
+          "legendFormat": "{{op}}"
         }
-      ]
+      ],
+      "description": "Buckets saturate at 100ms; for the multi-second tail see the max panel."
     },
     {
-      "id": 20,
+      "id": 15,
+      "type": "timeseries",
+      "title": "Latency MAX by op (the batch_exist tail)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (op)(dfkv_connector_op_max_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
+          "legendFormat": "{{op}}"
+        }
+      ],
+      "description": "Lifetime peak per op. A spike on op=exist is the scheduler-freezing stall."
+    },
+    {
+      "id": 16,
       "type": "row",
-      "title": "GET",
+      "title": "Per-cache-node latency (active prober)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 14
+        "y": 33
       },
       "panels": []
     },
     {
-      "id": 21,
-      "type": "stat",
-      "title": "Total bytes",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 4,
-        "x": 0,
-        "y": 15
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "decbytes",
-          "color": {
-            "mode": "fixed"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "colorMode": "value",
-        "graphMode": "area"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum(dfkv_connector_bytes_total{op=\"get\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})"
-        }
-      ]
-    },
-    {
-      "id": 22,
+      "id": 17,
       "type": "timeseries",
-      "title": "Requests/s",
+      "title": "Probe cache latency by peer",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "h": 7,
-        "w": 7,
-        "x": 4,
-        "y": 15
+        "w": 24,
+        "x": 0,
+        "y": 34
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
+          "unit": "s",
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "stacking": {
-              "mode": "normal"
-            }
+            "showPoints": "never"
           }
-        },
-        "overrides": []
+        }
       },
       "options": {
         "legend": {
           "displayMode": "list",
-          "placement": "bottom"
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -618,160 +762,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (status) (rate(dfkv_connector_ops_total{op=\"get\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))",
-          "legendFormat": "{{status}}"
-        }
-      ]
-    },
-    {
-      "id": 23,
-      "type": "timeseries",
-      "title": "Bandwidth",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 6,
-        "x": 11,
-        "y": 15
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "Bps",
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum(rate(dfkv_connector_bytes_total{op=\"get\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval]))",
-          "legendFormat": "get"
-        }
-      ]
-    },
-    {
-      "id": 24,
-      "type": "timeseries",
-      "title": "Latency (avg / p99 / max)",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 7,
-        "x": 17,
-        "y": 15
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 0
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum(rate(dfkv_connector_op_seconds_sum{op=\"get\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])) / clamp_min(sum(rate(dfkv_connector_op_seconds_count{op=\"get\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "avg"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dfkv_connector_op_seconds_bucket{op=\"get\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"}[$__rate_interval])))",
-          "legendFormat": "p99"
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "max(dfkv_connector_op_max_seconds{op=\"get\", dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
-          "legendFormat": "max"
-        }
-      ]
-    },
-    {
-      "id": 30,
-      "type": "timeseries",
-      "title": "Probe cache latency",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 22
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 0
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "avg by (peer) (dfkv_client_peer_latency_avg_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
+          "expr": "avg by (peer)(dfkv_client_peer_latency_avg_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
           "legendFormat": "avg {{peer}}"
         },
         {
@@ -780,7 +771,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max by (peer) (dfkv_client_peer_latency_max_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
+          "expr": "max by (peer)(dfkv_client_peer_latency_max_seconds{dfkv_connector_type=~\"$connector_type\", dfkv_connector_id=~\"$connector_id\"})",
           "legendFormat": "max {{peer}}"
         }
       ]

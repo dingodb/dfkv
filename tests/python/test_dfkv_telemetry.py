@@ -410,5 +410,63 @@ class OtelPushTest(TelemetryTestBase):
         metrics.shutdown()
 
 
+class ClientOpForwardTest(TelemetryTestBase):
+    """Per-op metrics are computed once in the C++ KVClient (dfkv_client_op_*);
+    the snapshot poller parses them and re-emits dfkv_connector_op_* with this
+    connector's identity, so all connectors report their full request mix."""
+
+    SNAP = (
+        'dfkv_client_op_requests_total{op="put"} 10\n'
+        'dfkv_client_op_keys_total{op="put"} 640\n'
+        'dfkv_client_op_hits_total{op="put"} 600\n'        # 40 pages failed to write
+        'dfkv_client_op_bytes_total{op="put"} 2621440\n'
+        'dfkv_client_op_max_seconds{op="put"} 0.020000\n'
+        'dfkv_client_op_latency_seconds_bucket{le="0.001",op="put"} 2\n'
+        'dfkv_client_op_latency_seconds_bucket{le="0.1",op="put"} 10\n'
+        'dfkv_client_op_latency_seconds_bucket{le="+Inf",op="put"} 10\n'
+        'dfkv_client_op_latency_seconds_sum{op="put"} 0.08\n'
+        'dfkv_client_op_latency_seconds_count{op="put"} 10\n'
+        'dfkv_client_op_requests_total{op="exist"} 5\n'
+        'dfkv_client_op_keys_total{op="exist"} 6960\n'
+        'dfkv_client_op_hits_total{op="exist"} 6960\n'
+        'dfkv_client_op_max_seconds{op="exist"} 48.500000\n'
+        'dfkv_client_op_latency_seconds_bucket{le="0.1",op="exist"} 4\n'
+        'dfkv_client_op_latency_seconds_bucket{le="+Inf",op="exist"} 5\n'  # 1 in +Inf (48s)
+        'dfkv_client_op_latency_seconds_sum{op="exist"} 48.6\n'
+        'dfkv_client_op_latency_seconds_count{op="exist"} 5\n'
+    )
+
+    def test_parse_client_ops(self):
+        d = metrics.parse_client_ops(self.SNAP)
+        self.assertEqual(d["put"]["keys"], 640.0)
+        self.assertEqual(d["put"]["hits"], 600.0)   # keys-hits = failed writes
+        self.assertEqual(d["exist"]["max"], 48.5)    # the batch_exist tail
+        self.assertEqual(len(d["put"]["buckets"]), 3)
+
+    def test_forward_to_otlp_with_identity(self):
+        from dfkv_telemetry import otlp_json
+        os.environ[config.ENV_METRICS_ENABLED] = "1"
+        metrics.configure({}, connector_type=config.TYPE_HICACHE, tp_rank=2, model="m")
+        rec = metrics._recorder
+        rec.update_client_ops(metrics.parse_client_ops(self.SNAP))
+        payload = otlp_json.build_payload(rec, rec.export_snapshot(), 1, 2)
+        ms = {m["name"]: m for m in
+              payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]}
+        for n in ("dfkv_connector_op_requests_total", "dfkv_connector_op_keys_total",
+                  "dfkv_connector_op_hits_total", "dfkv_connector_op_bytes_total",
+                  "dfkv_connector_op_max_seconds", "dfkv_connector_op_latency_seconds"):
+            self.assertIn(n, ms)
+        attrs = {a["key"] for a in
+                 payload["resourceMetrics"][0]["resource"]["attributes"]}
+        self.assertIn("dfkv.connector_type", attrs)
+        self.assertIn("dfkv.connector_id", attrs)
+        # the exist histogram preserved the 48s op in the +Inf bucket
+        ehist = [dp for dp in ms["dfkv_connector_op_latency_seconds"]["histogram"]["dataPoints"]
+                 if dp["attributes"][0]["value"]["stringValue"] == "exist"][0]
+        self.assertEqual(ehist["count"], "5")
+        self.assertEqual(ehist["bucketCounts"][-1], "1")  # +Inf bucket = the 48s op
+        metrics.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

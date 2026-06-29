@@ -141,6 +141,57 @@ def build_payload(rec, snap, start_ns, now_ns):
                             {"attributes": [_attr("peer", p)], "timeUnixNano": t, "asDouble": mx}
                             for p, (_avg, mx) in peer.items()]}})
 
+    # --- per-op metrics forwarded from the C++ KVClient snapshot (dfkv_client_op_*),
+    #     re-emitted with this connector's identity. One name set across all
+    #     connectors since they share the C chokepoint. Values are absolute/
+    #     cumulative (counters) so no per-window delta is needed.
+    cops = snap.get("client_ops") or {}
+    if cops:
+        for fld, mname in (("requests", "dfkv_connector_op_requests_total"),
+                           ("keys", "dfkv_connector_op_keys_total"),
+                           ("hits", "dfkv_connector_op_hits_total"),
+                           ("bytes", "dfkv_connector_op_bytes_total")):
+            dps = [{"attributes": [_attr("op", op)], "startTimeUnixNano": st,
+                    "timeUnixNano": t, "asInt": str(int(d.get(fld, 0)))}
+                   for op, d in cops.items() if d.get(fld)]
+            if dps:
+                metrics.append({"name": mname,
+                                "sum": {"aggregationTemporality": 2,
+                                        "isMonotonic": True, "dataPoints": dps}})
+        max_dps = [{"attributes": [_attr("op", op)], "timeUnixNano": t,
+                    "asDouble": float(d.get("max", 0.0))}
+                   for op, d in cops.items() if d.get("max")]
+        if max_dps:
+            metrics.append({"name": "dfkv_connector_op_max_seconds",
+                            "gauge": {"dataPoints": max_dps}})
+        hist_dps = []
+        for op, d in cops.items():
+            cnt = d.get("lat_count")
+            buckets = d.get("buckets")
+            if not cnt or not buckets:
+                continue
+            # Prometheus cumulative (le) buckets -> OTLP explicitBounds + per-bucket
+            # counts. The +Inf bucket = count - last cumulative.
+            fin = sorted(((float(le), cum) for le, cum in buckets
+                          if le not in ("+Inf", "Inf")), key=lambda x: x[0])
+            bounds = [b for b, _ in fin]
+            total = float(cnt)
+            counts, prev = [], 0.0
+            for _, c in fin:
+                counts.append(str(int(max(0.0, c - prev))))
+                prev = c
+            counts.append(str(int(max(0.0, total - prev))))  # +Inf bucket
+            hist_dps.append({
+                "attributes": [_attr("op", op)],
+                "startTimeUnixNano": st, "timeUnixNano": t,
+                "count": str(int(total)), "sum": float(d.get("lat_sum", 0.0)),
+                "bucketCounts": counts, "explicitBounds": bounds,
+            })
+        if hist_dps:
+            metrics.append({"name": "dfkv_connector_op_latency_seconds",
+                            "histogram": {"aggregationTemporality": 2,
+                                          "dataPoints": hist_dps}})
+
     return {"resourceMetrics": [{
         "resource": {"attributes": res_attrs},
         "scopeMetrics": [{"scope": {"name": "dfkv.connector"}, "metrics": metrics}],
