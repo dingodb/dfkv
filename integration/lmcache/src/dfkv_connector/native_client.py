@@ -27,6 +27,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 from .access_log import access_log
 from ._telemetry import config as _tcfg
 from ._telemetry import metrics as _push_metrics
+from ._telemetry import tracing as _push_tracing
 
 __all__ = ["DfkvNativeClient", "load_lib"]
 
@@ -209,6 +210,12 @@ class DfkvNativeClient:
                 {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(g["tp_rank"]),
                 version=_tcfg.dist_version("dfkv-connector"),
                 native_version=_native_version(self._lib))
+            # Connector-side request tracing (off by default; zero cost when off).
+            # Spans for slow / sampled / failed ops pushed over OTLP /v1/traces.
+            _push_tracing.configure(
+                {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(g["tp_rank"]),
+                version=_tcfg.dist_version("dfkv-connector"),
+                native_version=_native_version(self._lib))
             r.result = f"ok regs={regs} transport={self.transport_mode}"
 
     # ------------------------------------------------------------------
@@ -290,14 +297,19 @@ class DfkvNativeClient:
     ) -> Tuple[bool, Optional[List[bool]]]:
         n = len(keys)
         with _push_metrics.op("put", num_keys=n) as _m, \
+                _push_tracing.span("batch_set", n) as _sp, \
                 access_log("native.batch_set",
                            lambda: f"{n} keys, {_total_size(bufs)} bytes") as r:
-            if _m:
-                _m.bytes = _total_size(bufs)
+            if _m or _sp:
+                _nb = _total_size(bufs)
+                _m.bytes = _nb
+                _sp.bytes = _nb
             ok, per_key = await self._loop.run_in_executor(
                 self._executor, self._batch_set_blocking, list(keys), list(bufs)
             )
             r.result = "ok" if ok else "partial_fail"
+            if _sp:
+                _sp.hits = sum(1 for b in per_key if b)
             return ok, per_key
 
     async def batch_get(
@@ -305,14 +317,18 @@ class DfkvNativeClient:
     ) -> Tuple[bool, Optional[List[bool]], List[int]]:
         n = len(keys)
         with _push_metrics.op("get", num_keys=n) as _m, \
+                _push_tracing.span("batch_get", n) as _sp, \
                 access_log("native.batch_get",
                            lambda: f"{n} keys, {_total_size(bufs)} bytes") as r:
             ok, per_key, lengths = await self._loop.run_in_executor(
                 self._executor, self._batch_get_blocking, list(keys), list(bufs)
             )
-            if _m:
-                _m.bytes = sum(lengths)
             hits = sum(1 for b in per_key if b)
+            if _m or _sp:
+                _nb = sum(lengths)
+                _m.bytes = _nb
+                _sp.bytes = _nb
+                _sp.hits = hits
             r.result = f"hits={hits}/{n}"
             return ok, per_key, lengths
 
@@ -321,12 +337,15 @@ class DfkvNativeClient:
     ) -> Optional[List[bool]]:
         n = len(keys)
         with _push_metrics.op("exist", num_keys=n), \
+                _push_tracing.span("batch_exists", n) as _sp, \
                 access_log("native.batch_exists", lambda: f"{n} keys") as r:
             per_key = await self._loop.run_in_executor(
                 self._executor, self._batch_exists_blocking, list(keys)
             )
             hits = sum(1 for b in per_key if b)
             r.result = f"hits={hits}/{n}"
+            if _sp:
+                _sp.hits = hits
             return per_key
 
     def supports_remove(self) -> bool:
@@ -345,12 +364,15 @@ class DfkvNativeClient:
                 "remove RPC to enable L2 eviction)"
             )
         with _push_metrics.op("remove", num_keys=n), \
+                _push_tracing.span("batch_remove", n) as _sp, \
                 access_log("native.batch_remove", lambda: f"{n} keys") as r:
             per_key = await self._loop.run_in_executor(
                 self._executor, self._batch_remove_blocking, list(keys)
             )
             ok = sum(1 for b in per_key if b)
             r.result = f"ok={ok}/{n}"
+            if _sp:
+                _sp.hits = ok
             return per_key
 
     def exists_sync(self, key: str) -> bool:

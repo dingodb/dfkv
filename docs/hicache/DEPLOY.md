@@ -88,6 +88,7 @@ sglang serve ... \
 > 排查命中率/慢操作：可开启 access log（`access_log`/`access_log_path` 或 `DFKV_ACCESS_LOG_*`），见 [../access_log.md](../access_log.md)。
 > **客户端指标（pull）**：插件自动在 SGLang 自带的 `/metrics` 上暴露 `dfkv_client_*{tp_rank}`（set/get 量、命中、IO 错误、peer 熔断切换、set/get 延迟直方图）。后台轮询线程读 C 客户端快照，间隔由 extra_config `client_stats_poll_s`（默认 10s，`DFKV_CLIENT_STATS_POLL_S` 兜底，`0`=关）控制。全指标见 [../METRICS.md](../METRICS.md) §3.3。
 > **车队指标（push，opt-in）**：还可把本实例指标经 OTLP 主动推到中心 Collector→Grafana（命中率/吞吐/op 延迟 + 逐 peer 延迟）。HiCache 走 extra_config `"metrics":1,"otlp_endpoint":...` 或 `DFKV_METRICS_ENABLED=1`，默认 stdlib 零依赖。接法见 [../../deploy/observability/CONNECTOR-USAGE.md](../../deploy/observability/CONNECTOR-USAGE.md)、指标见 [../METRICS.md](../METRICS.md) §3.4。
+> **分布式追踪（push，opt-in）**：把慢请求 / 采样请求 / 失败请求的 span 经 OTLP `/v1/traces` 推到中心 Collector→Jaeger/Tempo。走 extra_config `"tracing":1,"trace_slow_request_ms":1000,"trace_sample_percent":1,"otlp_endpoint":...` 或对应 `DFKV_TRACE_*` 环境变量。详见 [../tracing.md](../tracing.md)。
 
 ---
 

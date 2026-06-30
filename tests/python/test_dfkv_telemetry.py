@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "python"))  # <repo>/python
 
 import dfkv_telemetry  # noqa: E402
-from dfkv_telemetry import config, metrics  # noqa: E402
+from dfkv_telemetry import config, metrics, tracing  # noqa: E402
 
 _ENV_KEYS = [
     config.ENV_METRICS_ENABLED, config.ENV_TELEMETRY_ENABLED,
@@ -466,6 +466,258 @@ class ClientOpForwardTest(TelemetryTestBase):
         self.assertEqual(ehist["count"], "5")
         self.assertEqual(ehist["bucketCounts"][-1], "1")  # +Inf bucket = the 48s op
         metrics.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Tracing (connector-side spans: slow / sampled / failed, pushed over /v1/traces)
+# ---------------------------------------------------------------------------
+
+_TRACE_ENV_KEYS = [
+    config.ENV_TRACING_ENABLED, config.ENV_TELEMETRY_ENABLED,
+    config.ENV_TRACE_SLOW_REQUEST_MS, config.ENV_TRACE_SAMPLE_PERCENT,
+    config.ENV_TRACE_EXPORT_INTERVAL_MS, config.ENV_TRACE_MAX_BUFFERED_SPANS,
+    config.ENV_CONNECTOR_ID, config.ENV_OTLP_ENDPOINT,
+]
+
+
+class _CollectExporter:
+    """Test span sink injected via tracing.configure(_exporter=...): collects
+    enqueued spans in memory, no thread, no network."""
+
+    def __init__(self):
+        self.spans = []
+
+    def enqueue(self, span):
+        self.spans.append(span)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+class TracingTestBase(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in _TRACE_ENV_KEYS}
+        for k in _TRACE_ENV_KEYS:
+            os.environ.pop(k, None)
+        tracing._reset_for_test()
+
+    def tearDown(self):
+        tracing._reset_for_test()
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _enable(self, exporter=None, **cfg):
+        os.environ[config.ENV_TRACING_ENABLED] = "1"
+        exp = exporter if exporter is not None else _CollectExporter()
+        tracing.configure(cfg, connector_type=config.TYPE_HICACHE, tp_rank=2,
+                          _exporter=exp)
+        return exp
+
+
+class TracingDisabledTest(TracingTestBase):
+    def test_off_by_default_is_noop(self):
+        tracing.configure({}, connector_type=config.TYPE_VLLM)
+        self.assertFalse(tracing.is_enabled())
+        with tracing.span("get", num_keys=3) as sp:
+            self.assertFalse(bool(sp))   # falsy: callers can skip expensive attrs
+            sp.hits = 3                  # dropped, never raises
+
+    def test_noop_does_not_swallow_exceptions(self):
+        tracing.configure({}, connector_type=config.TYPE_LMCACHE)
+        with self.assertRaises(ValueError):
+            with tracing.span("get", num_keys=1):
+                raise ValueError("boom")
+
+    def test_umbrella_switch_enables(self):
+        os.environ[config.ENV_TELEMETRY_ENABLED] = "true"
+        tracing.configure({}, connector_type=config.TYPE_VLLM, _exporter=_CollectExporter())
+        self.assertTrue(tracing.is_enabled())
+
+    def test_explicit_tracing_off_beats_umbrella_on(self):
+        os.environ[config.ENV_TELEMETRY_ENABLED] = "1"
+        tracing.configure({"tracing": False}, connector_type=config.TYPE_VLLM)
+        self.assertFalse(tracing.is_enabled())
+
+
+class TracingSampleDecisionTest(TracingTestBase):
+    def test_slow_threshold(self):
+        self._enable(trace_slow_request_ms=100, trace_sample_percent=0)
+        t = tracing._tracer
+        self.assertTrue(t.should_sample(150.0, False))    # over threshold
+        self.assertTrue(t.should_sample(100.0, False))    # exactly at threshold
+        self.assertFalse(t.should_sample(50.0, False))    # under, not sampled
+
+    def test_failed_always_sampled(self):
+        self._enable(trace_slow_request_ms=0, trace_sample_percent=0)
+        self.assertTrue(tracing._tracer.should_sample(0.1, True))
+
+    def test_percent_full_and_zero(self):
+        self._enable(trace_slow_request_ms=0, trace_sample_percent=100)
+        self.assertTrue(tracing._tracer.should_sample(0.1, False))
+        tracing._reset_for_test()
+        self._enable(trace_slow_request_ms=0, trace_sample_percent=0)
+        self.assertFalse(tracing._tracer.should_sample(0.1, False))
+
+    def test_percent_clamped_and_slow_disabled_by_zero(self):
+        self._enable(trace_slow_request_ms=0, trace_sample_percent=999)
+        # clamped to 100 -> always sample; slow_ms=0 -> latency never triggers alone
+        self.assertEqual(tracing._tracer.sample_percent, 100.0)
+        self.assertEqual(tracing._tracer.slow_ms, 0.0)
+
+
+class TracingEmitTest(TracingTestBase):
+    def test_slow_request_emits_span_with_attrs(self):
+        # tiny slow threshold => every real op counts as slow and is emitted
+        exp = self._enable(trace_slow_request_ms=0.0001, trace_sample_percent=0)
+        with tracing.span("batch_get_v1", num_keys=3) as sp:
+            self.assertTrue(bool(sp))
+            sp.hits = 2
+            sp.bytes = 4096
+        self.assertEqual(len(exp.spans), 1)
+        s = exp.spans[0]
+        self.assertEqual(s["name"], "batch_get_v1")
+        self.assertEqual(len(s["traceId"]), 32)   # 16-byte trace id
+        self.assertEqual(len(s["spanId"]), 16)     # 8-byte span id
+        self.assertNotIn("status", s)              # ok span leaves OTLP status unset
+        a = {x["key"]: x["value"] for x in s["attributes"]}
+        self.assertEqual(a["op"]["stringValue"], "batch_get_v1")
+        self.assertEqual(a["status"]["stringValue"], "ok")
+        self.assertEqual(a["dfkv.keys"]["intValue"], "3")
+        self.assertEqual(a["dfkv.hits"]["intValue"], "2")
+        self.assertEqual(a["dfkv.bytes"]["intValue"], "4096")
+
+    def test_failed_op_traced_even_when_not_slow_or_sampled(self):
+        exp = self._enable(trace_slow_request_ms=0, trace_sample_percent=0)
+        with self.assertRaises(RuntimeError):
+            with tracing.span("batch_set_v1", num_keys=2):
+                raise RuntimeError("io error")
+        self.assertEqual(len(exp.spans), 1)
+        s = exp.spans[0]
+        self.assertEqual(s["status"]["code"], 2)   # OTLP STATUS_ERROR
+        self.assertIn("io error", s["status"]["message"])
+        a = {x["key"]: x["value"] for x in s["attributes"]}
+        self.assertEqual(a["status"]["stringValue"], "fail")
+        self.assertIn("dfkv.error", a)
+
+    def test_status_fail_set_by_caller_is_traced(self):
+        exp = self._enable(trace_slow_request_ms=0, trace_sample_percent=0)
+        with tracing.span("get", num_keys=1) as sp:
+            sp.status = "fail"     # no exception, but caller flags failure
+        self.assertEqual(len(exp.spans), 1)
+        a = {x["key"]: x["value"] for x in exp.spans[0]["attributes"]}
+        self.assertEqual(a["status"]["stringValue"], "fail")
+
+    def test_fast_unsampled_op_emits_nothing(self):
+        exp = self._enable(trace_slow_request_ms=0, trace_sample_percent=0)
+        with tracing.span("get", num_keys=1):
+            pass
+        self.assertEqual(exp.spans, [])
+
+    def test_configure_is_idempotent(self):
+        exp = self._enable(trace_slow_request_ms=0.0001)
+        tracing.configure({"tracing": False}, connector_type=config.TYPE_VLLM)
+        self.assertTrue(tracing.is_enabled())   # second configure ignored
+
+
+class _FakeIdentity:
+    connector_type = "hicache"
+    connector_id = "host:123:0"
+    tp_rank = 0
+    pid = 123
+    version = "1.6.6"
+    native_version = "1.6.6"
+
+
+class OtlpTracesTest(unittest.TestCase):
+    def test_traces_url_normalization(self):
+        from dfkv_telemetry.otlp_traces import traces_url
+        self.assertEqual(traces_url("http://h:4318"), "http://h:4318/v1/traces")
+        self.assertEqual(traces_url("http://h:4318/"), "http://h:4318/v1/traces")
+        self.assertEqual(traces_url("h:4318"), "http://h:4318/v1/traces")
+        self.assertEqual(traces_url("http://h:4318/v1/traces"), "http://h:4318/v1/traces")
+        self.assertEqual(traces_url("http://h:4318/v1/traces/"), "http://h:4318/v1/traces")
+        self.assertEqual(traces_url(""), "http://localhost:4318/v1/traces")
+
+    def test_make_span_and_build_payload(self):
+        from dfkv_telemetry import otlp_traces
+        sp = otlp_traces.make_span("get", "a" * 32, "b" * 16, 1000, 3000,
+                                   {"op": "get", "dfkv.keys": 4}, failed=False)
+        self.assertEqual(sp["kind"], 3)            # SPAN_KIND_CLIENT
+        self.assertEqual(sp["startTimeUnixNano"], "1000")
+        self.assertEqual(sp["endTimeUnixNano"], "3000")
+        self.assertNotIn("status", sp)
+        payload = otlp_traces.build_payload(_FakeIdentity(), [sp])
+        rs = payload["resourceSpans"][0]
+        ra = {a["key"]: a["value"] for a in rs["resource"]["attributes"]}
+        self.assertEqual(ra["dfkv.connector_type"]["stringValue"], "hicache")
+        self.assertEqual(ra["dfkv.connector_id"]["stringValue"], "host:123:0")
+        self.assertEqual(ra["dfkv.version"]["stringValue"], "1.6.6")
+        self.assertEqual(ra["service.name"]["stringValue"], "dfkv-hicache-connector")
+        spans = rs["scopeSpans"][0]["spans"]
+        self.assertEqual(spans[0]["name"], "get")
+
+    def test_make_span_failed_sets_error_status(self):
+        from dfkv_telemetry import otlp_traces
+        sp = otlp_traces.make_span("put", "a" * 32, "b" * 16, 1, 2, {},
+                                   failed=True, error="OSError: disk full")
+        self.assertEqual(sp["status"]["code"], otlp_traces.STATUS_ERROR)
+        self.assertEqual(sp["status"]["message"], "OSError: disk full")
+
+    def test_exporter_buffer_drops_oldest_when_full(self):
+        from dfkv_telemetry import otlp_traces
+        exp = otlp_traces.StdlibSpanExporter(
+            _FakeIdentity(), "http://127.0.0.1:1", interval_s=0, max_spans=2)
+        for i in range(5):
+            exp.enqueue({"i": i})
+        self.assertEqual(exp.buffered(), 2)
+        self.assertEqual(exp.dropped(), 3)       # 5 enqueued, cap 2 -> 3 dropped
+
+    def test_flush_empty_is_noop(self):
+        from dfkv_telemetry import otlp_traces
+        exp = otlp_traces.StdlibSpanExporter(_FakeIdentity(), "http://127.0.0.1:1",
+                                             interval_s=0)
+        self.assertIsNone(exp.flush())
+
+    def test_flush_to_local_http_server(self):
+        import http.server
+        import json as _json
+        import socketserver
+        import threading
+        from dfkv_telemetry import otlp_traces
+        captured = {}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0))
+                captured["body"] = self.rfile.read(n)
+                captured["ctype"] = self.headers.get("Content-Type")
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.handle_request, daemon=True).start()
+
+        exp = otlp_traces.StdlibSpanExporter(
+            _FakeIdentity(), "http://127.0.0.1:%d" % port, interval_s=0)
+        exp.enqueue(otlp_traces.make_span("get", "a" * 32, "b" * 16, 1, 2,
+                                          {"op": "get"}))
+        status = exp.flush()
+        srv.server_close()
+        self.assertEqual(status, 200)
+        self.assertEqual(captured["ctype"], "application/json")
+        body = _json.loads(captured["body"].decode())
+        self.assertIn("resourceSpans", body)
+        self.assertEqual(exp.buffered(), 0)      # drained after flush
 
 
 if __name__ == "__main__":

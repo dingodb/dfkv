@@ -15,7 +15,8 @@ VENDORED = [
     os.path.join(ROOT, "integration", "vllm", "src", "dfkv_vllm", "_telemetry"),
     os.path.join(ROOT, "integration", "lmcache", "src", "dfkv_connector", "_telemetry"),
 ]
-FILES = ["__init__.py", "config.py", "metrics_push.py", "otlp_json.py"]
+FILES = ["__init__.py", "config.py", "metrics_push.py", "otlp_json.py",
+         "tracing.py", "otlp_traces.py"]
 
 
 class VendorSyncTest(unittest.TestCase):

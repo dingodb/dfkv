@@ -14,9 +14,11 @@ from typing import Any, Optional
 
 # --- master switches (off by default => zero cost) -------------------------
 # Metrics push is on when DFKV_METRICS_ENABLED is truthy, OR the umbrella
-# DFKV_TELEMETRY_ENABLED is truthy (the umbrella also turns on tracing later).
+# DFKV_TELEMETRY_ENABLED is truthy. Tracing is on when DFKV_TRACING_ENABLED is
+# truthy, OR the same umbrella DFKV_TELEMETRY_ENABLED is truthy.
 ENV_METRICS_ENABLED = "DFKV_METRICS_ENABLED"
 ENV_TELEMETRY_ENABLED = "DFKV_TELEMETRY_ENABLED"
+ENV_TRACING_ENABLED = "DFKV_TRACING_ENABLED"
 
 # --- OTLP push target (standard OTel env, shared with the C++ side) ---------
 ENV_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
@@ -32,6 +34,12 @@ EXPORTER_STDLIB = "stdlib"
 EXPORTER_OTEL = "otel"
 ENV_PROBE_INTERVAL_MS = "DFKV_PROBE_INTERVAL_MS"             # C++ per-peer probe (default off; 5000 when on)
 ENV_PEER_POLL_S = "DFKV_PEER_LATENCY_POLL_S"                 # snapshot->push cadence (default 10)
+
+# --- tracing knobs (connector-side spans pushed over OTLP /v1/traces) -------
+ENV_TRACE_SLOW_REQUEST_MS = "DFKV_TRACE_SLOW_REQUEST_MS"     # >= this latency => trace it (default 1000; 0=off)
+ENV_TRACE_SAMPLE_PERCENT = "DFKV_TRACE_SAMPLE_PERCENT"       # extra 0..100% of requests traced (default 0)
+ENV_TRACE_EXPORT_INTERVAL_MS = "DFKV_TRACE_EXPORT_INTERVAL_MS"  # span flush cadence (default 5000)
+ENV_TRACE_MAX_BUFFERED_SPANS = "DFKV_TRACE_MAX_BUFFERED_SPANS"  # bounded buffer; oldest dropped (default 2048)
 
 # connector_type values the dashboard groups by.
 TYPE_HICACHE = "hicache"
@@ -60,6 +68,17 @@ def resolve(cfg: Optional[dict], key: str, env: str, default: Any) -> Any:
 def metrics_enabled(cfg: Optional[dict]) -> bool:
     """Whether the push-metrics layer should be active for this process."""
     v = resolve(cfg, "metrics", ENV_METRICS_ENABLED, None)
+    if v is not None:
+        return truthy(v)
+    return truthy(resolve(cfg, "telemetry", ENV_TELEMETRY_ENABLED, False))
+
+
+def tracing_enabled(cfg: Optional[dict]) -> bool:
+    """Whether connector-side request tracing should be active for this process.
+
+    Mirrors ``metrics_enabled``: an explicit ``tracing`` key / DFKV_TRACING_ENABLED
+    wins; otherwise the umbrella DFKV_TELEMETRY_ENABLED turns it on too."""
+    v = resolve(cfg, "tracing", ENV_TRACING_ENABLED, None)
     if v is not None:
         return truthy(v)
     return truthy(resolve(cfg, "telemetry", ENV_TELEMETRY_ENABLED, False))

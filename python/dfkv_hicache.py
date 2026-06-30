@@ -22,6 +22,7 @@ from dfkv_access_log import (access_log, configure as _configure_access_log,
                             fmt_pool_results as _fmt_pool_results)
 from dfkv_metrics import Metrics as _Metrics, ClientStatsPoller as _ClientStatsPoller
 from dfkv_telemetry import metrics as _push_metrics, config as _tcfg
+from dfkv_telemetry import tracing as _tracing
 
 _FLAG_IS_MLA = 0x1
 
@@ -150,6 +151,12 @@ class DfkvHiCache(HiCacheStorage):
         _push_metrics.configure(cfg, connector_type=_tcfg.TYPE_HICACHE,
                                 tp_rank=self.tp_rank, model=self.model,
                                 version=native_ver, native_version=native_ver)
+        # Connector-side request tracing (off by default; zero cost when off).
+        # Emits a span per op for slow / sampled / failed requests over OTLP
+        # /v1/traces — same identity + endpoint as the fleet metrics above.
+        _tracing.configure(cfg, connector_type=_tcfg.TYPE_HICACHE,
+                           tp_rank=self.tp_rank, model=self.model,
+                           version=native_ver, native_version=native_ver)
         # When metrics are on, enable the C client's active per-peer latency probe
         # (read at dfkv_open below) so every cache node shows avg/max latency even
         # when idle. extra_config 'probe_interval_ms' overrides; 0 disables.
@@ -384,10 +391,13 @@ class DfkvHiCache(HiCacheStorage):
     # --- zero-copy v1 batch path (the one the controller calls) ---
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         n = len(keys)
-        with access_log("batch_set_v1", lambda: f"{self._alog_tag} {n} keys") as r:
+        with _tracing.span("batch_set_v1", n) as _sp, \
+                access_log("batch_set_v1", lambda: f"{self._alog_tag} {n} keys") as r:
             # MLA backup_skip: latent is replicated across TP, only rank 0 writes.
             if self.is_mla and self.tp_rank != 0:
                 r.result = "backup_skip"
+                if _sp:
+                    _sp.attrs = {"dfkv.backup_skip": True}
                 return [True] * n
             ptrs, sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
@@ -397,6 +407,8 @@ class DfkvHiCache(HiCacheStorage):
             dur = time.perf_counter() - t0
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"ok {sum(res)}/{n}"
+            if _sp:
+                _sp.hits = sum(res); _sp.bytes = sum(ss)
             self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=sum(ss), seconds=dur)
             # Fleet op metrics (put/get/exist/...) are accumulated in the C++
             # KVClient (the chokepoint all connectors share) and forwarded over
@@ -405,7 +417,8 @@ class DfkvHiCache(HiCacheStorage):
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         n = len(keys)
-        with access_log("batch_get_v1", lambda: f"{self._alog_tag} {n} keys") as r:
+        with _tracing.span("batch_get_v1", n) as _sp, \
+                access_log("batch_get_v1", lambda: f"{self._alog_tag} {n} keys") as r:
             ptrs, sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
@@ -414,13 +427,16 @@ class DfkvHiCache(HiCacheStorage):
             dur = time.perf_counter() - t0
             res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
             r.result = f"hits={sum(res)}/{n}"
+            if _sp:
+                _sp.hits = sum(res); _sp.bytes = sum(ss)
             self._metrics.on_get(pages=n, hit_pages=sum(res), nbytes=sum(ss), seconds=dur)
             # Fleet op metrics now come from the C++ KVClient snapshot (above).
             return res
 
     def batch_exists(self, keys, extra_info=None) -> int:
         total = len(keys)
-        with access_log("batch_exists", lambda: f"{self._alog_tag} {total} keys") as r:
+        with _tracing.span("batch_exists", total) as _sp, \
+                access_log("batch_exists", lambda: f"{self._alog_tag} {total} keys") as r:
             # longest contiguous prefix of pages whose every sub-object exists
             sub = self._sub()
             sks = [sk for k in keys for sk in self._keys(k)]
@@ -431,6 +447,8 @@ class DfkvHiCache(HiCacheStorage):
                     break
                 n += 1
             r.result = f"prefix={n}/{total}"
+            if _sp:
+                _sp.hits = n
             return n
 
     # --- v2 pool-aware interface (multi-pool models: Mamba/SWA/DeepSeek-V4) ---
@@ -477,17 +495,25 @@ class DfkvHiCache(HiCacheStorage):
         return results
 
     def batch_set_v2(self, transfers, extra_info=None) -> dict:
-        with access_log("batch_set_v2",
-                        lambda: f"{self._alog_tag} {_fmt_pools(transfers)}") as r:
+        nkeys = sum(len(tr.keys or []) for tr in (transfers or []))
+        with _tracing.span("batch_set_v2", nkeys) as _sp, \
+                access_log("batch_set_v2",
+                           lambda: f"{self._alog_tag} {_fmt_pools(transfers)}") as r:
             res = self._v2_io(transfers, putting=True)
             r.result = _fmt_pool_results(res)
+            if _sp:
+                _sp.hits = sum(sum(rs) for rs in res.values())
             return res
 
     def batch_get_v2(self, transfers, extra_info=None) -> dict:
-        with access_log("batch_get_v2",
-                        lambda: f"{self._alog_tag} {_fmt_pools(transfers)}") as r:
+        nkeys = sum(len(tr.keys or []) for tr in (transfers or []))
+        with _tracing.span("batch_get_v2", nkeys) as _sp, \
+                access_log("batch_get_v2",
+                           lambda: f"{self._alog_tag} {_fmt_pools(transfers)}") as r:
             res = self._v2_io(transfers, putting=False)
             r.result = _fmt_pool_results(res)
+            if _sp:
+                _sp.hits = sum(sum(rs) for rs in res.values())
             return res
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):

@@ -22,6 +22,7 @@ from ._cabi import load_lib, native_version
 from .access_log import access_log
 from ._telemetry import config as _tcfg
 from ._telemetry import metrics as _push_metrics
+from ._telemetry import tracing as _push_tracing
 
 c_void_p = ctypes.c_void_p
 c_char_p = ctypes.c_char_p
@@ -100,6 +101,12 @@ class DfkvDeviceClient:
             {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
             version=_tcfg.dist_version("dfkv-vllm"),
             native_version=native_version(self._lib))
+        # Connector-side request tracing (off by default; zero cost when off).
+        # Spans for slow / sampled / failed ops pushed over OTLP /v1/traces.
+        _push_tracing.configure(
+            {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
+            version=_tcfg.dist_version("dfkv-vllm"),
+            native_version=native_version(self._lib))
 
     @property
     def transport_mode(self) -> str:
@@ -127,9 +134,12 @@ class DfkvDeviceClient:
         connector's "0 = ok" convention so callers don't have to know this."""
         n = len(keys)
         with _push_metrics.op("put", num_keys=n) as _m, \
+                _push_tracing.span("batch_put", n) as _sp, \
                 access_log("batch_put", lambda: f"{n} keys, {sum(sizes)} bytes") as r:
-            if _m:
-                _m.bytes = sum(sizes)
+            if _m or _sp:
+                _nb = sum(sizes)
+                _m.bytes = _nb
+                _sp.bytes = _nb
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
             sarr = (c_uint64 * n)(*sizes)
@@ -138,7 +148,10 @@ class DfkvDeviceClient:
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_put rc={rc}")
             res = [0 if ok == 1 else 1 for ok in out]
-            r.result = f"ok={res.count(0)}/{n}"
+            ok_n = res.count(0)
+            r.result = f"ok={ok_n}/{n}"
+            if _sp:
+                _sp.hits = ok_n
             return res
 
     def batch_get(
@@ -149,6 +162,7 @@ class DfkvDeviceClient:
         miss; ``lengths[i]`` is the true stored byte length on hit."""
         n = len(keys)
         with _push_metrics.op("get", num_keys=n) as _m, \
+                _push_tracing.span("batch_get", n) as _sp, \
                 access_log("batch_get_auto", lambda: f"{n} keys") as r:
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             parr = (c_void_p * n)(*[c_void_p(p) for p in ptrs])
@@ -161,9 +175,12 @@ class DfkvDeviceClient:
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_get_auto rc={rc}")
             hits, lens = list(out_hit), list(out_len)
+            nhit, nbytes = sum(hits), sum(lens)
             if _m:
-                _m.bytes = sum(lens)
-            r.result = f"hits={sum(hits)}/{n}, {sum(lens)} bytes"
+                _m.bytes = nbytes
+            if _sp:
+                _sp.hits = nhit; _sp.bytes = nbytes
+            r.result = f"hits={nhit}/{n}, {nbytes} bytes"
             return hits, lens
 
     def batch_put_sg(
@@ -179,12 +196,15 @@ class DfkvDeviceClient:
         (``0`` = ok, ``1`` = failed), same "0=ok" normalization as ``batch_put``."""
         n = len(keys)
         with _push_metrics.op("put", num_keys=n) as _m, \
+                _push_tracing.span("batch_put_sg", n) as _sp, \
                 access_log(
                     "batch_put_sg",
                     lambda: f"{n} keys, {sum(sum(s) for s in seg_sizes)} bytes",
                 ) as r:
-            if _m:
-                _m.bytes = sum(sum(s) for s in seg_sizes)
+            if _m or _sp:
+                _nb = sum(sum(s) for s in seg_sizes)
+                _m.bytes = _nb
+                _sp.bytes = _nb
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             # Keep the per-key inner arrays alive for the duration of the call.
             inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
@@ -201,7 +221,10 @@ class DfkvDeviceClient:
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_put_sg rc={rc}")
             res = [0 if ok == 1 else 1 for ok in out]
-            r.result = f"ok={res.count(0)}/{n}"
+            ok_n = res.count(0)
+            r.result = f"ok={ok_n}/{n}"
+            if _sp:
+                _sp.hits = ok_n
             return res
 
     def batch_get_auto_sg(
@@ -216,6 +239,7 @@ class DfkvDeviceClient:
         ``(hits, lengths)`` where ``lengths[i]`` is the total stored bytes."""
         n = len(keys)
         with _push_metrics.op("get", num_keys=n) as _m, \
+                _push_tracing.span("batch_get_auto_sg", n) as _sp, \
                 access_log("batch_get_auto_sg", lambda: f"{n} keys") as r:
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             inner_p = [(c_void_p * len(p))(*[c_void_p(x) for x in p]) for p in seg_ptrs]
@@ -235,15 +259,19 @@ class DfkvDeviceClient:
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_get_auto_sg rc={rc}")
             hits, lens = list(out_hit), list(out_len)
+            nhit, nbytes = sum(hits), sum(lens)
             if _m:
-                _m.bytes = sum(lens)
-            r.result = f"hits={sum(hits)}/{n}, {sum(lens)} bytes"
+                _m.bytes = nbytes
+            if _sp:
+                _sp.hits = nhit; _sp.bytes = nbytes
+            r.result = f"hits={nhit}/{n}, {nbytes} bytes"
             return hits, lens
 
     def batch_exist(self, keys: Sequence[str]) -> list:
         """Return ``[1|0]`` per key (1 = present in the cache)."""
         n = len(keys)
         with _push_metrics.op("exist", num_keys=n), \
+                _push_tracing.span("batch_exist", n) as _sp, \
                 access_log("batch_exist", lambda: f"{n} keys") as r:
             karr = (c_char_p * n)(*[k.encode() for k in keys])
             out = (c_int * n)()
@@ -251,7 +279,10 @@ class DfkvDeviceClient:
             if rc != 0:
                 raise RuntimeError(f"dfkv_batch_exist rc={rc}")
             res = list(out)
-            r.result = f"present={res.count(1)}/{n}"
+            present = res.count(1)
+            r.result = f"present={present}/{n}"
+            if _sp:
+                _sp.hits = present
             return res
 
     def close(self) -> None:
