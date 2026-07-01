@@ -114,12 +114,12 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
                     f"{spec.block_size} != cache_config.block_size="
                     f"{cache_block_size} (mamba_cache_mode != 'align')"
                 )
-        pcp = vllm_config.parallel_config.prefill_context_parallel_size
-        dcp = vllm_config.parallel_config.decode_context_parallel_size
-        if len(kv_cache_config.kv_cache_groups) > 1 and pcp * dcp > 1:
-            unsupported.append(
-                f"PCP/DCP > 1 (pcp={pcp}, dcp={dcp}) with hybrid attention"
-            )
+        # NOTE: multi-group (hybrid attention, e.g. GLM-5.2 DSA = MLA + sparse
+        # indexer groups) together with PCP/DCP > 1 is now supported: each group
+        # is normalized to scheduler_block_size in the worker and every rank
+        # stores/loads only its own physical shard under its @pcp{r}@dcp{r} key,
+        # so the per-group store/load masks stay correct regardless of how a
+        # given group shards under CP. (Previously guarded off.)
         if unsupported:
             raise ValueError(
                 "DfkvStoreConnector does not support: " + "; ".join(unsupported)

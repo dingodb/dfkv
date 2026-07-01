@@ -766,20 +766,45 @@ class DfkvStoreWorker:
         self.kv_connector_stats = DfkvStoreConnectorStats()
 
         self._kv_cache_config = kv_cache_config
-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
-        # self.block_size (= scheduler_block_size) so the coordinator's
-        # ``block_size % hash_block_size == 0`` invariant holds.
-        groups = list(kv_cache_config.kv_cache_groups)
-        if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
-            g = groups[0]
-            groups = [
-                dataclasses.replace(
-                    g,
-                    kv_cache_spec=dataclasses.replace(
-                        g.kv_cache_spec, block_size=self.block_size
-                    ),
+        # PCP/DCP > 1 (single- OR multi-group): scale EACH group's
+        # spec.block_size to self.block_size (= scheduler_block_size) so the
+        # coordinator's ``block_size % hash_block_size == 0`` and
+        # ``scheduler_block_size % block_size == 0`` invariants hold. Under CP
+        # different groups shard differently (e.g. GLM-5.2 DSA: the MLA group is
+        # DCP-sharded while the indexer group is not), but normalizing every
+        # group to scheduler_block_size keeps the per-group hashing / store-load
+        # masks uniform; each rank still only holds (and stores under its
+        # @pcp{r}@dcp{r} key) its own physical shard of the cache.
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        def _scale_spec(spec):
+            # UniformTypeKVCacheSpecs wraps inner per-layer specs; the
+            # coordinator unwraps to the inner spec (see _unwrap_spec), so the
+            # inner block_size(s) must be scaled too, not just the wrapper's.
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                inner = {
+                    name: (
+                        dataclasses.replace(s, block_size=self.block_size)
+                        if s.block_size != self.block_size
+                        else s
+                    )
+                    for name, s in spec.kv_cache_specs.items()
+                }
+                if spec.block_size == self.block_size and all(
+                    s.block_size == self.block_size for s in inner.values()
+                ):
+                    return spec
+                return dataclasses.replace(
+                    spec, block_size=self.block_size, kv_cache_specs=inner
                 )
-            ]
+            if spec.block_size != self.block_size:
+                return dataclasses.replace(spec, block_size=self.block_size)
+            return spec
+
+        groups = [
+            dataclasses.replace(g, kv_cache_spec=_scale_spec(g.kv_cache_spec))
+            for g in kv_cache_config.kv_cache_groups
+        ]
         self._kv_cache_groups: list[KVCacheGroupSpec] = groups
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
