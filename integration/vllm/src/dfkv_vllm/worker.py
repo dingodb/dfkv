@@ -721,6 +721,19 @@ class DfkvStoreWorker:
             self.head_or_tp_rank = self.tp_rank
             self.put_step = 1
 
+        # DCP shards the (otherwise TP-replicated) MLA KV across dcp ranks, so
+        # each rank holds a UNIQUE shard (separated by the @dcp{r} key field),
+        # not a replica. put_step is a dedup stride that assumes replication:
+        # only 1/put_step of the identical-across-TP keys are stored. Under DCP
+        # that assumption is wrong -- the stride would drop ~(1 - 1/put_step) of
+        # each rank's own unique shard, so cross-instance (PD) consumers miss
+        # most of the KV (observed ~7% hit at TP8/DCP8, i.e. ~1/8). Shrink the
+        # stride by dcp_size so every rank stores its full shard. head_or_tp_rank
+        # is left unchanged: @dcp{r} already separates the shards, and both P and
+        # D derive it identically, so the keyspace stays consistent.
+        if self.dcp_size > 1 and self.put_step > 1:
+            self.put_step = max(1, self.put_step // self.dcp_size)
+
         self.metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
             tp_rank=self.head_or_tp_rank,
