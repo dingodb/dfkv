@@ -100,6 +100,14 @@ def _read_snapshot(lib, h) -> str:
     return buf.value.decode("utf-8", "replace")
 
 
+# A valid non-null pointer for zero-length "marker" puts (the logical-anchor
+# "kv" pool of V4/DSA models). The payload is 0 bytes, so the pointer is never
+# dereferenced, but it must be non-null so the batch slot isn't treated as a
+# failed (null-key) entry by the C ABI.
+_MARKER_BUF = ctypes.create_string_buffer(1)
+_MARKER_PTR = ctypes.addressof(_MARKER_BUF)
+
+
 def _arrays(subkeys, ptrs, sizes):
     """Build parallel C arrays (keys, ptrs, sizes) for a batch call."""
     n = len(subkeys)
@@ -132,6 +140,9 @@ class DfkvHiCache(HiCacheStorage):
         self.tp_rank = int(storage_config.tp_rank)
         self.tp_size = int(storage_config.tp_size)
         self.is_mla = bool(storage_config.is_mla_model)
+        # One-shot guard for the logical-anchor notice (V4/DSA models whose
+        # primary "kv" pool holds no host buffer — see _note_logical_anchor_once).
+        self._anchor_noop_warned = False
         # Access log: idempotent per process (first instance wins). Configured
         # here so tp_rank/model are available for the {rank} path placeholder.
         _configure_access_log(cfg, tp_rank=self.tp_rank, model=self.model)
@@ -388,6 +399,50 @@ class DfkvHiCache(HiCacheStorage):
             return [False] * len(kbuf)
         return [out[i] == 1 for i in range(len(kbuf))]
 
+    def _note_logical_anchor_once(self):
+        """One-time notice that the primary KV pool is a logical anchor.
+
+        SGLang builds a *logical anchor* (LogicalHostPool) as the primary "kv"
+        pool for V4/DSA multi-pool models such as GLM-5.2 — it carries no KV
+        tensor, so get_page_buffer_meta() returns None. The real KV rides the v2
+        side-pool path (batch_set_v2/batch_get_v2); the v1 anchor only writes an
+        empty "kv" marker so the v2 existence check can anchor the hit prefix
+        (mirrors SGLang's reference backend). Informational, not an error — the
+        path works, but it is newly enabled, so surface it once for ops to
+        confirm the hit rate via metrics."""
+        if self._anchor_noop_warned:
+            return
+        self._anchor_noop_warned = True
+        import sys as _sys
+        print("[dfkv] NOTE: primary KV pool is a logical anchor "
+              "(get_page_buffer_meta -> None) — a V4/DSA multi-pool model "
+              f"(model={self.model!r}, e.g. GLM-5.2). The v1 anchor writes an "
+              "empty 'kv' marker; real KV rides the v2 side-pool path. Verify L3 "
+              "hit rate via metrics; if low, the LMCache MP connector "
+              "(docs/lmcache/) is the alternative path for GLM-5.x DSA.",
+              file=_sys.stderr, flush=True)
+
+    def _write_anchor_markers(self, keys) -> List[bool]:
+        """Write an empty (0-byte) marker object per "kv" sub-key so a later
+        batch_exists / batch_exists_v2 can find the primary-pool prefix.
+
+        Used only for the logical-anchor case (V4/DSA, e.g. GLM-5.2): the anchor
+        pool holds no KV buffer, so there is nothing to zero-copy — but SGLang's
+        v2 existence check still gates the hit prefix on the primary "kv" keys,
+        exactly as its reference backend does by writing an empty get_data_page().
+        The marker carries the connector's geometry header (so a cross-geometry
+        reader still misses); the matching read (batch_get_v1) is a no-op. Returns
+        a per-page success list (a page succeeds iff all its sub-object markers
+        were written)."""
+        sub = self._sub()
+        sks = [sk for k in keys for sk in self._keys(k)]
+        if not sks:
+            return []
+        karr, parr, sarr, out, _ = _arrays(sks, [_MARKER_PTR] * len(sks),
+                                           [0] * len(sks))
+        self._lib.dfkv_batch_put(self._h, karr, parr, sarr, len(sks), out)
+        return self._fold([out[i] == 1 for i in range(len(sks))], len(keys), sub)
+
     # --- zero-copy v1 batch path (the one the controller calls) ---
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         n = len(keys)
@@ -399,7 +454,25 @@ class DfkvHiCache(HiCacheStorage):
                 if _sp:
                     _sp.attrs = {"dfkv.backup_skip": True}
                 return [True] * n
-            ptrs, sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
+            meta = self.mem_pool_host.get_page_buffer_meta(host_indices)
+            if meta is None:
+                # Primary "kv" pool is a *logical anchor* holding no KV buffer
+                # (V4/DSA-compressed models, e.g. GLM-5.2: SGLang registers a
+                # LogicalHostPool whose get_page_buffer_meta() returns None). The
+                # real KV lives in compressed side-pools written via batch_set_v2;
+                # there is nothing to zero-copy on the anchor, but we still write
+                # an empty "kv" marker per page so the v2 existence check can
+                # anchor the hit prefix (SGLang's reference backend does the same
+                # with an empty get_data_page()). Single-pool models (MLA/MHA)
+                # never return None, so this branch is inert for them.
+                self._note_logical_anchor_once()
+                res = self._write_anchor_markers(keys)
+                r.result = f"anchor_marker {sum(res)}/{n}"
+                if _sp:
+                    _sp.hits = sum(res)
+                    _sp.attrs = {"dfkv.anchor_marker": True}
+                return res
+            ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
             t0 = time.perf_counter()
@@ -419,7 +492,23 @@ class DfkvHiCache(HiCacheStorage):
         n = len(keys)
         with _tracing.span("batch_get_v1", n) as _sp, \
                 access_log("batch_get_v1", lambda: f"{self._alog_tag} {n} keys") as r:
-            ptrs, sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
+            meta = self.mem_pool_host.get_page_buffer_meta(host_indices)
+            if meta is None:
+                # Logical anchor pool, no buffer to scatter into (V4/DSA models,
+                # e.g. GLM-5.2). The "kv" prefix was already confirmed present by
+                # batch_exists_v2 (via the empty markers written on backup); there
+                # is no anchor payload to load. Report all pages present so
+                # _page_get_zero_copy counts the anchor prefix complete and the
+                # hybrid controller then loads the real KV from side-pools via
+                # batch_get_v2. Returning False here would make kv_completed_pages
+                # < prefix and skip that side-pool load entirely. Inert for
+                # single-pool models (non-None).
+                self._note_logical_anchor_once()
+                r.result = "anchor_noop"
+                if _sp:
+                    _sp.attrs = {"dfkv.anchor_noop": True}
+                return [True] * n
+            ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
             karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
             t0 = time.perf_counter()
@@ -535,7 +624,18 @@ class DfkvHiCache(HiCacheStorage):
                        for sk in self._pool_keys(name, k)]
                 present = self._fold(self._batch_exist_flat(sks), kv_pages, sub)
                 if tr.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                    boundary = kv_pages if all(present) else 0
+                    # Only the *last* `trailing` pages of a candidate prefix need
+                    # this pool (e.g. SWA sliding window / Mamba state) — matches
+                    # SGLang's reference batch_exists_v2. The previous `all(present)`
+                    # wrongly required every prefix page, collapsing SWA hits to 0
+                    # once early window pages had been evicted.
+                    trailing = max(1, len(tr.keys) if tr.keys else 1)
+                    boundary = 0
+                    for prefix_len in range(kv_pages, 0, -1):
+                        if all(present[i] for i in
+                               range(max(0, prefix_len - trailing), prefix_len)):
+                            boundary = prefix_len
+                            break
                 else:  # ALL_PAGES
                     boundary = 0
                     for ok in present:

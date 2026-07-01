@@ -90,6 +90,19 @@ class RegistrablePool(FakeMlaPool):
         self.data_buffer = FlatBuf(num_pages * page_bytes)
 
 
+class FakeLogicalAnchorPool:
+    """Stand-in for SGLang's LogicalHostPool: the primary "kv" pool of a
+    V4/DSA-compressed model (e.g. GLM-5.2). Holds NO KV buffer, so its
+    get_page_buffer_meta() returns None — the real KV lives in side-pools moved
+    over the v2 PoolTransfer path. The v1 anchor call must no-op on this."""
+
+    def __init__(self, page_size=64):
+        self.page_size = page_size
+
+    def get_page_buffer_meta(self, host_indices):
+        return None
+
+
 def _spawn_node(tag):
     d = tempfile.mkdtemp(prefix=f"dfkv_py_{tag}_")
     p = subprocess.Popen([SERVER_BIN, "--dir", d, "--port", "0", "--cap", str(1 << 30)],
@@ -370,6 +383,90 @@ class DingoFSHiCacheTest(unittest.TestCase):
             self.assertEqual(ex.page_bytes_at(i), expe[i])
         r = st.batch_exists_v2(keys, [PoolTransfer(name="extra", host_indices=hi, keys=keys)])
         self.assertEqual(r.kv_hit_pages, 3)
+
+    def test_v1_logical_anchor_writes_markers_no_crash(self):
+        # V4/DSA models (e.g. GLM-5.2): the primary "kv" pool is a logical anchor
+        # whose get_page_buffer_meta() returns None. batch_set_v1 must not crash
+        # (was: TypeError unpacking None); it writes an empty "kv" marker per page
+        # so batch_exists can find the primary prefix, and batch_get_v1 no-ops
+        # (all pages "present" so the hybrid controller loads the real side pools).
+        members, _, ndir = self._node("anchor")
+        st = self._plugin(self._cfg(members, model="glm-5.2"),
+                          FakeLogicalAnchorPool(self.PAGE_SIZE))
+        keys = ["kv0", "kv1", "kv2"]
+        hi = list(range(3 * self.PAGE_SIZE))
+        self.assertEqual(st.batch_set_v1(keys, hi), [True, True, True])
+        # markers were written (MLA: one object per page) and are discoverable
+        self.assertEqual(_count_objects(ndir), 3)
+        self.assertEqual(st.batch_exists(keys), 3)
+        self.assertEqual(st.batch_exists(keys + ["kv3"]), 3)  # absent page stops prefix
+        # anchor load is a no-op but reports all pages complete
+        self.assertEqual(st.batch_get_v1(keys, hi), [True, True, True])
+        self.assertTrue(st._anchor_noop_warned)
+
+    def test_v2_exists_with_logical_anchor_full_and_shrunk(self):
+        # End-to-end multi-pool existence for a logical-anchor (DSA) model: the
+        # "kv" markers (v1) + a compressed side pool (v2) together define the hit
+        # prefix, and a missing side-pool page shrinks it.
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+        members, _, _ = self._node("anchorv2")
+        st = dfkv_hicache.DfkvHiCache(self._cfg(members, model="glm-5.2"),
+                                      self._cfg(members, model="glm-5.2").extra_config)
+        st.register_mem_pool_host(FakeLogicalAnchorPool(self.PAGE_SIZE))
+        side = FakeMlaPool(3, self.PAGE_BYTES, self.PAGE_SIZE)
+        st.register_mem_host_pool_v2(side, "deepseek_v4_c4")
+        keys = ["a0", "a1", "a2"]
+        hi = list(range(3 * self.PAGE_SIZE))
+        # backup: v1 anchor markers (all 3) + v2 side pool for only the first 2
+        st.batch_set_v1(keys, hi)
+        st.batch_set_v2([PoolTransfer(name="deepseek_v4_c4",
+                                      host_indices=hi[:2 * self.PAGE_SIZE],
+                                      keys=keys[:2])])
+        trs = [PoolTransfer(name="deepseek_v4_c4", host_indices=hi, keys=keys)]
+        # side pool present for 2/3 -> usable prefix shrinks to 2
+        self.assertEqual(st.batch_exists_v2(keys, trs).kv_hit_pages, 2)
+        # fill the 3rd side-pool page -> full 3-page hit
+        st.batch_set_v2([PoolTransfer(name="deepseek_v4_c4",
+                                      host_indices=hi[2 * self.PAGE_SIZE:],
+                                      keys=keys[2:])])
+        self.assertEqual(st.batch_exists_v2(keys, trs).kv_hit_pages, 3)
+
+    def test_v2_exists_trailing_pool_sliding_window(self):
+        # TRAILING_PAGES (SWA / Mamba state): only the last N pages of a prefix
+        # need this pool. A hit must NOT collapse just because earlier window
+        # pages were evicted (the old `all(present)` logic wrongly did).
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolHitPolicy
+        members, _, _ = self._node("swa")
+        cfg = self._cfg(members, model="glm-5.2")
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st.register_mem_pool_host(FakeLogicalAnchorPool(self.PAGE_SIZE))
+        swa = FakeMlaPool(4, self.PAGE_BYTES, self.PAGE_SIZE)
+        st.register_mem_host_pool_v2(swa, "swa")
+        keys = ["s0", "s1", "s2", "s3"]
+        hi = list(range(4 * self.PAGE_SIZE))
+        st.batch_set_v1(keys, hi)  # 4 "kv" markers -> kv prefix = 4
+        # SWA present for only the trailing 2 pages (sliding window = 2)
+        st.batch_set_v2([PoolTransfer(name="swa",
+                                      host_indices=hi[2 * self.PAGE_SIZE:],
+                                      keys=keys[2:])])
+        trs = [PoolTransfer(name="swa", host_indices=hi, keys=keys[2:],
+                            hit_policy=PoolHitPolicy.TRAILING_PAGES)]
+        # trailing window (last 2) present -> full 4-page prefix stays usable
+        self.assertEqual(st.batch_exists_v2(keys, trs).kv_hit_pages, 4)
+        # but if the trailing window is broken (last page missing), it shrinks
+        swa2 = FakeMlaPool(4, self.PAGE_BYTES, self.PAGE_SIZE)
+        members2, _, _ = self._node("swa2")
+        cfg2 = self._cfg(members2, model="glm-5.2")
+        st2 = dfkv_hicache.DfkvHiCache(cfg2, cfg2.extra_config)
+        st2.register_mem_pool_host(FakeLogicalAnchorPool(self.PAGE_SIZE))
+        st2.register_mem_host_pool_v2(swa2, "swa")
+        st2.batch_set_v1(keys, hi)
+        # SWA present only for pages 0,1 (window covers a stale tail) -> for a
+        # window of 2 the best prefix whose last 2 pages are present is len 2.
+        st2.batch_set_v2([PoolTransfer(name="swa",
+                                       host_indices=hi[:2 * self.PAGE_SIZE],
+                                       keys=keys[:2])])
+        self.assertEqual(st2.batch_exists_v2(keys, trs).kv_hit_pages, 2)
 
     def test_register_mem_host_pool_v2_registers_backing_buffer(self):
         members, _, _ = self._node("v2reg")
