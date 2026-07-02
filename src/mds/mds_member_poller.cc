@@ -56,7 +56,21 @@ bool MdsMemberPoller::Query(std::vector<MemberInfo>* out, uint64_t* epoch) {
 bool MdsMemberPoller::PollOnce() {
   std::vector<MemberInfo> ms;
   uint64_t epoch = 0;
-  if (!Query(&ms, &epoch)) return false;
+  if (!Query(&ms, &epoch)) return false;  // failed RPC never clears the ring
+
+  // Empty-view guard: a *successful* empty response after we have seen real
+  // members is almost always etcd-outage recovery (all leases expired), not a
+  // genuine teardown. Don't swap in an empty ring until it persists for
+  // kEmptyViewsToAccept consecutive polls; adopting late costs nothing (an
+  // empty ring can serve no requests anyway), while adopting early causes a
+  // cluster-wide miss storm and a double remap when members re-register.
+  if (ms.empty() && seen_nonempty_ &&
+      ++consecutive_empty_ < kEmptyViewsToAccept) {
+    ++empty_view_rejected_;
+    return true;  // keep the last ring; do NOT invoke on_change
+  }
+  if (!ms.empty()) { seen_nonempty_ = true; consecutive_empty_ = 0; }
+
   if (!have_epoch_ || epoch != last_epoch_) {
     last_epoch_ = epoch;
     have_epoch_ = true;

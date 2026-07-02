@@ -2,6 +2,13 @@
 #include "mds/mds_server.h"
 #include "mds/mds_registrar.h"
 #include "common/membership.h"
+#include "transport/wire.h"
+#include "utils/net_util.h"
+#include "utils/wire_limits.h"
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <algorithm>
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
@@ -66,4 +73,116 @@ TEST(MdsMemberPoller, BackgroundLoopPicksUpMembers) {
   EXPECT_EQ(seen.load(), 1);
   poller.Stop();
   mds.Stop();
+}
+
+namespace {
+// In-process fake MDS that answers kListMembers with a scripted sequence of
+// member counts (one entry consumed per poll; the last entry repeats). Lets us
+// drive the empty-view guard deterministically without waiting on lease expiry.
+class ScriptedMds {
+ public:
+  explicit ScriptedMds(std::vector<int> counts) : counts_(std::move(counts)) {
+    lfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ::bind(lfd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+    ::listen(lfd_, 8);
+    socklen_t sl = sizeof(sa);
+    ::getsockname(lfd_, reinterpret_cast<sockaddr*>(&sa), &sl);
+    port_ = ntohs(sa.sin_port);
+    th_ = std::thread([this] { Serve(); });
+  }
+  ~ScriptedMds() {
+    ::shutdown(lfd_, SHUT_RDWR);
+    ::close(lfd_);
+    if (th_.joinable()) th_.join();
+  }
+  int port() const { return port_; }
+  std::string ep() const { return "127.0.0.1:" + std::to_string(port_); }
+
+ private:
+  void Serve() {
+    size_t idx = 0;
+    for (;;) {
+      int fd = ::accept(lfd_, nullptr, nullptr);
+      if (fd < 0) return;
+      char pre[kReqPrefix];
+      if (net::ReadAll(fd, pre, kReqPrefix)) {
+        ReqFields rq;
+        if (DecodeReq(pre, &rq, wire_limits::kMdsMaxReqPayload) && rq.payload_len) {
+          std::string sink(rq.payload_len, '\0');
+          net::ReadAll(fd, &sink[0], rq.payload_len);
+        }
+        int n = counts_[std::min(idx, counts_.size() - 1)];
+        ++idx;
+        std::vector<MemberInfo> ms;
+        for (int i = 0; i < n; ++i)
+          ms.push_back({"n" + std::to_string(i), "10.0.0." + std::to_string(i + 1),
+                        28000, 1});
+        // Epoch varies with content so the poller's dedup doesn't mask changes.
+        std::string data = EncodeMembers(ms, MembersEpoch(ms));
+        char rp[kRespPrefix];
+        EncodeResp(rp, Status::kOk, data.size());
+        net::WriteAll(fd, rp, kRespPrefix);
+        if (!data.empty()) net::WriteAll(fd, data.data(), data.size());
+      }
+      ::close(fd);
+    }
+  }
+  std::vector<int> counts_;
+  int lfd_ = -1, port_ = 0;
+  std::thread th_;
+};
+}  // namespace
+
+TEST(MdsMemberPoller, EmptyViewGuardKeepsRingUntilPersistent) {
+  // Sequence: 2 members, then empty x4. The first two empties are suppressed;
+  // the third empty is accepted (kEmptyViewsToAccept=3).
+  ScriptedMds mds({2, 0, 0, 0, 0});
+  std::vector<size_t> fired_sizes;
+  MdsMemberPoller poller({mds.ep()}, "g",
+      [&](const std::vector<MemberInfo>& ms) { fired_sizes.push_back(ms.size()); });
+
+  ASSERT_TRUE(poller.PollOnce());               // 2 members -> fire(2)
+  ASSERT_EQ(fired_sizes.size(), 1u);
+  EXPECT_EQ(fired_sizes[0], 2u);
+
+  ASSERT_TRUE(poller.PollOnce());               // empty #1 -> suppressed
+  ASSERT_TRUE(poller.PollOnce());               // empty #2 -> suppressed
+  EXPECT_EQ(fired_sizes.size(), 1u) << "ring must be kept while empties are transient";
+  EXPECT_EQ(poller.empty_view_rejected(), 2u);
+
+  ASSERT_TRUE(poller.PollOnce());               // empty #3 -> accepted -> fire(0)
+  ASSERT_EQ(fired_sizes.size(), 2u);
+  EXPECT_EQ(fired_sizes[1], 0u);
+}
+
+TEST(MdsMemberPoller, EmptyViewGuardResetsOnRecovery) {
+  // Sequence: 2, empty, empty, then members return before the 3rd empty.
+  ScriptedMds mds({2, 0, 0, 3, 3});
+  std::vector<size_t> fired_sizes;
+  MdsMemberPoller poller({mds.ep()}, "g",
+      [&](const std::vector<MemberInfo>& ms) { fired_sizes.push_back(ms.size()); });
+
+  ASSERT_TRUE(poller.PollOnce());  // fire(2)
+  ASSERT_TRUE(poller.PollOnce());  // empty #1 suppressed
+  ASSERT_TRUE(poller.PollOnce());  // empty #2 suppressed
+  ASSERT_TRUE(poller.PollOnce());  // 3 members -> fire(3), counter reset
+  ASSERT_EQ(fired_sizes.size(), 2u) << "ring never went empty";
+  EXPECT_EQ(fired_sizes[0], 2u);
+  EXPECT_EQ(fired_sizes[1], 3u);
+  EXPECT_EQ(poller.empty_view_rejected(), 2u);
+}
+
+TEST(MdsMemberPoller, FirstViewEmptyIsAdopted) {
+  // No prior non-empty view -> an initial empty result is adopted as-is
+  // (preserves the existing greenfield behavior).
+  ScriptedMds mds({0});
+  int fires = 0;
+  MdsMemberPoller poller({mds.ep()}, "g",
+      [&](const std::vector<MemberInfo>&) { ++fires; });
+  ASSERT_TRUE(poller.PollOnce());
+  EXPECT_EQ(fires, 1);
+  EXPECT_EQ(poller.empty_view_rejected(), 0u);
 }
