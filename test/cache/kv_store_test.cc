@@ -1,4 +1,5 @@
 // TDD R3 — KVStore: the cache-node local store (disk + LRU + cache-only/no-S3).
+#include <cerrno>
 #include <fstream>
 #include "cache/kv_store.h"
 
@@ -323,4 +324,50 @@ TEST_F(KVStoreTest, RebuildIndexReclaimsOrphanTmpAndKeepsPublishedBlocks) {
   EXPECT_EQ(tmps, 0u);
   // Orphan bytes were never counted toward capacity.
   (void)before;
+}
+
+TEST_F(KVStoreTest, EnospcTriggersForceEvictAndRetrySucceeds) {
+  // Fill the store with several evictable blocks, then inject a single ENOSPC
+  // on the next write. The store must force-evict and retry, landing the block.
+  KVStore s(Opts(/*cap=*/1ull << 30));
+  for (int i = 0; i < 8; ++i) {
+    std::string v(4096, 'a' + i);
+    ASSERT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(1000 + i), 0, 1},
+                      v.data(), v.size()), Status::kOk);
+  }
+  ASSERT_GE(s.Count(), 8u);
+
+  int calls = 0;
+  s.SetWriteFnForTest([&](const std::string& path, const void* data, size_t len,
+                          int* werr) -> bool {
+    if (++calls == 1) { if (werr) *werr = ENOSPC; return false; }  // first write: disk full
+    // Retry: write for real so the block actually lands + reads back.
+    std::ofstream(path, std::ios::binary).write(static_cast<const char*>(data),
+                                                static_cast<std::streamsize>(len));
+    return true;
+  });
+
+  std::string v(4096, 'Z');
+  BlockKey nk{2000, 0, 1};
+  EXPECT_EQ(s.Cache(nk, v.data(), v.size()), Status::kOk);
+  EXPECT_EQ(calls, 2) << "must retry exactly once after the injected ENOSPC";
+  EXPECT_EQ(s.EnospcEvictions(), 1u);
+  EXPECT_GT(s.Evictions(), 0u) << "force-evict must have reclaimed at least one block";
+  EXPECT_TRUE(s.IsCached(nk));
+}
+
+TEST_F(KVStoreTest, PersistentEnospcReturnsIoErrorWithoutInfiniteLoop) {
+  KVStore s(Opts());
+  for (int i = 0; i < 4; ++i) {
+    std::string v(4096, 'a' + i);
+    ASSERT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(3000 + i), 0, 1},
+                      v.data(), v.size()), Status::kOk);
+  }
+  s.SetWriteFnForTest([&](const std::string&, const void*, size_t, int* werr) -> bool {
+    if (werr) *werr = ENOSPC;  // always full: retry can't succeed
+    return false;
+  });
+  std::string v(4096, 'Q');
+  EXPECT_EQ(s.Cache(BlockKey{4000, 0, 1}, v.data(), v.size()), Status::kIOError);
+  EXPECT_EQ(s.EnospcEvictions(), 0u);  // retry did not succeed -> not counted
 }

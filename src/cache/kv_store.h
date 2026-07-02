@@ -16,6 +16,7 @@
 #define DFKV_KV_STORE_H_
 
 #include <atomic>
+#include <functional>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -99,7 +100,16 @@ class KVStore {
   // leaks). Diagnostic: a persistently non-zero value across restarts points at
   // frequent mid-write kills.
   uint64_t TmpReclaimed() const { return tmp_reclaimed_.load(std::memory_order_relaxed); }
+  // PUTs that hit a real ENOSPC, force-evicted, and retried successfully.
+  uint64_t EnospcEvictions() const { return enospc_evictions_.load(std::memory_order_relaxed); }
   const std::string& Dir() const { return opt_.cache_dir; }
+
+  // Test-only: override the disk write for the Cache() path so a test can
+  // inject a transient ENOSPC (returning false with *out_errno=ENOSPC once,
+  // then succeeding) and exercise the force-evict + retry self-heal.
+  using WriteFn = std::function<bool(const std::string& path, const void* data,
+                                     size_t len, int* out_errno)>;
+  void SetWriteFnForTest(WriteFn fn) { write_fn_override_ = std::move(fn); }
 
  private:
   struct Entry {
@@ -124,6 +134,7 @@ class KVStore {
 
   Shard& ShardFor(const std::string& fname) const;
   void EvictLocked(Shard& sh);  // CLOCK second-chance; exclusive lock held
+  void ForceEvictLocked(Shard& sh, uint64_t target);  // ENOSPC self-heal; excl. lock
   void RebuildIndex();
 
   Options opt_;
@@ -131,7 +142,9 @@ class KVStore {
   std::atomic<uint64_t> tmp_seq_{0};  // unique suffix for concurrent lock-free writes
   // Eviction counters (relaxed): incremented in EvictLocked across shards.
   std::atomic<uint64_t> evictions_{0}, evicted_bytes_{0};
-  std::atomic<uint64_t> tmp_reclaimed_{0};  // orphan .tmp removed at startup
+  std::atomic<uint64_t> tmp_reclaimed_{0};   // orphan .tmp removed at startup
+  std::atomic<uint64_t> enospc_evictions_{0};  // ENOSPC force-evict + retry succeeded
+  WriteFn write_fn_override_;                // test-only Cache() write injection
 };
 
 }  // namespace dfkv

@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -79,9 +80,11 @@ class AlignedBuf {
 // Writes [data, data+len) to `path` via O_DIRECT: fallocate the (aligned) space,
 // write an aligned superset from a bounce buffer, then ftruncate to the exact
 // `len`. Returns true on success. The caller owns tmp-file cleanup on failure.
-bool WriteFileDirect(const std::string& path, const void* data, size_t len) {
+bool WriteFileDirect(const std::string& path, const void* data, size_t len,
+                     int* out_errno) {
+  if (out_errno) *out_errno = 0;  // 0 unless a syscall below fails (see ENOSPC path)
   Fd fd(::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644));
-  if (!fd.valid()) return false;
+  if (!fd.valid()) { if (out_errno) *out_errno = errno; return false; }
   if (len == 0) return true;  // empty file already created + truncated by O_TRUNC
 
   uint64_t alen64 = 0;
@@ -93,6 +96,7 @@ bool WriteFileDirect(const std::string& path, const void* data, size_t len) {
   // so tolerate "unsupported"; treat other errors (e.g. ENOSPC) as fatal.
   if (::fallocate(fd.get(), 0, 0, static_cast<off_t>(alen)) != 0 &&
       errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
+    if (out_errno) *out_errno = errno;
     return false;
   }
 
@@ -105,14 +109,17 @@ bool WriteFileDirect(const std::string& path, const void* data, size_t len) {
   while (done < alen) {
     ssize_t w = ::pwrite(fd.get(), buf.data() + done, alen - done,
                          static_cast<off_t>(done));
-    if (w < 0) { if (errno == EINTR) continue; return false; }
+    if (w < 0) { if (errno == EINTR) continue; if (out_errno) *out_errno = errno; return false; }
     if (w == 0) return false;  // not expected for a regular file
     done += static_cast<size_t>(w);
     // A sub-block resume offset would make the next O_DIRECT pwrite EINVAL.
     if (done < alen && (done % kDioAlign) != 0) return false;
   }
 
-  if (::ftruncate(fd.get(), static_cast<off_t>(len)) != 0) return false;  // exact size
+  if (::ftruncate(fd.get(), static_cast<off_t>(len)) != 0) {  // exact size
+    if (out_errno) *out_errno = errno;
+    return false;
+  }
   return true;
 }
 
@@ -301,6 +308,38 @@ void KVStore::EvictLocked(Shard& sh) {
   }
 }
 
+// Reclaim at least `target` bytes from this shard regardless of the capacity
+// watermark, for the ENOSPC self-heal path: the disk filled before the logical
+// capacity did (tmp/FS-metadata overhead, a shared-disk tenant), so a normal
+// capacity-triggered eviction never fires and every PUT would fail forever.
+// Same CLOCK mechanics as EvictLocked; bounded by a full ring sweep so it
+// terminates even if `target` exceeds what the shard holds. Exclusive lock held.
+void KVStore::ForceEvictLocked(Shard& sh, uint64_t target) {
+  uint64_t freed = 0;
+  size_t swept = 0;
+  const size_t budget = 3 * sh.ring.size() + 4;  // bounded sweep (progress guarantee)
+  while (freed < target && sh.ring.size() > 1 && swept++ < budget) {
+    if (sh.hand == sh.ring.end()) sh.hand = std::prev(sh.ring.end());
+    auto cur = sh.hand;
+    auto it = sh.index.find(*cur);
+    if (it == sh.index.end()) {
+      sh.hand = HandNext(sh.ring, cur);
+      sh.ring.erase(cur);
+      continue;
+    }
+    // Under real pressure we don't grant second chances (we need bytes now).
+    sh.hand = HandNext(sh.ring, cur);
+    std::error_code ec;
+    fs::remove(it->second.path, ec);
+    sh.used_bytes -= it->second.size;
+    freed += it->second.size;
+    evictions_.fetch_add(1, std::memory_order_relaxed);
+    evicted_bytes_.fetch_add(it->second.size, std::memory_order_relaxed);
+    sh.ring.erase(cur);
+    sh.index.erase(it);
+  }
+}
+
 Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
   if (data == nullptr && len != 0) return Status::kInvalid;
   const std::string fname = key.Filename();
@@ -315,11 +354,29 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
   fs::path full = fs::path(opt_.cache_dir) / key.StoreKey();
   std::error_code ec;
   fs::create_directories(full.parent_path(), ec);
-  fs::path tmp = full;
-  tmp += "." + std::to_string(tmp_seq_.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
-  if (!WriteFileDirect(tmp.string(), data, len)) {
+  auto write_tmp = [&](fs::path* tmp, int* werr) -> bool {
+    *tmp = full;
+    *tmp += "." + std::to_string(tmp_seq_.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
+    return write_fn_override_
+               ? write_fn_override_(tmp->string(), data, len, werr)
+               : WriteFileDirect(tmp->string(), data, len, werr);
+  };
+  fs::path tmp;
+  int werr = 0;
+  if (!write_tmp(&tmp, &werr)) {
     fs::remove(tmp, ec);
-    return Status::kIOError;
+    // ENOSPC self-heal: the disk filled before logical capacity did (tmp/FS
+    // overhead / shared-disk tenant), so capacity-triggered eviction never
+    // fires and PUTs would fail forever. Force-evict this shard and retry once.
+    if (werr == ENOSPC) {
+      { std::lock_guard<std::shared_mutex> wl(sh.mu);
+        ForceEvictLocked(sh, std::max<uint64_t>(2 * len, 64ull << 20)); }
+      werr = 0;
+      if (!write_tmp(&tmp, &werr)) { fs::remove(tmp, ec); return Status::kIOError; }
+      enospc_evictions_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      return Status::kIOError;
+    }
   }
   std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
   if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first
