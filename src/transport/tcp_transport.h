@@ -38,7 +38,8 @@ class TcpTransport : public Transport {
  private:
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
                    uint64_t offset, uint64_t length, const void* payload,
-                   uint64_t payload_len, std::string* out);
+                   uint64_t payload_len, std::string* out,
+                   uint64_t max_data);
   int Acquire(const std::string& node, bool* from_pool);
   void Release(const std::string& node, int fd);
 

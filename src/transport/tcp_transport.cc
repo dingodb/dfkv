@@ -1,5 +1,7 @@
 #include "transport/tcp_transport.h"
 
+#include "utils/wire_limits.h"
+
 #include <unistd.h>
 
 #include <string>
@@ -16,7 +18,7 @@ constexpr size_t kMaxIdlePerNode = 16;  // cap pooled idle conns per node
 // server's response status (which may itself be NotFound etc.).
 bool OneShot(int fd, WireOp op, const BlockKey& k, uint64_t offset,
              uint64_t length, const void* payload, uint64_t payload_len,
-             Status* st, std::string* out) {
+             Status* st, std::string* out, uint64_t max_data) {
   char prefix[kReqPrefix];
   EncodeReq(prefix, op, k, offset, length, payload_len);
   if (!net::WriteAll(fd, prefix, kReqPrefix)) return false;
@@ -25,7 +27,10 @@ bool OneShot(int fd, WireOp op, const BlockKey& k, uint64_t offset,
   char rp[kRespPrefix];
   if (!net::ReadAll(fd, rp, kRespPrefix)) return false;
   uint64_t dlen = 0;
-  if (!DecodeResp(rp, st, &dlen)) return false;  // bad protocol version
+  // max_data caps the server-declared response length BEFORE the allocation
+  // below (the caller knows what it asked for; a corrupt/hostile peer must
+  // not be able to declare a 16 GiB body).
+  if (!DecodeResp(rp, st, &dlen, max_data)) return false;  // bad version / oversize
   if (dlen) {
     std::string data(dlen, '\0');
     if (!net::ReadAll(fd, &data[0], dlen)) return false;
@@ -71,7 +76,8 @@ void TcpTransport::Release(const std::string& node, int fd) {
 Status TcpTransport::RoundTrip(const std::string& node, WireOp op,
                               const BlockKey& k, uint64_t offset,
                               uint64_t length, const void* payload,
-                              uint64_t payload_len, std::string* out) {
+                              uint64_t payload_len, std::string* out,
+                              uint64_t max_data) {
   // Up to 2 attempts: a stale pooled connection is dropped and re-dialed once.
   for (int attempt = 0; attempt < 2; ++attempt) {
     bool from_pool = false;
@@ -79,7 +85,8 @@ Status TcpTransport::RoundTrip(const std::string& node, WireOp op,
     if (fd < 0) return Status::kIOError;  // dial failed
 
     Status st = Status::kIOError;
-    if (OneShot(fd, op, k, offset, length, payload, payload_len, &st, out)) {
+    if (OneShot(fd, op, k, offset, length, payload, payload_len, &st, out,
+                max_data)) {
       Release(node, fd);  // healthy -> back to pool
       return st;
     }
@@ -92,25 +99,31 @@ Status TcpTransport::RoundTrip(const std::string& node, WireOp op,
 
 Status TcpTransport::Cache(const std::string& node, const BlockKey& key,
                            const void* data, size_t len) {
-  return RoundTrip(node, WireOp::kCache, key, 0, 0, data, len, nullptr);
+  return RoundTrip(node, WireOp::kCache, key, 0, 0, data, len, nullptr,
+                   wire_limits::kStatusMaxRespData);
 }
 
 Status TcpTransport::Range(const std::string& node, const BlockKey& key,
                            uint64_t offset, uint64_t length, std::string* out) {
-  return RoundTrip(node, WireOp::kRange, key, offset, length, nullptr, 0, out);
+  // A Range reply carries at most the requested byte count.
+  return RoundTrip(node, WireOp::kRange, key, offset, length, nullptr, 0, out,
+                   length);
 }
 
 Status TcpTransport::Stats(const std::string& node, std::string* out) {
-  return RoundTrip(node, WireOp::kStats, BlockKey{}, 0, 0, nullptr, 0, out);
+  return RoundTrip(node, WireOp::kStats, BlockKey{}, 0, 0, nullptr, 0, out,
+                   wire_limits::kTextMaxRespData);
 }
 
 Status TcpTransport::Members(const std::string& node, std::string* out) {
-  return RoundTrip(node, WireOp::kMembers, BlockKey{}, 0, 0, nullptr, 0, out);
+  return RoundTrip(node, WireOp::kMembers, BlockKey{}, 0, 0, nullptr, 0, out,
+                   wire_limits::kTextMaxRespData);
 }
 
 Status TcpTransport::Exist(const std::string& node, const BlockKey& key,
                            bool* exist) {
-  Status st = RoundTrip(node, WireOp::kExist, key, 0, 0, nullptr, 0, nullptr);
+  Status st = RoundTrip(node, WireOp::kExist, key, 0, 0, nullptr, 0, nullptr,
+                        wire_limits::kStatusMaxRespData);
   if (st == Status::kOk) { *exist = true; return Status::kOk; }
   if (st == Status::kNotFound) { *exist = false; return Status::kOk; }
   return st;
@@ -120,7 +133,8 @@ Status TcpTransport::Remove(const std::string& node, const BlockKey& key) {
   // kRemove is a key-only request (no payload), Status-only response: kOk when a
   // block was dropped, kNotFound when it was already absent (both fine for the
   // caller), kIOError on a transport failure.
-  return RoundTrip(node, WireOp::kRemove, key, 0, 0, nullptr, 0, nullptr);
+  return RoundTrip(node, WireOp::kRemove, key, 0, 0, nullptr, 0, nullptr,
+                   wire_limits::kStatusMaxRespData);
 }
 
 }  // namespace dfkv

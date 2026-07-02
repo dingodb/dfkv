@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "cache/kv_node_server.h"
+#include "utils/wire_limits.h"
 #include "utils/log.h"
 #include "mds/mds_registrar.h"
 #include "utils/metrics_http.h"
@@ -85,6 +86,9 @@ int main(int argc, char** argv) {
   if (dirs.empty()) dirs.push_back(dir);
 
   KvNodeServer srv(dirs, cap);
+  // TCP request frames share the RDMA path's resolved max-value bound (OOM-DoS
+  // guard; see utils/wire_limits.h).
+  srv.set_max_request_payload(dfkv::wire_limits::MaxRequestPayload());
   // Identity for Prometheus labels: reuse the MDS --id/--group when present.
   if (!node_id.empty() || group != "default") srv.set_identity(node_id, group);
   if (srv.Start(port) != Status::kOk) {

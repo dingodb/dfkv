@@ -39,6 +39,12 @@ class KvNodeServer {
   void set_identity(const std::string& id, const std::string& group) {
     node_id_ = id; node_group_ = group;
   }
+  // Upper bound for a request frame's declared payload_len. The TCP handler
+  // allocates payload_len BEFORE reading the payload bytes, so without a real
+  // bound a 42-byte forged prefix triggers a 16 GiB allocation (one-frame OOM
+  // DoS). Defaults to value-header + the env-resolved max value size — the
+  // SAME bound the RDMA server enforces (utils/wire_limits.h).
+  void set_max_request_payload(uint64_t n) { max_request_payload_ = n; }
   int port() const { return port_; }
   size_t Count() const { return group_.Count(); }
   uint64_t UsedBytes() const { return group_.UsedBytes(); }
@@ -106,6 +112,7 @@ class KvNodeServer {
   Sampler lat_sampler_{64};        // 1-in-64 latency sampling (near-zero hot-path cost)
   LatencyHist get_lat_, put_lat_;  // server-side op latency (sampled)
   std::string members_;  // advertised cluster membership (kMembers)
+  uint64_t max_request_payload_ = 0;  // 0 = resolve default lazily (see .cc)
   std::string node_id_, node_group_;       // identity for Prometheus labels (optional)
   std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
 
