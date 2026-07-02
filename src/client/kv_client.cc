@@ -151,7 +151,13 @@ void KVClient::ProbeLoop() {
                        std::chrono::steady_clock::now() - t0).count();
       // Only record real round trips; a transport IO error (e.g. connect refused)
       // is fast and would skew latency, and is already counted by PeerHealth.
-      if (st != Status::kIOError) peer_lat_.Observe(a, sec);
+      // A non-IO reply also means the peer is reachable: clear its data-path
+      // cooldown here (off the data path) so recovery never depends on a data
+      // request re-dialing a peer that is still inside its backed-off cooldown.
+      if (st != Status::kIOError) {
+        peer_lat_.Observe(a, sec);
+        health_.MarkProbeAlive(a);
+      }
     }
     std::unique_lock<std::mutex> lk(probe_mu_);
     probe_cv_.wait_for(lk, std::chrono::milliseconds(probe_interval_ms_),
@@ -241,8 +247,12 @@ bool KVClient::Put(const std::string& key, const void* value, size_t n) {
     if (n) std::memcpy(buf.data() + ValueHeader::kSize, value, n);
     st = t_->Cache(node, bk, buf.data(), buf.size());
   }
-  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
-  health_.MarkGood(node);
+  // Fresh clock: `now` was taken before a round trip that can burn the whole
+  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
+  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
+  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
+  // client-side/oversize outcomes that must not clear a peer's cooldown.
+  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node);
   return st == Status::kOk;
 }
 
@@ -275,8 +285,12 @@ bool KVClient::Get(const std::string& key, void* out, size_t n) {
   // TCP (non-pipelined): response into a string, then copy to out.
   std::string raw;
   Status st = t_->Range(node, bk, 0, ValueHeader::kSize + n, &raw);
-  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
-  health_.MarkGood(node);
+  // Fresh clock: `now` was taken before a round trip that can burn the whole
+  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
+  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
+  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
+  // client-side/oversize outcomes that must not clear a peer's cooldown.
+  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node);
   if (st != Status::kOk) return false;
   if (raw.size() < ValueHeader::kSize) return false;
 
@@ -298,8 +312,12 @@ bool KVClient::GetAuto(const std::string& key, std::string* out, size_t max_byte
   if (!health_.Healthy(node, now)) return false;
   std::string raw;
   Status st = t_->Range(node, ToBlockKey(key), 0, ValueHeader::kSize + max_bytes, &raw);
-  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
-  health_.MarkGood(node);
+  // Fresh clock: `now` was taken before a round trip that can burn the whole
+  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
+  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
+  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
+  // client-side/oversize outcomes that must not clear a peer's cooldown.
+  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node);
   if (st != Status::kOk) return false;
   if (raw.size() < ValueHeader::kSize) return false;
   ValueHeader h;
@@ -319,8 +337,12 @@ bool KVClient::GetAuto(const std::string& key, void* out, size_t cap, size_t* ou
   // Read [header | up-to-cap payload]; the header tells us the true payload_len.
   std::string raw;
   Status st = t_->Range(node, ToBlockKey(key), 0, ValueHeader::kSize + cap, &raw);
-  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
-  health_.MarkGood(node);
+  // Fresh clock: `now` was taken before a round trip that can burn the whole
+  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
+  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
+  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
+  // client-side/oversize outcomes that must not clear a peer's cooldown.
+  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node);
   if (st != Status::kOk) return false;
   if (raw.size() < ValueHeader::kSize) return false;
   ValueHeader h;
@@ -340,8 +362,12 @@ bool KVClient::Exist(const std::string& key) {
   if (!health_.Healthy(node, now)) return false;
   bool e = false;
   Status st = t_->Exist(node, ToBlockKey(key), &e);
-  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
-  health_.MarkGood(node);
+  // Fresh clock: `now` was taken before a round trip that can burn the whole
+  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
+  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
+  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
+  // client-side/oversize outcomes that must not clear a peer's cooldown.
+  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node);
   return st == Status::kOk && e;
 }
 
@@ -351,8 +377,12 @@ bool KVClient::Remove(const std::string& key) {
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
   Status st = t_->Remove(node, ToBlockKey(key));
-  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
-  health_.MarkGood(node);
+  // Fresh clock: `now` was taken before a round trip that can burn the whole
+  // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
+  if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
+  // Only a real reply (hit or logical miss) is "good"; kInvalid/kCacheFull are
+  // client-side/oversize outcomes that must not clear a peer's cooldown.
+  if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node);
   // kNotFound is a success for the caller: the goal (key not present) holds.
   return st == Status::kOk || st == Status::kNotFound;
 }
@@ -394,8 +424,13 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     std::vector<Status> sts = t_->CacheFrom(node, srcs);
     for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
     bool resp = false, ioerr = false;
-    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
-    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    // kInvalid (oversize/per-item guard) is neither: it must not clear the
+    // peer cooldown (resp) nor trip MarkBad (ioerr).
+    for (Status s : sts) {
+      if (s == Status::kIOError) ioerr = true;
+      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+    }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, NowMs());
   });
   // RDMA path records the batch once (TCP path above is counted per-key by Put()).
   uint64_t bytes = 0;
@@ -440,8 +475,13 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     std::vector<std::string> hdrs;
     std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
     bool resp = false, ioerr = false;
-    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
-    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    // kInvalid (oversize/per-item guard) is neither: it must not clear the
+    // peer cooldown (resp) nor trip MarkBad (ioerr).
+    for (Status s : sts) {
+      if (s == Status::kIOError) ioerr = true;
+      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+    }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, NowMs());
     for (size_t m = 0; m < idx.size(); ++m) {
       if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
       ValueHeader h;
@@ -497,8 +537,13 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
     std::vector<std::string> hdrs;
     std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
     bool resp = false, ioerr = false;
-    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
-    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    // kInvalid (oversize/per-item guard) is neither: it must not clear the
+    // peer cooldown (resp) nor trip MarkBad (ioerr).
+    for (Status s : sts) {
+      if (s == Status::kIOError) ioerr = true;
+      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+    }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, NowMs());
     for (size_t m = 0; m < idx.size(); ++m) {
       if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
       ValueHeader h;
@@ -546,8 +591,13 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
     std::vector<char> ex;
     std::vector<Status> sts = t_->ExistMany(node, bkeys, &ex);
     bool resp = false, ioerr = false;
-    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
-    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    // kInvalid (oversize/per-item guard) is neither: it must not clear the
+    // peer cooldown (resp) nor trip MarkBad (ioerr).
+    for (Status s : sts) {
+      if (s == Status::kIOError) ioerr = true;
+      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+    }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, NowMs());
     for (size_t m = 0; m < idx.size(); ++m) e[idx[m]] = (m < ex.size() && ex[m]) ? 1 : 0;
   });
   return RecordBatch(OpMetrics::kExist, t0, e, 0);
@@ -581,8 +631,13 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
     for (size_t k : idx) bkeys.push_back(ToBlockKey(keys[k]));
     std::vector<Status> sts = t_->RemoveMany(node, bkeys);
     bool resp = false, ioerr = false;
-    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
-    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    // kInvalid (oversize/per-item guard) is neither: it must not clear the
+    // peer cooldown (resp) nor trip MarkBad (ioerr).
+    for (Status s : sts) {
+      if (s == Status::kIOError) ioerr = true;
+      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+    }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, NowMs());
     for (size_t m = 0; m < idx.size(); ++m)
       ok[idx[m]] = (m < sts.size() &&
                     (sts[m] == Status::kOk || sts[m] == Status::kNotFound)) ? 1 : 0;
@@ -643,8 +698,13 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     std::vector<Status> sts = t_->CacheFromMulti(node, srcs);
     for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
     bool resp = false, ioerr = false;
-    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
-    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    // kInvalid (oversize/per-item guard) is neither: it must not clear the
+    // peer cooldown (resp) nor trip MarkBad (ioerr).
+    for (Status s : sts) {
+      if (s == Status::kIOError) ioerr = true;
+      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+    }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, NowMs());
   });
   uint64_t bytes = 0;
   for (size_t i = 0; i < N; ++i) if (ok[i]) for (size_t s : items[i].sizes) bytes += s;
@@ -702,8 +762,13 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     std::vector<Status> sts =
         t_->RangeIntoMulti(node, keys, dsts, ValueHeader::kSize, &hdrs, &tlens);
     bool resp = false, ioerr = false;
-    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
-    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    // kInvalid (oversize/per-item guard) is neither: it must not clear the
+    // peer cooldown (resp) nor trip MarkBad (ioerr).
+    for (Status s : sts) {
+      if (s == Status::kIOError) ioerr = true;
+      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+    }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, NowMs());
     for (size_t m = 0; m < idx.size(); ++m) {
       size_t cap = groups[g].first.second;
       if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;

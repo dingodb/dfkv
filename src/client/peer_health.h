@@ -22,7 +22,14 @@ namespace dfkv {
 // here at no extra hot-path cost (the mutex is already taken on these calls).
 class PeerHealth {
  public:
-  explicit PeerHealth(uint64_t cooldown_ms = 2000) : cooldown_ms_(cooldown_ms) {}
+  // base_cooldown_ms doubles per consecutive failure up to max_cooldown_ms. A
+  // FIXED cooldown shorter than the connect timeout (2s < 3s) meant a dead peer
+  // was re-dialed on the data path every base period, stalling each batch on a
+  // full connect timeout indefinitely; exponential backoff caps that cost at
+  // one connect per max_cooldown once a peer is persistently down.
+  explicit PeerHealth(uint64_t base_cooldown_ms = 2000,
+                      uint64_t max_cooldown_ms = 30000)
+      : base_cooldown_ms_(base_cooldown_ms), max_cooldown_ms_(max_cooldown_ms) {}
 
   bool Healthy(const std::string& peer, uint64_t now_ms) const {
     std::lock_guard<std::mutex> lk(mu_);
@@ -36,7 +43,12 @@ class PeerHealth {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = until_.find(peer);
     bool was_ok = it == until_.end() || it->second <= now_ms;
-    until_[peer] = now_ms + cooldown_ms_;
+    // Exponential backoff: base << (fails-1), capped at max_cooldown.
+    uint32_t fails = ++fail_streak_[peer];
+    unsigned shift = fails > 31 ? 31u : (fails - 1);
+    uint64_t cd = base_cooldown_ms_ << shift;
+    if (cd > max_cooldown_ms_ || cd < base_cooldown_ms_ /*overflow*/) cd = max_cooldown_ms_;
+    until_[peer] = now_ms + cd;
     errors_.fetch_add(1, std::memory_order_relaxed);
     if (was_ok) marked_bad_.fetch_add(1, std::memory_order_relaxed);  // healthy->bad edge
     // Bound per-peer cardinality: only track a new peer while under the cap, so a
@@ -44,10 +56,20 @@ class PeerHealth {
     // map (and its scrape series) without bound. Aggregate errors_ still counts.
     if (peer_errors_.size() < kMaxPeers || peer_errors_.count(peer)) peer_errors_[peer]++;
   }
+  // Data-path success: clears the cooldown and the backoff streak. Bumps the
+  // served counter (an op completed), so it is NOT for probe-driven recovery.
   void MarkGood(const std::string& peer) {
     std::lock_guard<std::mutex> lk(mu_);
     served_.fetch_add(1, std::memory_order_relaxed);
-    if (until_.erase(peer)) recovered_.fetch_add(1, std::memory_order_relaxed);  // bad->good edge
+    ClearLocked(peer);
+  }
+  // Probe-driven recovery (off the data path): the background prober reached
+  // the peer, so clear its cooldown/streak WITHOUT counting a served op. This
+  // is what lets recovery happen without the data path ever having to re-dial a
+  // dead peer inside its (now backed-off) cooldown.
+  void MarkProbeAlive(const std::string& peer) {
+    std::lock_guard<std::mutex> lk(mu_);
+    ClearLocked(peer);
   }
 
   // Prometheus client-side metrics text. Aggregates + per-peer error counts.
@@ -92,10 +114,18 @@ class PeerHealth {
   uint64_t recovered() const { return recovered_.load(std::memory_order_relaxed); }
 
  private:
+  // Clear a peer's cooldown + backoff streak (recovery). Caller holds mu_.
+  void ClearLocked(const std::string& peer) {
+    fail_streak_.erase(peer);
+    if (until_.erase(peer)) recovered_.fetch_add(1, std::memory_order_relaxed);  // bad->good edge
+  }
+
   static constexpr size_t kMaxPeers = 4096;  // per-peer error-map cardinality cap
   mutable std::mutex mu_;
-  uint64_t cooldown_ms_;
+  uint64_t base_cooldown_ms_;
+  uint64_t max_cooldown_ms_;
   std::unordered_map<std::string, uint64_t> until_;        // peer -> unhealthy-until (ms)
+  std::unordered_map<std::string, uint32_t> fail_streak_;  // peer -> consecutive failures
   std::unordered_map<std::string, uint64_t> peer_errors_;  // peer -> cumulative IO errors
   mutable std::atomic<uint64_t> checks_{0}, unhealthy_skips_{0}, errors_{0},
       marked_bad_{0}, served_{0}, recovered_{0};
