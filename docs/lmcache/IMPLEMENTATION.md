@@ -44,7 +44,7 @@ integration/lmcache/
 ——纯 Python，后台 asyncio loop 跑 `DfkvNativeClient` 的 batch_set/get/exists 协程，三个 `create_event_notifier`
 （store/lookup/load）+ done-callback 桥接到 LMCache `L2AdapterInterface`；`ObjectKey`→`model_name@kv_rank@group@hash[@salt]`；
 经 LMCache 内置 `plugin` L2 adapter（`--l2-adapter {"type":"plugin",...}`）加载，给 `LMCacheMPConnector`（多 KV-group 模型）用。
-单测 `tests/test_l2_adapter.py`（fake client）+ GLM-5.2 真机 store/重启/回载已验证。
+单测 `integration/lmcache/tests/test_l2_adapter.py`（fake client）+ GLM-5.2 真机 store/重启/回载已验证。
 
 ---
 
@@ -127,8 +127,8 @@ MR 注册（目标部署用默认 allocator，不触此路径）。
 
 ## 8. 测试
 
-- **C++ gtest**：[../../tests/get_auto_test.cc](../../tests/get_auto_test.cc) —— `GetAuto`/`BatchGetAuto`
+- **C++ gtest**：[../../test/client/get_auto_test.cc](../../test/client/get_auto_test.cc) —— `GetAuto`/`BatchGetAuto`
   覆盖满块、不满块、cap 过小（miss）、geometry 不匹配（miss）、双节点批量混合大小。
-- **Python 冒烟**：[../../tests/python/dfkv_lmcache_native_smoke.py](../../tests/python/dfkv_lmcache_native_smoke.py)
+- **Python 冒烟**：[../../test/python/dfkv_lmcache_native_smoke.py](../../test/python/dfkv_lmcache_native_smoke.py)
   —— `DfkvNativeClient` 对接本地 `dfkv_server`，put→exists→变长 get（满块+不满块）逐字节校验，
   无需 torch/lmcache。

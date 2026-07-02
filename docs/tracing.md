@@ -109,7 +109,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 \
 无需 GPU/torch，纯单测覆盖采样判定、OTLP payload 组装与缓冲丢弃：
 
 ```bash
-cd tests/python && python3 -m unittest test_dfkv_telemetry test_telemetry_vendor_sync -v
+cd test/python && python3 -m unittest test_dfkv_telemetry test_telemetry_vendor_sync -v
 ```
 
 端到端（起一个本地 Collector 或假 HTTP 端点，设 `DFKV_TRACING_ENABLED=1
@@ -122,7 +122,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`，跑连接器 smoke，确认
 - [integration/hicache/dfkv_telemetry/otlp_traces.py](../integration/hicache/dfkv_telemetry/otlp_traces.py) — 纯 stdlib OTLP/HTTP-JSON traces 导出器（有界缓冲 + 后台批量 POST）。
 - [integration/hicache/dfkv_telemetry/config.py](../integration/hicache/dfkv_telemetry/config.py) — 追踪开关 / 阈值的 env+extra_config 解析（`tracing_enabled`）。
 - 连接器接线：[integration/hicache/dfkv_hicache.py](../integration/hicache/dfkv_hicache.py)、[integration/vllm/src/dfkv_vllm/dfkv_client.py](../integration/vllm/src/dfkv_vllm/dfkv_client.py)、[integration/lmcache/src/dfkv_connector/native_client.py](../integration/lmcache/src/dfkv_connector/native_client.py)。
-- 单测：[tests/python/test_dfkv_telemetry.py](../tests/python/test_dfkv_telemetry.py)（`Tracing*` / `OtlpTraces*` 用例）。
+- 单测：[test/python/test_dfkv_telemetry.py](../test/python/test_dfkv_telemetry.py)（`Tracing*` / `OtlpTraces*` 用例）。
 
 > vLLM / LMCache 连接器各自 vendor 一份逐字节一致的 `_telemetry` 副本（含 `tracing.py`/`otlp_traces.py`），
-> 由 [scripts/sync_telemetry.sh](../scripts/sync_telemetry.sh) 同步、`test_telemetry_vendor_sync` 守护防漂移。
+> 由 [deploy/sync_telemetry.sh](../deploy/sync_telemetry.sh) 同步、`test_telemetry_vendor_sync` 守护防漂移。

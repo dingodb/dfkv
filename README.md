@@ -89,7 +89,7 @@ integration/hicache/  dfkv_hicache.py (SGLang dynamic backend plugin) + dfkv_tel
                       (canonical shared telemetry pkg, vendored by the other connectors)
 integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libdfkv.so)
 integration/vllm/     dfkv_vllm       (vLLM KVConnectorBase_V1, GPUDirect RDMA, bypass LMCache)
-tests/      gtest suites + tests/python (unittest + no-torch sglang shim)
+test/       gtest suites + test/python (unittest + no-torch sglang shim)
 docs/       DEPLOY.md (dfkv CLUSTER deploy: etcd + MDS + server + systemd) · INTEGRATION.md (fuse into dingo-cache)
 docs/hicache/  SGLang HiCache connector docs (DEPLOY — connect/config/use)
 docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)

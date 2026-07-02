@@ -115,9 +115,9 @@ if(DFKV_BUILD_TESTS)
   FetchContent_MakeAvailable(googletest)
   include(GoogleTest)
 
-  file(GLOB_RECURSE DFKV_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cc)
+  file(GLOB_RECURSE DFKV_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/*_test.cc)
   # rdma_loopback_test needs the RDMA transport/server symbols -> RDMA build only.
-  list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/transport/rdma_loopback_test.cc)
+  list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
   foreach(t ${DFKV_TESTS})
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
@@ -125,7 +125,7 @@ if(DFKV_BUILD_TESTS)
     gtest_discover_tests(${name})
   endforeach()
   if(DFKV_WITH_RDMA)  # exercised in CI under Soft-RoCE (rdma_rxe); skips if no device
-    add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/transport/rdma_loopback_test.cc)
+    add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
     target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
     gtest_discover_tests(rdma_loopback_test)
   endif()
@@ -135,19 +135,19 @@ if(DFKV_BUILD_TESTS)
   if(PYTHON3)
     add_test(NAME python_plugin
       COMMAND ${PYTHON3} -m unittest test_dfkv_hicache
-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests/python)
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
     set_tests_properties(python_plugin PROPERTIES
       ENVIRONMENT "DFKV_BUILD=${CMAKE_BINARY_DIR};DFKV_LIB=${CMAKE_BINARY_DIR}/libdfkv.so")
     # Shared telemetry layer: pure-python, no build/lib needed (OTel-push test
     # self-skips when the SDK is absent). Includes the vendored-copy drift guard.
     add_test(NAME python_telemetry
       COMMAND ${PYTHON3} -m unittest test_dfkv_telemetry test_telemetry_vendor_sync
-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests/python)
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test/python)
   endif()
 
   # CLI tools integration smoke (dfkv_server + dfkv_smoke + dfkvctl)
   add_test(NAME tool_smoke
-    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/tool_smoke.sh ${CMAKE_BINARY_DIR})
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/tool_smoke.sh ${CMAKE_BINARY_DIR})
 endif()
 
 # --- packaging (deb/rpm via CPack) ---

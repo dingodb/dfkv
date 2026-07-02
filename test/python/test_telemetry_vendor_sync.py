@@ -1,7 +1,7 @@
 """Drift guard: the vendored telemetry copies inside the vLLM / LMCache pip
 connectors must stay byte-identical to the canonical integration/hicache/dfkv_telemetry/.
 
-If this fails, run ``scripts/sync_telemetry.sh`` (you edited the canonical files
+If this fails, run ``deploy/sync_telemetry.sh`` (you edited the canonical files
 but not the vendored copies, or vice-versa).
 """
 import os
@@ -31,7 +31,7 @@ class VendorSyncTest(unittest.TestCase):
                     got = fh.read()
                 self.assertEqual(
                     got, canon,
-                    "{} drifted from canonical; run scripts/sync_telemetry.sh".format(path))
+                    "{} drifted from canonical; run deploy/sync_telemetry.sh".format(path))
 
 
 if __name__ == "__main__":

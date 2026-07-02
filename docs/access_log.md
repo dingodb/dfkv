@@ -127,7 +127,7 @@ SGLang 每个 TP rank 一个进程，会**同时写同一路径**。为避免互
 无需 GPU/torch，单测会拉起真实 `dfkv_server` 节点驱动插件：
 
 ```bash
-DFKV_BUILD=$(pwd)/build python3 tests/python/test_dfkv_hicache.py   # 含 access-log + 滚动用例
+DFKV_BUILD=$(pwd)/build python3 test/python/test_dfkv_hicache.py   # 含 access-log + 滚动用例
 # 滚动用例不依赖 node/so，可单独快速跑：
 python3 -m unittest test_dfkv_hicache.DfkvAccessLogRotationTest -v
 ```
@@ -136,4 +136,4 @@ python3 -m unittest test_dfkv_hicache.DfkvAccessLogRotationTest -v
 
 - [integration/hicache/dfkv_access_log.py](../integration/hicache/dfkv_access_log.py) — `configure()` / `access_log()` 上下文管理器、noop 单例、异步队列、格式化辅助。
 - [integration/hicache/dfkv_hicache.py](../integration/hicache/dfkv_hicache.py) — `__init__` 里调 `configure()`，并用 `with access_log(...)` 包住各继承接口。
-- [tests/python/test_dfkv_hicache.py](../tests/python/test_dfkv_hicache.py) — `DfkvAccessLogTest`（接口逐 op 日志）+ `DfkvAccessLogRotationTest`（滚动/清理）测试类。
+- [test/python/test_dfkv_hicache.py](../test/python/test_dfkv_hicache.py) — `DfkvAccessLogTest`（接口逐 op 日志）+ `DfkvAccessLogRotationTest`（滚动/清理）测试类。

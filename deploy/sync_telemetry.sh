@@ -5,7 +5,7 @@
 # independent pip wheels that can't import a repo-level module at runtime, so
 # they vendor a byte-identical copy as an internal _telemetry sub-package. Run
 # this after editing the canonical files; CI guards against drift via
-# tests/python/test_telemetry_vendor_sync.py.
+# test/python/test_telemetry_vendor_sync.py.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

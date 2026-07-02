@@ -10,7 +10,7 @@ No torch / lmcache needed — native_client only depends on ctypes + access_log.
 
 Usage:
     DFKV_LIB=build/libdfkv.so DFKV_SERVER=build/dfkv_server \
-        python3 tests/python/dfkv_lmcache_native_smoke.py
+        python3 test/python/dfkv_lmcache_native_smoke.py
 """
 import asyncio
 import importlib
