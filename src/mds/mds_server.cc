@@ -7,6 +7,7 @@
 
 #include "mds/mds_proto.h"
 #include "utils/net_util.h"
+#include "utils/wire_limits.h"
 #include "transport/wire.h"
 
 namespace dfkv {
@@ -168,7 +169,9 @@ void MdsServer::Handle(int fd) {
     char prefix[kReqPrefix];
     if (!net::ReadAll(fd, prefix, kReqPrefix)) return;
     ReqFields rq;
-    if (!DecodeReq(prefix, &rq)) return;
+    // MDS frames carry a group name + one MemberInfo (<1 KiB); cap the
+    // declared length so a forged prefix can't trigger a giant allocation.
+    if (!DecodeReq(prefix, &rq, wire_limits::kMdsMaxReqPayload)) return;
     std::vector<char> payload(rq.payload_len);
     if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
 

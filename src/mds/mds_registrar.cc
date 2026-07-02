@@ -9,6 +9,7 @@
 #include "common/status.h"
 #include "mds/mds_proto.h"
 #include "utils/net_util.h"
+#include "utils/wire_limits.h"
 #include "transport/wire.h"
 
 namespace dfkv {
@@ -45,7 +46,7 @@ bool MdsRegistrar::SendOnce(uint8_t op) {
     char rp[kRespPrefix];
     Status st = Status::kInvalid;
     uint64_t dlen = 0;
-    ok = net::ReadAll(fd, rp, kRespPrefix) && DecodeResp(rp, &st, &dlen) &&
+    ok = net::ReadAll(fd, rp, kRespPrefix) && DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData) &&
          st == Status::kOk;
     if (ok && dlen) {
       std::vector<char> d(dlen);

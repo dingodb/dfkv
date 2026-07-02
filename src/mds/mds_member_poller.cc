@@ -7,6 +7,7 @@
 
 #include "common/status.h"
 #include "utils/net_util.h"
+#include "utils/wire_limits.h"
 #include "transport/wire.h"
 
 namespace dfkv {
@@ -42,7 +43,7 @@ bool MdsMemberPoller::Query(std::vector<MemberInfo>* out, uint64_t* epoch) {
     char rp[kRespPrefix];
     Status st = Status::kInvalid;
     uint64_t dlen = 0;
-    ok = net::ReadAll(fd, rp, kRespPrefix) && DecodeResp(rp, &st, &dlen) &&
+    ok = net::ReadAll(fd, rp, kRespPrefix) && DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData) &&
          st == Status::kOk;
     if (ok) { data.resize(dlen); ok = (dlen == 0) || net::ReadAll(fd, &data[0], dlen); }
   }

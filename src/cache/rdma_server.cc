@@ -17,6 +17,7 @@
 
 #include "utils/net_util.h"     // ReadAll / WriteAll / Get*/Put*
 #include "utils/numa_util.h"    // pin serve thread to the device's NUMA node
+#include "utils/wire_limits.h"  // ResolveMaxPayload (shared with the TCP path)
 #include "transport/rdma_verbs.h"   // RcEndpoint, QpInfo
 #include "transport/transport.h"    // kReqPrefix, kRespPrefix
 #include "cache/uring_reader.h" // io_uring async-GET path (DFKV_WITH_URING only)
@@ -25,32 +26,13 @@
 namespace dfkv {
 
 namespace {
-size_t EnvBytes(const char* name, size_t dflt) {
-  const char* v = std::getenv(name);
-  if (!v || !*v) return dflt;
-  errno = 0;
-  char* end = nullptr;
-  unsigned long long x = std::strtoull(v, &end, 10);
-  if (errno != 0 || end == v || x == 0) return dflt;
-  constexpr unsigned long long kMaxSge =
-      static_cast<unsigned long long>(std::numeric_limits<uint32_t>::max() -
-                                      ValueHeader::kSize - 2 * rdma::kDirectIoAlign);
-  if (x > kMaxSge) x = kMaxSge;
-  return static_cast<size_t>(x);
-}
-
-size_t ResolveMaxPayload(size_t configured) {
-  size_t n = configured ? configured : (64u << 20);
-  n = EnvBytes("DFKV_RDMA_MAX_PAYLOAD_BYTES", n);
-  n = EnvBytes("DFKV_RDMA_MAX_MSG_BYTES", n);
-  // Clamp the constructor-supplied value too (EnvBytes only clamps the env paths):
-  // dbuf/SGE length is uint32, so payload must stay under uint32 - header - 2*align
-  // or the registered length silently overflows/truncates -> corruption.
-  constexpr size_t kMaxSge = static_cast<size_t>(
-      std::numeric_limits<uint32_t>::max() - ValueHeader::kSize - 2 * rdma::kDirectIoAlign);
-  if (n > kMaxSge) n = kMaxSge;
-  return n;
-}
+// EnvBytes/ResolveMaxPayload live in utils/wire_limits.h so the TCP request
+// path (kv_node_server) bounds its frames with the SAME resolved max value
+// this RDMA server enforces (wire_limits::kIoAlign == rdma::kDirectIoAlign;
+// static_assert below keeps that true).
+static_assert(wire_limits::kIoAlign == rdma::kDirectIoAlign,
+              "wire_limits must mirror the RDMA direct-IO alignment");
+using wire_limits::ResolveMaxPayload;
 
 size_t ControlCapFor(size_t max_payload) {
   constexpr size_t kDefaultControlCap = 8u << 20;

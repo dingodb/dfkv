@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "utils/net_util.h"
+#include "utils/wire_limits.h"
 #include "utils/prom_escape.h"
 #include "transport/transport.h"
 
@@ -360,11 +361,17 @@ void KvNodeServer::RangeDirectComplete(bool ok, size_t bytes_read) {
 
 // Keep-alive: serve requests on this connection until the peer closes it.
 void KvNodeServer::Handle(int fd) {
+  // Bound the declared payload_len BEFORE the allocation below: without this
+  // a forged 42-byte prefix is a 16 GiB allocation. Same bound as the RDMA
+  // path (utils/wire_limits.h).
+  const uint64_t max_payload = max_request_payload_
+                                   ? max_request_payload_
+                                   : wire_limits::MaxRequestPayload();
   while (running_) {
     char prefix[kReqPrefix];
     if (!net::ReadAll(fd, prefix, kReqPrefix)) return;  // peer closed / error
     ReqFields rq;
-    if (!DecodeReq(prefix, &rq)) return;  // bad protocol version => drop
+    if (!DecodeReq(prefix, &rq, max_payload)) return;  // bad version / oversize => drop
     std::vector<char> payload(rq.payload_len);
     if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
 
