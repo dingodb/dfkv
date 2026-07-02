@@ -74,3 +74,37 @@ TEST(MdsServer, ListEmptyGroupOkEmpty) {
   EXPECT_TRUE(got.empty());
   mds.Stop();
 }
+
+TEST(MdsServer, HeartbeatRewritesMemberValueUnderOwnLease) {
+  // Regression for the multi-MDS lease-drift bug: the fast path used to only
+  // LeaseKeepAlive and never re-Put the key, so (a) a MemberInfo change within
+  // the TTL was silently dropped, and (b) with several rotating MDS instances
+  // the key stayed attached to another MDS's decaying lease while every
+  // heartbeat still returned kOk. Both reduce to the same observable pinned
+  // here: a heartbeat must re-write the key's current value.
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  int port = mds.port();
+  std::string group = "itest-reput-" + std::to_string(port);
+
+  MemberInfo m{"n1", "10.1.1.1", 28000, 1};
+  Status st; std::string data;
+  ASSERT_TRUE(DoReq(port, WireOp::kRegister, EncodeMemberReq(group, m), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+
+  m.ip = "10.9.9.9";  // node reconfigured within the TTL
+  m.weight = 7;
+  ASSERT_TRUE(DoReq(port, WireOp::kHeartbeat, EncodeMemberReq(group, m), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+
+  ASSERT_TRUE(DoReq(port, WireOp::kListMembers, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  std::vector<MemberInfo> got; uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &got, &epoch));
+  ASSERT_EQ(got.size(), 1u);
+  EXPECT_EQ(got[0].ip, "10.9.9.9");
+  EXPECT_EQ(got[0].weight, 7u);
+  mds.Stop();
+}
