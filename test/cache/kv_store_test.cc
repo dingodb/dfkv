@@ -371,3 +371,34 @@ TEST_F(KVStoreTest, PersistentEnospcReturnsIoErrorWithoutInfiniteLoop) {
   EXPECT_EQ(s.Cache(BlockKey{4000, 0, 1}, v.data(), v.size()), Status::kIOError);
   EXPECT_EQ(s.EnospcEvictions(), 0u);  // retry did not succeed -> not counted
 }
+
+TEST_F(KVStoreTest, EvictionAndRemoveLeaveNoTmpOrphansOnDisk) {
+  // Eviction/Remove now RENAME the victim to a ".tmp" trash name inside the
+  // lock and unlink it AFTER releasing the lock. Verify the deferred unlink
+  // actually completes: after an eviction storm + removes, no ".tmp" orphans
+  // remain and the on-disk regular-file count matches the live index.
+  auto count_disk = [&](const char* suffix) {
+    size_t n = 0;
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(dir_, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+      if (!it->is_regular_file(ec)) continue;
+      std::string f = it->path().filename().string();
+      bool tmp = f.size() >= 4 && f.substr(f.size() - 4) == ".tmp";
+      if ((suffix && tmp) || (!suffix && !tmp)) ++n;
+    }
+    return n;
+  };
+
+  // Small capacity + many distinct 4 KiB blocks => sustained eviction.
+  KVStore s(Opts(/*cap=*/64 * 4096, /*shards=*/4));
+  std::string v(4096, 'e');
+  for (uint64_t i = 0; i < 400; ++i)
+    ASSERT_EQ(s.Cache(BlockKey{i, 0, 1}, v.data(), v.size()), Status::kOk);
+  EXPECT_GT(s.Evictions(), 0u) << "the workload must have forced evictions";
+  for (uint64_t i = 350; i < 400; ++i) s.Remove(BlockKey{i, 0, 1});  // some Removes too
+
+  EXPECT_EQ(count_disk(".tmp"), 0u) << "deferred unlink must leave no .tmp orphans";
+  EXPECT_EQ(count_disk(nullptr), s.Count())
+      << "on-disk block files must match the live index";
+}

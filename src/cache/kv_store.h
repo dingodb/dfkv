@@ -116,6 +116,11 @@ class KVStore {
     std::string path;
     uint64_t size = 0;
     std::atomic<bool> referenced{false};  // CLOCK bit: set on access (read lock)
+    // This entry's own node in Shard::ring. std::list iterators are stable
+    // across other insert/erase, so Remove() drops the ring node in O(1)
+    // instead of scanning the whole ring (the old O(n), O(n^2) under RemoveMany
+    // while holding the exclusive lock). Set right after the ring push_front.
+    std::list<std::string>::iterator it{};
     Entry(std::string p, uint64_t s) : path(std::move(p)), size(s) {}
   };
   struct Shard {
@@ -133,8 +138,14 @@ class KVStore {
   };
 
   Shard& ShardFor(const std::string& fname) const;
-  void EvictLocked(Shard& sh);  // CLOCK second-chance; exclusive lock held
-  void ForceEvictLocked(Shard& sh, uint64_t target);  // ENOSPC self-heal; excl. lock
+  // Eviction detaches victims from the index/ring under the exclusive lock but
+  // only RENAMES their files to a unique sibling (a fast metadata op); the slow
+  // block-freeing unlink is deferred to `*trash`, which the caller drains AFTER
+  // releasing the lock so an eviction storm can't stall concurrent GETs.
+  void EvictLocked(Shard& sh, std::vector<std::string>* trash);  // CLOCK 2nd-chance
+  void ForceEvictLocked(Shard& sh, uint64_t target,
+                        std::vector<std::string>* trash);  // ENOSPC self-heal
+  std::string RenameToTrash(const std::string& path);  // fast in-lock; unlink deferred
   void RebuildIndex();
 
   Options opt_;

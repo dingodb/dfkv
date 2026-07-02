@@ -251,7 +251,8 @@ void KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
     uint64_t sz = static_cast<uint64_t>(fs::file_size(it->path(), ec));
     Shard& sh = ShardFor(fname);
     sh.ring.push_front(fname);
-    sh.index.try_emplace(fname, it->path().string(), sz);
+    auto res = sh.index.try_emplace(fname, it->path().string(), sz);
+    res.first->second.it = sh.ring.begin();  // O(1) removal handle
     sh.used_bytes += sz;
   }
   // Reclaim outside the iteration so removal can't perturb the directory walk.
@@ -278,7 +279,23 @@ static std::list<std::string>::iterator HandNext(
 // bounded (`limit`): after sweeping ~two full cycles without freeing enough, the
 // current victim is evicted regardless of its bit, guaranteeing forward progress
 // and termination even under ring/index drift.
-void KVStore::EvictLocked(Shard& sh) {
+// Rename a victim block to a unique sibling ".tmp" name: a fast metadata-only
+// op, so the slow block-freeing unlink can run OUTSIDE the shard lock. The
+// original path is immediately free for a concurrent re-insert, and the trash
+// name is unique (shared tmp_seq_), so the deferred unlink can never hit the
+// re-inserted file. Orphan trash (crash before the deferred unlink) is a
+// standard ".tmp" that RebuildIndex reclaims. Returns "" if nothing to defer.
+std::string KVStore::RenameToTrash(const std::string& path) {
+  std::string trash =
+      path + "." + std::to_string(tmp_seq_.fetch_add(1, std::memory_order_relaxed)) +
+      ".tmp";
+  std::error_code ec;
+  fs::rename(path, trash, ec);
+  if (ec) return {};  // already gone / rename failed: nothing to unlink later
+  return trash;
+}
+
+void KVStore::EvictLocked(Shard& sh, std::vector<std::string>* trash) {
   // size() > 1 (not !empty()): never evict a shard's last entry, so a value larger
   // than the per-shard capacity still stays cached (it just keeps the shard over).
   size_t spins = 0;
@@ -298,8 +315,8 @@ void KVStore::EvictLocked(Shard& sh) {
       continue;
     }
     sh.hand = HandNext(sh.ring, cur);  // move off the victim before erasing it
-    std::error_code ec;
-    fs::remove(it->second.path, ec);
+    std::string t = RenameToTrash(it->second.path);  // fast rename in-lock
+    if (!t.empty()) trash->push_back(std::move(t));   // slow unlink deferred off-lock
     sh.used_bytes -= it->second.size;
     evictions_.fetch_add(1, std::memory_order_relaxed);
     evicted_bytes_.fetch_add(it->second.size, std::memory_order_relaxed);
@@ -314,7 +331,8 @@ void KVStore::EvictLocked(Shard& sh) {
 // capacity-triggered eviction never fires and every PUT would fail forever.
 // Same CLOCK mechanics as EvictLocked; bounded by a full ring sweep so it
 // terminates even if `target` exceeds what the shard holds. Exclusive lock held.
-void KVStore::ForceEvictLocked(Shard& sh, uint64_t target) {
+void KVStore::ForceEvictLocked(Shard& sh, uint64_t target,
+                               std::vector<std::string>* trash) {
   uint64_t freed = 0;
   size_t swept = 0;
   const size_t budget = 3 * sh.ring.size() + 4;  // bounded sweep (progress guarantee)
@@ -329,8 +347,8 @@ void KVStore::ForceEvictLocked(Shard& sh, uint64_t target) {
     }
     // Under real pressure we don't grant second chances (we need bytes now).
     sh.hand = HandNext(sh.ring, cur);
-    std::error_code ec;
-    fs::remove(it->second.path, ec);
+    std::string t = RenameToTrash(it->second.path);
+    if (!t.empty()) trash->push_back(std::move(t));
     sh.used_bytes -= it->second.size;
     freed += it->second.size;
     evictions_.fetch_add(1, std::memory_order_relaxed);
@@ -369,8 +387,10 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
     // overhead / shared-disk tenant), so capacity-triggered eviction never
     // fires and PUTs would fail forever. Force-evict this shard and retry once.
     if (werr == ENOSPC) {
+      std::vector<std::string> trash;
       { std::lock_guard<std::shared_mutex> wl(sh.mu);
-        ForceEvictLocked(sh, std::max<uint64_t>(2 * len, 64ull << 20)); }
+        ForceEvictLocked(sh, std::max<uint64_t>(2 * len, 64ull << 20), &trash); }
+      for (auto& t : trash) { std::error_code e2; fs::remove(t, e2); }  // off-lock
       werr = 0;
       if (!write_tmp(&tmp, &werr)) { fs::remove(tmp, ec); return Status::kIOError; }
       enospc_evictions_.fetch_add(1, std::memory_order_relaxed);
@@ -378,37 +398,41 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
       return Status::kIOError;
     }
   }
-  std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
-  if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first
-  fs::rename(tmp, full, ec);  // atomic publish
-  if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
-  sh.ring.push_front(fname);
-  sh.index.try_emplace(fname, full.string(), len);
-  sh.used_bytes += len;
-  EvictLocked(sh);
+  std::vector<std::string> trash;
+  {
+    std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
+    if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }  // lost the race; keep first
+    fs::rename(tmp, full, ec);  // atomic publish
+    if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
+    sh.ring.push_front(fname);
+    auto res = sh.index.try_emplace(fname, full.string(), len);
+    res.first->second.it = sh.ring.begin();  // O(1) removal handle
+    sh.used_bytes += len;
+    EvictLocked(sh, &trash);
+  }
+  for (auto& t : trash) { std::error_code e2; fs::remove(t, e2); }  // slow unlink off-lock
   return Status::kOk;
 }
 
 Status KVStore::Remove(const BlockKey& key) {
   const std::string fname = key.Filename();
   Shard& sh = ShardFor(fname);
-  std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
-  auto it = sh.index.find(fname);
-  if (it == sh.index.end()) return Status::kNotFound;
-  std::error_code ec;
-  fs::remove(it->second.path, ec);  // best-effort unlink (index is the source of truth)
-  sh.used_bytes -= it->second.size;
-  // Drop it from the CLOCK ring; if the hand points at the victim, advance the
-  // hand off it first so the persistent eviction cursor stays valid (same
-  // discipline as EvictLocked).
-  for (auto rit = sh.ring.begin(); rit != sh.ring.end(); ++rit) {
-    if (*rit == fname) {
-      if (sh.hand == rit) sh.hand = HandNext(sh.ring, rit);
-      sh.ring.erase(rit);
-      break;
-    }
+  std::string trash;
+  {
+    std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
+    auto it = sh.index.find(fname);
+    if (it == sh.index.end()) return Status::kNotFound;
+    trash = RenameToTrash(it->second.path);  // fast rename; slow unlink deferred
+    sh.used_bytes -= it->second.size;
+    // O(1) ring drop via the entry's own iterator (was an O(n) scan, O(n^2)
+    // under RemoveMany while holding the exclusive lock). If the CLOCK hand
+    // points at the victim, advance it off first (same discipline as eviction).
+    auto rit = it->second.it;
+    if (sh.hand == rit) sh.hand = HandNext(sh.ring, rit);
+    sh.ring.erase(rit);
+    sh.index.erase(it);
   }
-  sh.index.erase(it);
+  if (!trash.empty()) { std::error_code ec; fs::remove(trash, ec); }  // off-lock
   return Status::kOk;
 }
 
@@ -431,14 +455,19 @@ Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
     fs::remove(tmp, ec);
     return Status::kIOError;
   }
-  std::lock_guard<std::shared_mutex> wl(sh.mu);
-  if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }
-  fs::rename(tmp, full, ec);
-  if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
-  sh.ring.push_front(fname);
-  sh.index.try_emplace(fname, full.string(), len);
-  sh.used_bytes += len;
-  EvictLocked(sh);
+  std::vector<std::string> trash;
+  {
+    std::lock_guard<std::shared_mutex> wl(sh.mu);
+    if (sh.index.count(fname)) { fs::remove(tmp, ec); return Status::kOk; }
+    fs::rename(tmp, full, ec);
+    if (ec) { fs::remove(tmp, ec); return Status::kIOError; }
+    sh.ring.push_front(fname);
+    auto res = sh.index.try_emplace(fname, full.string(), len);
+    res.first->second.it = sh.ring.begin();  // O(1) removal handle
+    sh.used_bytes += len;
+    EvictLocked(sh, &trash);
+  }
+  for (auto& t : trash) { std::error_code e2; fs::remove(t, e2); }  // slow unlink off-lock
   return Status::kOk;
 }
 
