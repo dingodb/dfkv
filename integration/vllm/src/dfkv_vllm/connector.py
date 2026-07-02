@@ -258,8 +258,14 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.register_cross_layers_kv_caches(kv_cache)
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
-        # No-op: loads are issued in get_finished() for compute overlap.
-        pass
+        # Loads are issued in get_finished() for compute overlap; this hook
+        # only runs the preemption fence, which must happen BEFORE this step's
+        # forward pass can overwrite a preempted request's freed (and possibly
+        # re-allocated) blocks while an in-flight save still reads them.
+        assert self.connector_worker is not None
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, DfkvStoreConnectorMetadata)
+        self.connector_worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         # No layerwise support - no-op
