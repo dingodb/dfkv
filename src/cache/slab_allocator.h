@@ -69,6 +69,15 @@ class SlabAllocator {
   bool Get(const std::string& key, SlotRef* out);
   bool Contains(const std::string& key) const;
 
+  // Crash-recovery only: install a key KNOWN (from persistence) to occupy
+  // (extent, slot) in a class of `slot_size`. Binds the extent to that class if
+  // needed and reserves the exact slot. Must be called before any Put, and the
+  // (extent, slot) triples restored must be internally consistent (one class per
+  // extent). Returns false on an inconsistency (mixed class on an extent, or a
+  // slot out of range) -- the caller then discards that record.
+  bool Restore(const std::string& key, uint32_t slot_size, uint32_t extent,
+               uint32_t slot);
+
   // Drop `key` (frees its slot). true if present. A pinned key is still removed
   // from the index but its slot is not reused until Unpin brings refs to 0.
   bool Remove(const std::string& key);
@@ -113,6 +122,7 @@ class SlabAllocator {
   };
 
   size_t ClassForLen(size_t aligned_len);  // returns class index (creates if needed)
+  size_t ClassForExactSize(uint32_t slot_size);  // find/create a class of exactly slot_size
   bool BindFreeExtent(size_t cls);         // bind a pool extent to cls; false if none
   bool EvictOneFrom(size_t cls, std::vector<std::string>* evicted);  // CLOCK evict 1
   bool StealExtentFor(size_t cls, std::vector<std::string>* evicted); // rebind a full extent

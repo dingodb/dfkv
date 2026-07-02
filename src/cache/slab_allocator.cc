@@ -34,6 +34,55 @@ size_t SlabAllocator::ClassForLen(size_t aligned_len) {
   return classes_.size() - 1;
 }
 
+size_t SlabAllocator::ClassForExactSize(uint32_t slot_size) {
+  for (size_t i = 0; i < classes_.size(); ++i)
+    if (classes_[i]->slot_size == slot_size) return i;
+  auto c = std::make_unique<Class>();
+  c->slot_size = slot_size;
+  c->slots_per_extent = slot_size ? static_cast<uint32_t>(opt_.extent_bytes / slot_size) : 0;
+  classes_.push_back(std::move(c));
+  return classes_.size() - 1;
+}
+
+bool SlabAllocator::Restore(const std::string& key, uint32_t slot_size,
+                            uint32_t extent, uint32_t slot) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (slot_size == 0 || extent >= extents_.size() || index_.count(key)) return false;
+  const size_t cls = ClassForExactSize(slot_size);
+  Class& C = *classes_[cls];
+  if (C.slots_per_extent == 0 || slot >= C.slots_per_extent) return false;
+  ExtentMeta& m = extents_[extent];
+  if (m.cls == kUnbound) {  // first restored slot on this extent: bind + cut slots
+    m.cls = static_cast<int>(cls);
+    m.total_slots = C.slots_per_extent;
+    m.free_slots = C.slots_per_extent;
+    m.pinned = 0;
+    C.free_slots.reserve(C.free_slots.size() + m.total_slots);
+    for (uint32_t s = 0; s < m.total_slots; ++s) C.free_slots.push_back(Slot{extent, s});
+  } else if (m.cls != static_cast<int>(cls)) {
+    return false;  // persistence inconsistency: two classes on one extent
+  }
+  // Reserve the exact slot: pull it out of the class free stack.
+  auto& fs = C.free_slots;
+  auto it = std::find_if(fs.begin(), fs.end(), [extent, slot](const Slot& s) {
+    return s.extent == extent && s.slot == slot;
+  });
+  if (it == fs.end()) return false;  // already taken (duplicate record)
+  fs.erase(it);
+  Entry e;
+  e.ref.cls = static_cast<uint32_t>(cls);
+  e.ref.extent = extent;
+  e.ref.slot = slot;
+  e.ref.slot_size = slot_size;
+  e.ref.offset = static_cast<uint64_t>(slot) * slot_size;
+  C.ring.push_front(key);
+  e.ring_it = C.ring.begin();
+  m.free_slots--;
+  used_bytes_ += slot_size;
+  index_.emplace(key, std::move(e));
+  return true;
+}
+
 bool SlabAllocator::BindFreeExtent(size_t cls) {
   for (uint32_t e = 0; e < extents_.size(); ++e) {
     if (extents_[e].cls != kUnbound) continue;

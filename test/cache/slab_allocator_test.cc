@@ -190,3 +190,35 @@ TEST(SlabAllocator, ConcurrentPutGetRemoveIsRaceFree) {
   EXPECT_GT(ok_puts.load(), 0);
   EXPECT_LE(a.UsedBytes(), a.Capacity());  // never over-commit the pool
 }
+
+TEST(SlabAllocator, RestoreInstallsKeyAtKnownSlot) {
+  SlabAllocator a(Opts(4 * 4096, 2));
+  // Restore two keys at known slots (as a rebuild would from persistence).
+  EXPECT_TRUE(a.Restore("ka", 4096, /*extent=*/0, /*slot=*/1));
+  EXPECT_TRUE(a.Restore("kb", 4096, /*extent=*/0, /*slot=*/2));
+  EXPECT_EQ(a.Count(), 2u);
+  EXPECT_EQ(a.UsedBytes(), 2u * 4096u);
+  SlotRef r;
+  ASSERT_TRUE(a.Get("ka", &r));
+  EXPECT_EQ(r.extent, 0u);
+  EXPECT_EQ(r.slot, 1u);
+  EXPECT_EQ(r.offset, 1u * 4096u);
+  // A subsequent Put on the same extent must use a still-free slot, not clobber
+  // the restored ones.
+  std::vector<std::string> ev;
+  ASSERT_TRUE(a.Put("kc", 4096, &r, &ev));
+  EXPECT_TRUE(ev.empty());
+  EXPECT_NE(r.slot, 1u);
+  EXPECT_NE(r.slot, 2u);
+}
+
+TEST(SlabAllocator, RestoreRejectsInconsistentInput) {
+  SlabAllocator a(Opts(4 * 4096, 1));
+  EXPECT_FALSE(a.Restore("bad_extent", 4096, /*extent=*/9, 0));   // extent out of range
+  EXPECT_FALSE(a.Restore("bad_slot", 4096, 0, /*slot=*/99));      // slot out of range
+  EXPECT_TRUE(a.Restore("k", 4096, 0, 0));
+  EXPECT_FALSE(a.Restore("k", 4096, 0, 1));                       // duplicate key
+  EXPECT_FALSE(a.Restore("k2", 4096, 0, 0));                      // slot already taken
+  // A second class on the same extent is a persistence inconsistency.
+  EXPECT_FALSE(a.Restore("k3", 8192, 0, 0));
+}
