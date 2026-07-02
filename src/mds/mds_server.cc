@@ -112,7 +112,21 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
     auto it = leases_.find(key);
     if (it != leases_.end()) { existing = it->second; have = true; }
   }
-  if (have && etcd_.LeaseKeepAlive(existing)) return Status::kOk;  // fast path: refresh
+  // Fast path: refresh the lease AND re-write the key under it. The Put is
+  // load-bearing, not redundant: with several MDS instances behind a rotating
+  // registrar, a slow path on ANOTHER MDS re-attaches the key to that MDS's
+  // lease. From then on a value-less keepalive here would refresh a lease that
+  // no longer holds the key, while the key's actual lease only gets refreshed
+  // once per full rotation (N_mds * heartbeat) — at 3 MDS * 10s hb that equals
+  // the 30s TTL, so the member can expire out of etcd while every heartbeat
+  // still returns kOk. Re-putting under our own live lease restores the
+  // invariant "any MDS that answers a heartbeat guarantees the key survives".
+  // It also propagates MemberInfo changes (ip/weight after a reconfigure)
+  // that the old refresh silently dropped. Cost: one small etcd write per
+  // heartbeat; the epoch is a content hash, so unchanged values don't make
+  // clients rebuild their ring.
+  if (have && etcd_.LeaseKeepAlive(existing) && etcd_.Put(key, val, existing))
+    return Status::kOk;
   // Slow path: (re)grant a lease and (re)write the member key. A same-key race
   // here (two heartbeats both missing the lease) can briefly orphan one lease,
   // which expires on its own via the TTL; same-key heartbeats are serial in
