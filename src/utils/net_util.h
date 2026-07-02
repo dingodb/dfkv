@@ -9,7 +9,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -82,9 +82,15 @@ inline int Dial(const std::string& addr, int connect_ms = 0, int io_ms = 0) {
     int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
     if (rc != 0) {
       if (errno != EINPROGRESS) { ::close(fd); return -1; }
-      fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
-      timeval tv{connect_ms / 1000, (connect_ms % 1000) * 1000};
-      if (::select(fd + 1, nullptr, &wf, nullptr, &tv) <= 0) { ::close(fd); return -1; }
+      // poll, not select: this header is linked into inference-engine hosts
+      // that routinely hold thousands of fds, so a fresh socket's fd number
+      // can exceed FD_SETSIZE (1024) — FD_SET would then write past the
+      // fd_set (stack corruption in the host process, not just a failed
+      // connect). poll has no fd-number limit.
+      pollfd pf{fd, POLLOUT, 0};
+      int pr;
+      do { pr = ::poll(&pf, 1, connect_ms); } while (pr < 0 && errno == EINTR);
+      if (pr <= 0) { ::close(fd); return -1; }
       int err = 0; socklen_t el = sizeof(err);
       ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
       if (err != 0) { ::close(fd); return -1; }
