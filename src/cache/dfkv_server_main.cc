@@ -169,6 +169,20 @@ int main(int argc, char** argv) {
         [&srv](bool ok, size_t bytes_read) {
           srv.RangeDirectComplete(ok, bytes_read);
         });
+    // RAM hot tier (P3 B5-3): when enabled, register the arena as a pool MR and
+    // wire the zero-copy serve hooks so a RAM hit is scatter-sent straight from
+    // the arena (no copy into the connection buffer, no disk). No-op if off.
+    if (srv.ram_enabled()) {
+      rsrv->RegisterMemory(srv.ram_arena(), srv.ram_arena_bytes());
+      rsrv->set_ram_range_handler(
+          [&srv](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
+                 const char** out_ptr, size_t* out_len, uint64_t* out_token) {
+            return srv.RamRangePrep(id, idx, ks, off, len, out_ptr, out_len, out_token);
+          });
+      rsrv->set_ram_release_handler([&srv](uint64_t tok) { srv.RamRelease(tok); });
+      DFKV_LOG_INFO("dfkv_server RAM hot tier: RDMA zero-copy serve enabled (arena " +
+                    std::to_string(srv.ram_arena_bytes()) + " bytes)");
+    }
     if (rsrv->Start(rdma_port) == Status::kOk)
       DFKV_LOG_INFO("dfkv_server RDMA listening (TCP bootstrap) on port " +
                     std::to_string(rsrv->port()) +

@@ -114,6 +114,10 @@ size_t RdmaServer::live_conn_count() {
   return conns_.size();
 }
 
+void RdmaServer::RegisterMemory(void* base, size_t size) {
+  if (base && size) user_regions_.emplace_back(base, size);  // applied per-conn in Serve
+}
+
 void RdmaServer::AcceptLoop() {
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
@@ -215,6 +219,10 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd); return;
   }
   if (!ep.Connect(rdma::ParseQpInfo(peer))) { ::close(boot_fd); return; }
+  // Register the RAM arena (and any other declared region) as a pool MR on this
+  // connection's PD so a RAM-hit payload resolves to an MR with no per-op reg_mr
+  // (B5-3). No-op when nothing was registered.
+  if (!user_regions_.empty()) ep.EnsurePoolMrs(user_regions_);
   auto post_request_recv = [&](size_t slot) {
     if (!ep.dbuf(slot) || !ep.dmr(slot) || ep.dbuf_cap() <= ValueHeader::kSize)
       return ep.PostRecv(slot);
@@ -256,6 +264,7 @@ void RdmaServer::Serve(int boot_fd) {
     const void* payload = nullptr;
     size_t payload_len = 0;
     ibv_mr* payload_mr = nullptr;
+    uint64_t release_token = 0;  // RAM-hit send-in-flight pin; 0 = none (B5-3)
   };
 
   // Build the reply for one request. Generic ops are materialized in sbuf. For
@@ -297,6 +306,34 @@ void RdmaServer::Serve(int boot_fd) {
       if (!ep.dbuf(recv_slot) || !ep.dmr(recv_slot)) return false;
       if (rq.length > static_cast<uint64_t>(ValueHeader::kSize + max_msg_))
         return invalid_reply();
+      // RAM hot tier (B5-3): if the block is resident in the arena, scatter-send
+      // it STRAIGHT from the arena MR -- no copy into dbuf, no disk. The slot is
+      // pinned until this send completes (release_token -> ram_release_handler_).
+      if (ram_range_handler_) {
+        const char* rptr = nullptr; size_t rlen = 0; uint64_t tok = 0;
+        if (ram_range_handler_(rq.id, rq.index, rq.size, rq.offset, rq.length,
+                               &rptr, &rlen, &tok)) {
+          ibv_mr* amr = rlen ? ep.RegisterUser(const_cast<char*>(rptr), rlen) : nullptr;
+          if (rlen != 0 && amr == nullptr) {  // MR resolve failed -> release + fall back
+            if (ram_release_handler_) ram_release_handler_(tok);
+          } else {
+            EncodeResp(sb, Status::kOk, rlen);
+            reply->first_len = kRespPrefix;
+            if (rlen != 0) {
+              reply->scatter = true;
+              reply->defer_recv_rearm = true;
+              reply->recv_slot = recv_slot;
+              reply->payload = rptr;
+              reply->payload_len = rlen;
+              reply->payload_mr = amr;
+              reply->release_token = tok;
+            } else {
+              if (ram_release_handler_) ram_release_handler_(tok);  // 0-len: nothing to send
+            }
+            return true;
+          }
+        }
+      }
       const char* out_data = nullptr;
       size_t out_len = 0;
       Status st = range_handler_(rq.id, rq.index, rq.size, rq.offset, rq.length,
@@ -359,6 +396,16 @@ void RdmaServer::Serve(int boot_fd) {
   std::vector<ibv_wc> wcs(K);
   constexpr size_t kNoSlot = static_cast<size_t>(-1);
   std::vector<size_t> rearm_on_send(K, kNoSlot);
+  // Parallel to rearm_on_send: the RAM-hit pin token to release when this send
+  // slot's IBV_WC_SEND fires (the arena bytes were read by the NIC in place).
+  // 0 = none (B5-3). All-zero unless a ram_range_handler_ hit went out.
+  std::vector<uint64_t> release_on_send(K, 0);
+  auto release_completed_send = [&](size_t sid) {
+    if (sid < release_on_send.size() && release_on_send[sid] != 0) {
+      if (ram_release_handler_) ram_release_handler_(release_on_send[sid]);
+      release_on_send[sid] = 0;
+    }
+  };
   bool fail = false;
   const int idle_ms = ServerIdleMs();
   active_conns_.fetch_add(1, std::memory_order_relaxed);
@@ -426,6 +473,7 @@ void RdmaServer::Serve(int boot_fd) {
               if (!post_request_recv(rearm_on_send[sid])) { fail = true; break; }
               rearm_on_send[sid] = kNoSlot;
             }
+            release_completed_send(sid);  // release any RAM-hit pin (B5-3)
             free_send.push_back(sid);
             continue;
           }
@@ -516,6 +564,7 @@ void RdmaServer::Serve(int boot_fd) {
             } else if (!post_request_recv(qd.recv_slot)) {
               fail = true; break;
             }
+            release_on_send[qd.send_slot] = reply.release_token;  // RAM-hit pin (B5-3)
             bool sent = reply.scatter
                             ? ep.PostSendScatter(qd.send_slot, reply.first_len,
                                                  reply.payload, reply.payload_len,
@@ -558,6 +607,9 @@ void RdmaServer::Serve(int boot_fd) {
       // Connection ending: close any fds still owned by un-emitted queue entries.
       for (auto& qd : queue) if (qd.fd >= 0) ::close(qd.fd);
     }
+    // Release RAM-hit pins for sends that never completed (conn tore down) so the
+    // arena slots don't stay pinned forever (B5-3).
+    for (size_t i = 0; i < release_on_send.size(); ++i) release_completed_send(i);
     active_conns_.fetch_sub(1, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
     return;
@@ -581,6 +633,7 @@ sync_serve_loop:;
           if (!post_request_recv(rearm_on_send[sid])) { fail = true; break; }
           rearm_on_send[sid] = kNoSlot;
         }
+        release_completed_send(sid);  // release any RAM-hit pin (B5-3)
         free_send.push_back(sid);
         continue;
       }
@@ -599,6 +652,7 @@ sync_serve_loop:;
       } else if (!post_request_recv(r)) {
         fail = true; break;  // re-arm (request consumed)
       }
+      release_on_send[s] = reply.release_token;  // RAM-hit pin (B5-3)
       bool sent = reply.scatter
                       ? ep.PostSendScatter(s, reply.first_len, reply.payload,
                                            reply.payload_len, reply.payload_mr)
@@ -606,6 +660,8 @@ sync_serve_loop:;
       if (!sent) { fail = true; break; }
     }
   }
+  // Release RAM-hit pins for sends that never completed (conn tore down, B5-3).
+  for (size_t i = 0; i < release_on_send.size(); ++i) release_completed_send(i);
   active_conns_.fetch_sub(1, std::memory_order_relaxed);
   { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
   // ep dtor tears down the QP; the peer observes the drop as an error completion.

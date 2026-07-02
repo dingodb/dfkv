@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/status.h"
@@ -86,6 +87,27 @@ class RdmaServer {
   void set_range_complete_handler(RangeCompleteHandler h) {
     range_complete_handler_ = std::move(h);
   }
+
+  // --- RAM hot-tier zero-copy GET (P3 B5-3, ADDITIVE + OFF unless wired) --------
+  // On a kRange, the serve loop first asks ram_range_handler_ for a hit: on true
+  // it returns (arena ptr, len, token) into a caller RAM arena, and the reply is
+  // scatter-sent [resp | arena bytes] straight from the arena MR -- no copy into
+  // the connection buffer, no disk. The NIC reads the shared arena during the
+  // send, so the slot stays pinned until IBV_WC_SEND, when the serve loop calls
+  // ram_release_handler_(token) (mirrors rearm_on_send). Both must be set AND the
+  // arena registered via RegisterMemory for the path to activate; otherwise the
+  // existing range_handler_ (copy-out) path runs unchanged.
+  using RamRangeHandler = std::function<bool(
+      uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
+      uint64_t length, const char** out_ptr, size_t* out_len, uint64_t* out_token)>;
+  using RamReleaseHandler = std::function<void(uint64_t token)>;
+  void set_ram_range_handler(RamRangeHandler h) { ram_range_handler_ = std::move(h); }
+  void set_ram_release_handler(RamReleaseHandler h) { ram_release_handler_ = std::move(h); }
+  // Register a caller memory region (the RAM arena) as a pool MR on every
+  // connection's PD, so a RAM-hit payload resolves to an MR with no per-op
+  // ibv_reg_mr. Call before Start(); regions are applied as each connection opens.
+  void RegisterMemory(void* base, size_t size);
+
   ~RdmaServer();
 
   Status Start(int port);  // TCP bootstrap port
@@ -127,6 +149,9 @@ class RdmaServer {
   CacheDirectHandler cache_direct_handler_;
   RangePrepHandler range_prep_handler_;
   RangeCompleteHandler range_complete_handler_;
+  RamRangeHandler ram_range_handler_;
+  RamReleaseHandler ram_release_handler_;
+  std::vector<std::pair<void*, size_t>> user_regions_;  // RAM arena pool MRs (RegisterMemory)
   size_t max_msg_;
   size_t control_cap_;
   std::string dev_name_;

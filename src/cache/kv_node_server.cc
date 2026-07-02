@@ -491,6 +491,25 @@ void KvNodeServer::RangeDirectComplete(bool ok, size_t bytes_read) {
   }
 }
 
+bool KvNodeServer::RamRangePrep(uint64_t id, uint32_t index, uint32_t ksize,
+                                uint64_t offset, uint64_t length,
+                                const char** out_ptr, size_t* out_len,
+                                uint64_t* out_token) {
+  if (!ram_) return false;
+  RamTier::Hit h;
+  if (!ram_->GetPrep(BlockKey{id, index, ksize}, offset, length, &h)) return false;
+  if (out_ptr) *out_ptr = h.ptr;
+  if (out_len) *out_len = h.len;
+  if (out_token) *out_token = h.token;
+  cache_hit_.fetch_add(1, std::memory_order_relaxed);
+  bytes_read_.fetch_add(h.len, std::memory_order_relaxed);
+  return true;
+}
+
+void KvNodeServer::RamRelease(uint64_t token) {
+  if (ram_) ram_->Release(token);
+}
+
 // Keep-alive: serve requests on this connection until the peer closes it.
 void KvNodeServer::Handle(int fd) {
   // Bound the declared payload_len BEFORE the allocation below: without this

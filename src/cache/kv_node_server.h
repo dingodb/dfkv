@@ -101,6 +101,20 @@ class KvNodeServer {
   // Account a completed prep-based GET (called after the async read finishes).
   void RangeDirectComplete(bool ok, size_t bytes_read);
 
+  // --- RAM hot tier zero-copy serve hooks (P3 B5-3) ----------------------------
+  // These let the RDMA server send a RAM hit STRAIGHT from the arena MR (no copy
+  // into the connection buffer). All no-ops / false when the RAM tier is off.
+  bool ram_enabled() const { return ram_ != nullptr; }
+  char* ram_arena() const { return ram_ ? ram_->arena() : nullptr; }
+  uint64_t ram_arena_bytes() const { return ram_ ? ram_->arena_bytes() : 0; }
+  // On a RAM hit, pins the slot and returns its arena pointer + length + a token;
+  // the caller MUST call RamRelease(token) once the RDMA send completes (the NIC
+  // reads the shared arena in place -- gap 10.1). Bumps hit/miss + bytes-read.
+  bool RamRangePrep(uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
+                    uint64_t length, const char** out_ptr, size_t* out_len,
+                    uint64_t* out_token);
+  void RamRelease(uint64_t token);
+
  private:
   void AcceptLoop();
   void Handle(int fd);

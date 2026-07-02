@@ -844,3 +844,93 @@ TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
   ::unsetenv("DFKV_SERVER_URING_DEPTH");
   ::unsetenv("DFKV_RDMA_DEPTH");
 }
+
+// --- P3 B5-3: RAM hot-tier zero-copy RDMA serve --------------------------------
+// A cache node with the RAM tier enabled must serve a GET straight from the
+// pre-registered arena MR (scatter-send, no copy into the connection buffer, no
+// disk), and the bytes must round-trip correctly. dfkv_ram_hit_total proves the
+// zero-copy path was taken; the send-in-flight pin is released on IBV_WC_SEND.
+namespace {
+struct RamRdmaNode {
+  fs::path dir;
+  std::unique_ptr<KvNodeServer> srv;
+  std::unique_ptr<RdmaServer> rsrv;
+  std::string addr;
+
+  explicit RamRdmaNode(const std::string& tag, size_t max_msg = kMaxMsg) {
+    ::setenv("DFKV_RAM_TIER", "1", 1);
+    ::setenv("DFKV_RAM_TIER_BYTES", "8388608", 1);  // 8 MiB arena
+    dir = fs::temp_directory_path() / ("dfkv_ramrdma_" + tag);
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    srv = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
+    EXPECT_EQ(srv->Start(0), Status::kOk);
+    rsrv = std::make_unique<RdmaServer>(
+        [this](uint8_t op, uint64_t id, uint32_t idx, uint32_t ks, uint64_t off,
+               uint64_t len, const char* pl, uint64_t pll, std::string* out) {
+          return srv->ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
+        },
+        max_msg);
+    rsrv->set_range_handler(
+        [this](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
+               char* io_buf, size_t cap, const char** out_data, size_t* out_len) {
+          return srv->RangeDirect(id, idx, ks, off, len, io_buf, cap, out_data, out_len);
+        });
+    rsrv->set_cache_direct_handler(
+        [this](uint64_t id, uint32_t idx, uint32_t ks, char* data, size_t len,
+               size_t cap) { return srv->CacheDirect(id, idx, ks, data, len, cap); });
+    // The B5-3 wiring (mirrors dfkv_server_main): register the arena as a pool MR
+    // and set the zero-copy serve hooks.
+    if (srv->ram_enabled()) {
+      rsrv->RegisterMemory(srv->ram_arena(), srv->ram_arena_bytes());
+      rsrv->set_ram_range_handler(
+          [this](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
+                 const char** p, size_t* l, uint64_t* tok) {
+            return srv->RamRangePrep(id, idx, ks, off, len, p, l, tok);
+          });
+      rsrv->set_ram_release_handler([this](uint64_t tok) { srv->RamRelease(tok); });
+    }
+    EXPECT_EQ(rsrv->Start(0), Status::kOk);
+    addr = "127.0.0.1:" + std::to_string(rsrv->port());
+  }
+  ~RamRdmaNode() {
+    if (rsrv) rsrv->Stop();
+    if (srv) srv->Stop();
+    srv.reset();
+    ::unsetenv("DFKV_RAM_TIER");
+    ::unsetenv("DFKV_RAM_TIER_BYTES");
+    fs::remove_all(dir);
+  }
+};
+}  // namespace
+
+TEST(RdmaLoopback, RamTierZeroCopyServe) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
+  RamRdmaNode node("ram");
+  ASSERT_TRUE(node.srv->ram_enabled());
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  // PUT then GET a spread of blocks over RDMA; each must round-trip byte-for-byte
+  // even though the GET is served zero-copy from the arena MR.
+  const int N = 40;
+  std::vector<std::string> vals;
+  for (int i = 0; i < N; ++i) {
+    std::string v = "ram-rdma-" + std::to_string(i) + std::string(300 + i, 'q');
+    vals.push_back(v);
+    ASSERT_TRUE(c.Put("z" + std::to_string(i), v.data(), v.size())) << i;
+  }
+  for (int i = 0; i < N; ++i) {
+    std::string out(vals[i].size(), '\0');
+    ASSERT_TRUE(c.Get("z" + std::to_string(i), &out[0], out.size())) << i;
+    EXPECT_EQ(out, vals[i]) << i;
+  }
+
+  const std::string m = node.srv->MetricsText();
+  EXPECT_GT(CounterVal(m, "dfkv_ram_hit_total"), 0) << "GET must be served from RAM";
+  // Every send completed, so no arena slot is left send-pinned: a re-GET still
+  // works (pin released on IBV_WC_SEND, not leaked).
+  std::string out2(vals[0].size(), '\0');
+  ASSERT_TRUE(c.Get("z0", &out2[0], out2.size()));
+  EXPECT_EQ(out2, vals[0]);
+}
