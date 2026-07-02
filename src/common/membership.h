@@ -26,6 +26,22 @@ struct MemberInfo {
   }
 };
 
+// A group or member id is embedded verbatim into the etcd key
+//   /dfkv/v1/groups/<group>/members/<id>
+// so a '/' (or an empty/overlong token) lets a registration escape its own
+// key subtree -- e.g. group "a/members/ghost" injects a phantom member into
+// group "a"'s RangePrefix, and any reachable client can point a real node id
+// at an attacker IP. Restrict both to a conservative, path-safe alphabet.
+inline bool IsValidGroupOrId(const std::string& s) {
+  if (s.empty() || s.size() > 128) return false;
+  for (unsigned char c : s) {
+    const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
 // Magic tag marking the OPTIONAL tcp_port extension appended after the member list.
 // Old encodings carry no trailing bytes, so this tag is unambiguous when present.
 constexpr uint32_t kMemberExtTcpPort = 0x54435031u;  // "TCP1"

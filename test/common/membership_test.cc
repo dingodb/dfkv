@@ -82,3 +82,23 @@ TEST(MembersEpoch, NoFieldBoundaryCollision) {
   std::vector<MemberInfo> y = {{"a", "bc", 0, 0}};
   EXPECT_NE(MembersEpoch(x), MembersEpoch(y));
 }
+
+TEST(Membership, ValidGroupOrIdAlphabet) {
+  // Accepted: the tokens real deployments use.
+  EXPECT_TRUE(IsValidGroupOrId("glm"));
+  EXPECT_TRUE(IsValidGroupOrId("glm-a"));
+  EXPECT_TRUE(IsValidGroupOrId("gpu2-0045"));
+  EXPECT_TRUE(IsValidGroupOrId("itest-grp-12345"));
+  EXPECT_TRUE(IsValidGroupOrId("a.b_c-1"));
+  EXPECT_TRUE(IsValidGroupOrId(std::string(128, 'a')));  // max length
+
+  // Rejected: empty, overlong, and anything that could escape the key subtree.
+  EXPECT_FALSE(IsValidGroupOrId(""));
+  EXPECT_FALSE(IsValidGroupOrId(std::string(129, 'a')));
+  EXPECT_FALSE(IsValidGroupOrId("a/members/ghost"));  // path traversal
+  EXPECT_FALSE(IsValidGroupOrId("a/b"));
+  EXPECT_FALSE(IsValidGroupOrId("a b"));   // space
+  EXPECT_FALSE(IsValidGroupOrId("a\tb"));
+  EXPECT_FALSE(IsValidGroupOrId("a:b"));
+  EXPECT_FALSE(IsValidGroupOrId(std::string("a\0b", 3)));  // embedded NUL
+}

@@ -108,3 +108,37 @@ TEST(MdsServer, HeartbeatRewritesMemberValueUnderOwnLease) {
   EXPECT_EQ(got[0].weight, 7u);
   mds.Stop();
 }
+
+TEST(MdsServer, RejectsPathTraversalGroupAndId) {
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  int port = mds.port();
+  Status st; std::string data;
+
+  // A group containing "/members/" would land the key inside group "victim".
+  std::string victim = "victim-" + std::to_string(port);
+  MemberInfo ghost{"ghost", "6.6.6.6", 28000, 1};
+  std::string evil_group = victim + "/members/x/members";
+  ASSERT_TRUE(DoReq(port, WireOp::kRegister, EncodeMemberReq(evil_group, ghost),
+                    &st, &data));
+  EXPECT_EQ(st, Status::kInvalid) << "path-traversal group must be rejected";
+
+  // An id with a slash is equally dangerous.
+  MemberInfo m{"a/members/x", "1.1.1.1", 28000, 1};
+  ASSERT_TRUE(DoReq(port, WireOp::kRegister, EncodeMemberReq(victim, m), &st, &data));
+  EXPECT_EQ(st, Status::kInvalid) << "path-traversal id must be rejected";
+
+  // The victim group must contain no injected phantom member.
+  ASSERT_TRUE(DoReq(port, WireOp::kListMembers, victim, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  std::vector<MemberInfo> got; uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &got, &epoch));
+  EXPECT_TRUE(got.empty()) << "no phantom member should have been injected";
+
+  // A malformed group on ListMembers is rejected outright.
+  ASSERT_TRUE(DoReq(port, WireOp::kListMembers, "a/b", &st, &data));
+  EXPECT_EQ(st, Status::kInvalid);
+  mds.Stop();
+}
