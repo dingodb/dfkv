@@ -224,6 +224,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
         self.enable_kv_event = enable_kv_event
+        # Which request _handle_request is executing right now. Published under
+        # done_task_lock together with the dequeue gate below, so a request is
+        # either dropped at the gate or visibly in flight to
+        # wait_for_inflight_put() -- never invisibly both.
+        self._active_req_id: str | None = None
+        self._active_cv = threading.Condition(self.done_task_lock)
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -239,6 +245,23 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if req_id in self.stored_requests:
                 del self.stored_requests[req_id]
 
+    def wait_for_inflight_put(self, req_id: str, timeout_s: float = 30.0) -> bool:
+        """Block until no store for ``req_id`` is currently executing.
+
+        Queued-but-not-started entries are handled by
+        delete_finished_stored_request() + the dequeue gate (they get dropped
+        before any GPU read); the one entry the thread may already be
+        executing cannot be cancelled -- it holds an RDMA read against the
+        request's GPU blocks -- so the preemption path must wait it out
+        before those blocks can be handed to another request. Returns False
+        on timeout (put ops are client-side bounded, so this only happens if
+        the store path is badly wedged).
+        """
+        with self._active_cv:
+            return self._active_cv.wait_for(
+                lambda: self._active_req_id != req_id, timeout_s
+            )
+
     def _handle_request(self, req_meta: ReqMeta):
         # Cache hits are always a multiple of ``lcm_block_size`` tokens, which
         # is also ``store_mask``'s precondition.
@@ -248,7 +271,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
         req_id = req_meta.req_id
         current_event = req_meta.current_event
 
-        if req_id not in self.stored_requests:
+        # Publish the active request and take the dequeue gate under ONE lock
+        # acquisition: a concurrent preemption fence either deletes the counter
+        # first (we drop the entry here) or sees _active_req_id == req_id and
+        # waits for the finally below. No window where the put runs invisibly.
+        with self.done_task_lock:
+            self._active_req_id = req_id
+            gate_ok = req_id in self.stored_requests
+        if not gate_ok:
+            with self._active_cv:
+                self._active_req_id = None
+                self._active_cv.notify_all()
             self.request_queue.task_done()
             return
 
@@ -426,6 +459,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
         finally:
+            with self._active_cv:
+                self._active_req_id = None
+                self._active_cv.notify_all()
             self.dec_stored_request(req_id)
             self.request_queue.task_done()
 
@@ -980,8 +1016,39 @@ class DfkvStoreWorker:
         self,
         metadata: DfkvStoreConnectorMetadata,
     ):
-        """No-op: loads are issued in get_finished() for overlap."""
-        pass
+        """Pre-forward hook: fence preempted requests' in-flight saves.
+
+        Loads/stores are issued in get_finished() for overlap; the ONLY work
+        here is the preemption fence, and it must be here. The scheduler
+        frees a preempted request's GPU blocks with no connector hook
+        (request_finished()'s delay-free covers only the normal finish path)
+        and can hand them to another request scheduled in this very step.
+        This hook runs before this step's forward pass writes into those
+        blocks, so it is the last point where the race can still be closed:
+        drop the queued-not-started saves, then wait out the one save the
+        send thread may currently be executing (an uncancellable RDMA read
+        of the request's old blocks). Without the fence that read races the
+        new request's prefill writes and stores mixed bytes under a
+        content-addressed key -- and the save path's exists-dedup then
+        prevents the correct bytes from ever replacing them (persistent
+        cache poison, spread across instances by PD reuse).
+        """
+        if self.kv_send_thread is None or not metadata.preempted_req_ids:
+            return
+        # Drop queued entries first (the dequeue gate re-checks per entry),
+        # then join whichever entry is already executing.
+        for req_id in metadata.preempted_req_ids:
+            self.kv_send_thread.delete_finished_stored_request(req_id)
+        for req_id in metadata.preempted_req_ids:
+            wait_start = time.perf_counter()
+            if not self.kv_send_thread.wait_for_inflight_put(req_id):
+                logger.error(
+                    "preemption fence timed out waiting for in-flight save "
+                    "of request %s (%.1fs); its old GPU blocks may be read "
+                    "while reused -- possible poisoned store keys",
+                    req_id,
+                    time.perf_counter() - wait_start,
+                )
 
     def wait_for_save(
         self,
