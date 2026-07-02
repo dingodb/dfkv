@@ -310,8 +310,34 @@ bool KVClient::GetAuto(const std::string& key, std::string* out, size_t max_byte
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
+  BlockKey bk = ToBlockKey(key);
+
+  if (t_->pipelined()) {
+    // Zero-copy via RangeInto (a 1-element batch), matching Get(): the payload
+    // scatters straight into `out`'s buffer. This also lifts the limit from the
+    // single-Range control_cap (8 MiB) to the batch max_payload (64 MiB) — a
+    // value in (8 MiB, 64 MiB] used to "miss on single read, hit on batch read".
+    out->resize(max_bytes);
+    std::vector<BlockKey> keys{bk};
+    std::vector<RangeDst> dsts{RangeDst{max_bytes ? &(*out)[0] : nullptr, max_bytes}};
+    std::vector<std::string> hdrs;
+    Status st = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs)[0];
+    if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); out->clear(); return false; }
+    if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node);
+    if (st != Status::kOk || hdrs[0].size() < ValueHeader::kSize) { out->clear(); return false; }
+    ValueHeader h;
+    if (!ValueHeader::Parse(hdrs[0].data(), hdrs[0].size(), &h) ||
+        !HeaderMatches(self_hdr_, h) || h.payload_len > max_bytes) {
+      out->clear();
+      return false;
+    }
+    out->resize(h.payload_len);  // trim the receive buffer to the true stored length
+    return true;
+  }
+
+  // TCP (non-pipelined): response into a string, then copy out.
   std::string raw;
-  Status st = t_->Range(node, ToBlockKey(key), 0, ValueHeader::kSize + max_bytes, &raw);
+  Status st = t_->Range(node, bk, 0, ValueHeader::kSize + max_bytes, &raw);
   // Fresh clock: `now` was taken before a round trip that can burn the whole
   // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
   if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
@@ -334,9 +360,30 @@ bool KVClient::GetAuto(const std::string& key, void* out, size_t cap, size_t* ou
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  // Read [header | up-to-cap payload]; the header tells us the true payload_len.
+  BlockKey bk = ToBlockKey(key);
+
+  if (t_->pipelined()) {
+    // Zero-copy: the payload scatters straight into the caller's buffer and the
+    // header (true payload_len) comes back separately. Lifts the 8 MiB
+    // single-Range cap to the 64 MiB batch max_payload, like Get()/GetAuto(str).
+    std::vector<BlockKey> keys{bk};
+    std::vector<RangeDst> dsts{RangeDst{cap ? out : nullptr, cap}};
+    std::vector<std::string> hdrs;
+    Status st = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs)[0];
+    if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
+    if (st == Status::kOk || st == Status::kNotFound) health_.MarkGood(node);
+    if (st != Status::kOk || hdrs[0].size() < ValueHeader::kSize) return false;
+    ValueHeader h;
+    if (!ValueHeader::Parse(hdrs[0].data(), hdrs[0].size(), &h)) return false;
+    if (!HeaderMatches(self_hdr_, h)) return false;        // geometry drift => miss
+    if (h.payload_len > cap) return false;                 // won't fit caller buffer
+    if (out_len) *out_len = h.payload_len;
+    return true;
+  }
+
+  // TCP: read [header | up-to-cap payload]; the header tells us the true payload_len.
   std::string raw;
-  Status st = t_->Range(node, ToBlockKey(key), 0, ValueHeader::kSize + cap, &raw);
+  Status st = t_->Range(node, bk, 0, ValueHeader::kSize + cap, &raw);
   // Fresh clock: `now` was taken before a round trip that can burn the whole
   // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
   if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
