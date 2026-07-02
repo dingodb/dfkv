@@ -226,16 +226,31 @@ KVStore::Shard& KVStore::ShardFor(const std::string& fname) const {
 void KVStore::RebuildIndex() {  // constructor-time, single-threaded: no locks
   std::error_code ec;
   if (!fs::exists(opt_.cache_dir, ec)) return;
+  // A crash between WriteFileDirect and the atomic rename (every rolling upgrade
+  // kills a process mid-flight) leaves an orphan ".tmp": it is never indexed,
+  // never counted toward capacity, and thus never evicted -- a permanent disk
+  // leak that accumulates across restarts. Delete them on startup instead of
+  // just skipping. A published block's name is purely digits ("id_index_size")
+  // and never contains '.', so ".tmp" can only be an orphan -- no false delete.
+  std::vector<fs::path> orphans;
   for (auto it = fs::recursive_directory_iterator(opt_.cache_dir, ec);
        !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
     if (!it->is_regular_file(ec)) continue;
     std::string fname = it->path().filename().string();
-    if (fname.size() >= 4 && fname.substr(fname.size() - 4) == ".tmp") continue;
+    if (fname.size() >= 4 && fname.substr(fname.size() - 4) == ".tmp") {
+      orphans.push_back(it->path());
+      continue;
+    }
     uint64_t sz = static_cast<uint64_t>(fs::file_size(it->path(), ec));
     Shard& sh = ShardFor(fname);
     sh.ring.push_front(fname);
     sh.index.try_emplace(fname, it->path().string(), sz);
     sh.used_bytes += sz;
+  }
+  // Reclaim outside the iteration so removal can't perturb the directory walk.
+  for (const auto& p : orphans) {
+    std::error_code rc;
+    if (fs::remove(p, rc)) tmp_reclaimed_.fetch_add(1, std::memory_order_relaxed);
   }
 }
 

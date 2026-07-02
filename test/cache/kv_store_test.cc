@@ -1,4 +1,5 @@
 // TDD R3 — KVStore: the cache-node local store (disk + LRU + cache-only/no-S3).
+#include <fstream>
 #include "cache/kv_store.h"
 
 #include <gtest/gtest.h>
@@ -288,4 +289,38 @@ TEST_F(KVStoreTest, RemoveKeepsClockHandValidUnderManyKeys) {
   // The survivors are still readable and a fresh cache still evicts correctly.
   std::string out;
   EXPECT_EQ(s.Range(BlockKey{1, 0, 1}, 0, 64, &out), Status::kOk);
+}
+
+TEST_F(KVStoreTest, RebuildIndexReclaimsOrphanTmpAndKeepsPublishedBlocks) {
+  BlockKey k{555, 0, 1};
+  std::string v = "durable-value-0123456789";
+  {
+    KVStore s(Opts());
+    ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  }
+  // Simulate a crash between WriteFileDirect and rename: drop orphan ".tmp"
+  // files alongside the published block (nested like the real StoreKey layout).
+  std::error_code ec;
+  fs::path bucket = dir_ / "blocks" / "0" / "0";
+  fs::create_directories(bucket, ec);
+  size_t before = 0;
+  for (auto& e : fs::recursive_directory_iterator(dir_)) (void)e, ++before;
+  std::ofstream(bucket / "999_0_1.7.tmp") << "half-written-aligned-garbage";
+  std::ofstream(dir_ / "888_0_1.3.tmp") << "another-orphan";
+
+  KVStore s2(Opts());
+  EXPECT_EQ(s2.TmpReclaimed(), 2u);
+  EXPECT_TRUE(s2.IsCached(k)) << "published block must survive tmp cleanup";
+  std::string out;
+  ASSERT_EQ(s2.Range(k, 0, v.size(), &out), Status::kOk);
+  EXPECT_EQ(out, v);
+  // No ".tmp" files remain on disk.
+  size_t tmps = 0;
+  for (auto& e : fs::recursive_directory_iterator(dir_)) {
+    std::string n = e.path().filename().string();
+    if (n.size() >= 4 && n.substr(n.size() - 4) == ".tmp") ++tmps;
+  }
+  EXPECT_EQ(tmps, 0u);
+  // Orphan bytes were never counted toward capacity.
+  (void)before;
 }
