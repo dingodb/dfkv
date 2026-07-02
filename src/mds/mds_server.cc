@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "common/membership.h"
 #include "mds/mds_proto.h"
 #include "utils/net_util.h"
 #include "utils/wire_limits.h"
@@ -99,6 +100,9 @@ void MdsServer::AcceptLoop() {
 }
 
 Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
+  // Reject before the id/group reach the etcd key: an unrestricted token can
+  // contain '/' and escape its own key subtree (phantom-member injection).
+  if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
   std::string key = MemberKey(group, m.id);
   std::string val = EncodeMembers({m}, 0);
   // Look up this member's known lease under the lock, then do the BLOCKING etcd
@@ -145,6 +149,9 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
 
 Status MdsServer::ListMembers(const std::string& group, std::string* out) {
   metrics_.list_requests.fetch_add(1, std::memory_order_relaxed);
+  // A malformed group would build a RangePrefix straddling other groups'
+  // subtrees; reject it the same way Upsert does.
+  if (!IsValidGroupOrId(group)) return Status::kInvalid;
   std::string prefix = "/dfkv/v1/groups/" + group + "/members/";
   auto r = etcd_.RangePrefix(prefix);
   if (!r) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
