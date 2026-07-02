@@ -1,5 +1,5 @@
 """Drift guard: the vendored telemetry copies inside the vLLM / LMCache pip
-connectors must stay byte-identical to the canonical python/dfkv_telemetry/.
+connectors must stay byte-identical to the canonical integration/hicache/dfkv_telemetry/.
 
 If this fails, run ``scripts/sync_telemetry.sh`` (you edited the canonical files
 but not the vendored copies, or vice-versa).
@@ -10,7 +10,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 
-CANON = os.path.join(ROOT, "python", "dfkv_telemetry")
+CANON = os.path.join(ROOT, "integration", "hicache", "dfkv_telemetry")
 VENDORED = [
     os.path.join(ROOT, "integration", "vllm", "src", "dfkv_vllm", "_telemetry"),
     os.path.join(ROOT, "integration", "lmcache", "src", "dfkv_connector", "_telemetry"),

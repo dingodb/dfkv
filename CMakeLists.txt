@@ -94,13 +94,13 @@ install(DIRECTORY src/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dfkv FILES_MATCHI
 # dfkv_hicache.py imports dfkv_access_log and dfkv_metrics at module load, so all
 # three must ship together or an installed plugin fails with ImportError.
 install(FILES
-  python/dfkv_hicache.py
-  python/dfkv_access_log.py
-  python/dfkv_metrics.py
+  integration/hicache/dfkv_hicache.py
+  integration/hicache/dfkv_access_log.py
+  integration/hicache/dfkv_metrics.py
   DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python)
 # Shared telemetry package (push-metrics now; tracing later). Canonical source;
 # the vLLM/LMCache pip connectors vendor a byte-identical copy (drift-guarded).
-install(DIRECTORY python/dfkv_telemetry
+install(DIRECTORY integration/hicache/dfkv_telemetry
   DESTINATION ${CMAKE_INSTALL_DATADIR}/dfkv/python
   FILES_MATCHING PATTERN "*.py")
 

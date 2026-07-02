@@ -205,10 +205,13 @@ jobs:
           cp build-static/dfkv_server build-static/dfkv_mds build-static/dfkv_bench \
              build-static/dfkv_smoke build-static/dfkvctl "$PKG/bin/"
           cp build-static/libdfkv.so "$PKG/lib/"
-          cp python/dfkv_hicache.py python/dfkv_access_log.py python/dfkv_metrics.py "$PKG/python/"
+          # SGLang HiCache 插件（仓库源在 integration/hicache/；产物内保持 python/ 布局不变，
+          # 线上部署脚本引用的是 tarball 内的 python/dfkv_hicache.py 路径）。
+          cp integration/hicache/dfkv_hicache.py integration/hicache/dfkv_access_log.py \
+             integration/hicache/dfkv_metrics.py "$PKG/python/"
           # 共享遥测包：dfkv_hicache.py 顶部 `from dfkv_telemetry import ...`，
           # 不一起打包则 SGLang 插件加载即 ImportError。
-          cp -r python/dfkv_telemetry "$PKG/python/"
+          cp -r integration/hicache/dfkv_telemetry "$PKG/python/"
           # vLLM / LMCache 连接器（源码 Python 包，随 release 一起发，便于免源码直接 pip install 对接）
           mkdir -p "$PKG/integration"
           cp -r integration/vllm integration/lmcache "$PKG/integration/"

@@ -2,7 +2,7 @@
 
 > 前提：先按 [docs/DEPLOY.md](../DEPLOY.md) 部署好 dfkv 集群(server + MDS)。本文只讲 SGLang HiCache 如何对接 dfkv 作 L3。
 
-把 `libdfkv.so` + `python/dfkv_hicache.py` 放到 pod 可访问路径，免 fork、`dynamic` 侧载。
+把 `libdfkv.so` + `dfkv_hicache.py`(发布包内 `python/`,仓库源在 `integration/hicache/`)放到 pod 可访问路径，免 fork、`dynamic` 侧载。
 前提：GLM-5.1 = MLA（每页 KV ≈ 2.74 MiB 单对象、跨 TP 复制、仅 tp_rank0 写）。
 
 ---

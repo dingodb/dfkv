@@ -18,7 +18,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 # shim 'sglang' (no torch) first on path, then the real plugin source dir.
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(HERE, "..", "..", "python"))  # <repo>/python
+sys.path.insert(0, os.path.join(HERE, "..", "..", "integration", "hicache"))  # <repo>/integration/hicache
 
 BUILD = os.environ.get("DFKV_BUILD", os.path.join(HERE, "..", "..", "build"))
 SERVER_BIN = os.path.join(BUILD, "dfkv_server")
