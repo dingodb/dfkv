@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cache/disk_cache_group.h"
+#include "cache/ram_tier.h"
 #include "utils/latency_hist.h"
 
 namespace dfkv {
@@ -103,6 +104,7 @@ class KvNodeServer {
  private:
   void AcceptLoop();
   void Handle(int fd);
+  void InitRamTier();     // construct ram_ if DFKV_RAM_TIER is enabled (env)
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
@@ -120,6 +122,12 @@ class KvNodeServer {
   std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
 
   DiskCacheGroup group_;
+  // Optional RAM hot tier (P3). Declared AFTER group_ so it is destroyed FIRST:
+  // ~RamTier stops+joins the flusher, whose callback calls group_.Cache, before
+  // group_ is torn down. nullptr unless DFKV_RAM_TIER is enabled. Write-through:
+  // PUT lands in RAM (sync-visible) + async-flushes to group_; GET checks RAM
+  // first (served from the arena) then falls back to group_.
+  std::unique_ptr<RamTier> ram_;
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};

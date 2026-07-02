@@ -1,6 +1,8 @@
 #include "cache/kv_node_server.h"
 
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include <vector>
@@ -22,13 +24,39 @@ inline double NowSec() {
 }  // namespace
 
 KvNodeServer::KvNodeServer(const std::string& cache_dir, uint64_t capacity_bytes)
-    : group_(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) {}
+    : group_(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) { InitRamTier(); }
 
 KvNodeServer::KvNodeServer(const std::vector<std::string>& cache_dirs,
                            uint64_t capacity_bytes)
-    : group_(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) {}
+    : group_(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) { InitRamTier(); }
 
-KvNodeServer::~KvNodeServer() { Stop(); }
+KvNodeServer::~KvNodeServer() {
+  // Order matters: Stop() first joins the accept + handler threads so no request
+  // is still reading ram_; THEN reset ram_ (stops+joins its flusher, whose
+  // callback calls group_.Cache -- group_ is a member, still alive here); group_
+  // is destroyed last, after this body.
+  Stop();
+  ram_.reset();
+}
+
+void KvNodeServer::InitRamTier() {
+  // Off by default. DFKV_RAM_TIER in {1,on,true,yes} enables the RAM hot tier;
+  // DFKV_RAM_TIER_BYTES sizes the pre-registered arena (default 4 GiB).
+  const char* e = std::getenv("DFKV_RAM_TIER");
+  if (!e || !*e) return;
+  const std::string v(e);
+  if (v != "1" && v != "on" && v != "true" && v != "yes") return;
+  RamTier::Options o;
+  if (const char* b = std::getenv("DFKV_RAM_TIER_BYTES")) {
+    unsigned long long n = std::strtoull(b, nullptr, 10);
+    if (n > 0) o.bytes = n;
+  }
+  // Flusher persists a RAM slot to the disk group (same bytes GET returns).
+  auto tier = std::make_unique<RamTier>(o, [this](const BlockKey& k, const void* d, size_t l) {
+    return group_.Cache(k, d, l) == Status::kOk;
+  });
+  if (tier->ok()) ram_ = std::move(tier);  // arena alloc failed => stay disk-only
+}
 
 Status KvNodeServer::Start(int port) {
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -191,6 +219,20 @@ std::string KvNodeServer::MetricsText() const {
     s += get_lat_.RenderBody("dfkv_op_latency_seconds", get_lbl);
     s += put_lat_.RenderBody("dfkv_op_latency_seconds", put_lbl);
   }
+  // RAM hot tier (P3), emitted only when enabled so a disk-only node's scrape is
+  // unchanged. ram_hit/ram_miss let you compute the RAM hit rate; ram_put_bypass
+  // is the flush-backpressure signal from the design's gap 10.3.
+  if (ram_) {
+    metric("dfkv_ram_hit_total", "counter", "GETs served from the RAM hot tier", ram_->Hits());
+    metric("dfkv_ram_miss_total", "counter", "GETs that missed RAM (fell to disk)", ram_->Misses());
+    metric("dfkv_ram_put_total", "counter", "PUTs accepted into the RAM hot tier", ram_->Puts());
+    metric("dfkv_ram_put_bypass_total", "counter", "PUTs bypassing RAM (flush backpressure)", ram_->PutBypass());
+    metric("dfkv_ram_flushed_total", "counter", "RAM slots flushed to disk (now durable)", ram_->Flushed());
+    metric("dfkv_ram_flush_dropped_total", "counter", "RAM slots dropped after flush failure", ram_->FlushDropped());
+    metric("dfkv_ram_evictions_total", "counter", "RAM slots evicted under capacity pressure", ram_->Evictions());
+    metric("dfkv_ram_objects", "gauge", "Blocks currently resident in the RAM hot tier", ram_->Count());
+    metric("dfkv_ram_flush_backlog", "gauge", "RAM slots queued for flush (not yet durable)", ram_->FlushBacklog());
+  }
   return s;
 }
 
@@ -230,12 +272,22 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
     case WireOp::kCache: {
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
-      st = group_.Cache(key, payload, payload_len);
-      if (st == Status::kOk) {
+      // Write-through RAM tier: on acceptance the value is synchronously visible
+      // in RAM (read-after-write) and flushed to disk in the background. On
+      // backpressure (arena full of un-flushed slots) Put declines and we take
+      // the normal disk path.
+      if (ram_ && ram_->Put(key, payload, payload_len)) {
+        st = Status::kOk;
         cache_put_.fetch_add(1, std::memory_order_relaxed);
         bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
-      } else if (st == Status::kIOError) {
-        put_io_err_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        st = group_.Cache(key, payload, payload_len);
+        if (st == Status::kOk) {
+          cache_put_.fetch_add(1, std::memory_order_relaxed);
+          bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
+        } else if (st == Status::kIOError) {
+          put_io_err_.fetch_add(1, std::memory_order_relaxed);
+        }
       }
       if (samp) put_lat_.Observe(NowSec() - t0);
       break;
@@ -243,27 +295,56 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
     case WireOp::kRange: {
       bool samp = lat_sampler_.ShouldSample();
       double t0 = samp ? NowSec() : 0.0;
-      st = group_.Range(key, offset, length, out_data);
-      if (st == Status::kOk) {
-        cache_hit_.fetch_add(1, std::memory_order_relaxed);
-        bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
-      } else if (st == Status::kNotFound) {
-        cache_miss_.fetch_add(1, std::memory_order_relaxed);
-      } else if (st == Status::kIOError) {
-        get_io_err_.fetch_add(1, std::memory_order_relaxed);
+      bool ram_served = false;
+      if (ram_) {  // RAM hot tier: serve straight from the arena (copy out), no disk
+        RamTier::Hit h;
+        if (ram_->GetPrep(key, offset, length, &h)) {
+          out_data->assign(h.ptr, h.len);
+          ram_->Release(h.token);
+          st = Status::kOk;
+          cache_hit_.fetch_add(1, std::memory_order_relaxed);
+          bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
+          ram_served = true;
+        }
+      }
+      if (!ram_served) {
+        st = group_.Range(key, offset, length, out_data);
+        if (st == Status::kOk) {
+          cache_hit_.fetch_add(1, std::memory_order_relaxed);
+          bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
+        } else if (st == Status::kNotFound) {
+          cache_miss_.fetch_add(1, std::memory_order_relaxed);
+        } else if (st == Status::kIOError) {
+          get_io_err_.fetch_add(1, std::memory_order_relaxed);
+        }
       }
       if (samp) get_lat_.Observe(NowSec() - t0);
       break;
     }
     case WireOp::kExist:
-      if (group_.IsCached(key)) { st = Status::kOk; exist_hit_.fetch_add(1, std::memory_order_relaxed); }
-      else { st = Status::kNotFound; exist_miss_.fetch_add(1, std::memory_order_relaxed); }
+      // A RAM-resident block (possibly RAM-only, not yet flushed) must count as
+      // present, else Exist would report absent for a just-written key.
+      if ((ram_ && ram_->Contains(key)) || group_.IsCached(key)) {
+        st = Status::kOk; exist_hit_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        st = Status::kNotFound; exist_miss_.fetch_add(1, std::memory_order_relaxed);
+      }
       break;
-    case WireOp::kRemove:
-      st = group_.Remove(key);
-      if (st == Status::kOk) remove_ok_.fetch_add(1, std::memory_order_relaxed);
-      else if (st == Status::kNotFound) remove_miss_.fetch_add(1, std::memory_order_relaxed);
+    case WireOp::kRemove: {
+      // Drop from both tiers. RamTier::Remove is best-effort (a still-flushing or
+      // in-flight slot declines and is reclaimed later under pressure); the L2
+      // eviction this backs targets durable blocks, which drop cleanly.
+      bool ram_had = ram_ && ram_->Remove(key);
+      Status ds = group_.Remove(key);
+      if (ram_had || ds == Status::kOk) {
+        st = Status::kOk; remove_ok_.fetch_add(1, std::memory_order_relaxed);
+      } else if (ds == Status::kNotFound) {
+        st = Status::kNotFound; remove_miss_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        st = ds;
+      }
       break;
+    }
     case WireOp::kStats:
       *out_data = MetricsText();
       st = Status::kOk;
@@ -288,6 +369,19 @@ Status KvNodeServer::RangeInto(uint64_t id, uint32_t index, uint32_t ksize,
   BlockKey key{id, index, ksize};
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
+  if (ram_) {
+    RamTier::Hit h;
+    if (ram_->GetPrep(key, offset, length, &h)) {  // RAM hit: copy out, no disk
+      size_t n = h.len < dst_cap ? h.len : dst_cap;
+      std::memcpy(dst, h.ptr, n);
+      ram_->Release(h.token);
+      if (out_len) *out_len = n;
+      cache_hit_.fetch_add(1, std::memory_order_relaxed);
+      bytes_read_.fetch_add(n, std::memory_order_relaxed);
+      if (samp) get_lat_.Observe(NowSec() - t0);
+      return Status::kOk;
+    }
+  }
   Status st = group_.RangeInto(key, offset, length, dst, dst_cap, out_len);
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
@@ -306,14 +400,23 @@ Status KvNodeServer::CacheDirect(uint64_t id, uint32_t index, uint32_t ksize,
   BlockKey key{id, index, ksize};
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
-  Status st = group_.CacheDirect(key, data, len, cap);
-  if (st == Status::kOk) {
+  // RAM write-through (same [ValueHeader|payload] blob GET returns); backpressure
+  // or disabled falls through to the O_DIRECT disk write.
+  Status st;
+  if (ram_ && ram_->Put(key, data, len)) {
+    st = Status::kOk;
     cache_put_.fetch_add(1, std::memory_order_relaxed);
     bytes_written_.fetch_add(len, std::memory_order_relaxed);
-  } else if (st == Status::kIOError) {
-    put_io_err_.fetch_add(1, std::memory_order_relaxed);
-  } else if (st == Status::kInvalid) {
-    invalid_ops_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    st = group_.CacheDirect(key, data, len, cap);
+    if (st == Status::kOk) {
+      cache_put_.fetch_add(1, std::memory_order_relaxed);
+      bytes_written_.fetch_add(len, std::memory_order_relaxed);
+    } else if (st == Status::kIOError) {
+      put_io_err_.fetch_add(1, std::memory_order_relaxed);
+    } else if (st == Status::kInvalid) {
+      invalid_ops_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
   if (samp) put_lat_.Observe(NowSec() - t0);
   return st;
@@ -326,6 +429,23 @@ Status KvNodeServer::RangeDirect(uint64_t id, uint32_t index, uint32_t ksize,
   BlockKey key{id, index, ksize};
   bool samp = lat_sampler_.ShouldSample();
   double t0 = samp ? NowSec() : 0.0;
+  if (ram_) {
+    RamTier::Hit h;
+    if (ram_->GetPrep(key, offset, length, &h)) {
+      // RAM hit: copy the value into the caller's registered io_buf so the RDMA
+      // layer scatter-sends it from there (no disk, no open, no pread). True
+      // zero-copy (send straight from the arena MR) is B5-3.
+      size_t n = h.len < io_cap ? h.len : io_cap;
+      std::memcpy(io_buf, h.ptr, n);
+      ram_->Release(h.token);
+      if (out_data) *out_data = io_buf;
+      if (out_len) *out_len = n;
+      cache_hit_.fetch_add(1, std::memory_order_relaxed);
+      bytes_read_.fetch_add(n, std::memory_order_relaxed);
+      if (samp) get_lat_.Observe(NowSec() - t0);
+      return Status::kOk;
+    }
+  }
   Status st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data, out_len);
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
@@ -343,6 +463,14 @@ Status KvNodeServer::RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize
                                      uint64_t offset, uint64_t length,
                                      size_t io_cap, KVStore::RangePrep* out) {
   BlockKey key{id, index, ksize};
+  // A RAM-resident key has no fd to hand io_uring (and may be RAM-only, not yet
+  // on disk). Decline the async prep (kInvalid) WITHOUT counting a miss so the
+  // RDMA serve loop falls back to the synchronous RangeDirect, which serves it
+  // from the arena. (Only reached when the RAM tier is enabled.)
+  if (ram_ && ram_->Contains(key)) {
+    if (out) *out = KVStore::RangePrep{};
+    return Status::kInvalid;
+  }
   Status st = group_.RangeDirectPrep(key, offset, length, io_cap, out);
   // Only miss/io-error are final here; a kOk prep is accounted on read completion
   // (RangeDirectComplete) because the async read can still fail.
