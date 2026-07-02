@@ -30,7 +30,7 @@ c_uint64 = ctypes.c_uint64
 c_uint32 = ctypes.c_uint32
 c_int = ctypes.c_int
 
-# dfkv geometry guard fields (src/value_header.h). Default 0 = no geometry guard;
+# dfkv geometry guard fields (src/common/value_header.h). Default 0 = no geometry guard;
 # isolation is by model_hash + key namespace. A KV pool sharing one model_hash
 # must share kv-cache-dtype / page-size / layout (see dfkv sharing-safety notes).
 _GEOMETRY_ZEROS = (0,) * 8

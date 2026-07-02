@@ -1,0 +1,291 @@
+// TDD R3 — KVStore: the cache-node local store (disk + LRU + cache-only/no-S3).
+#include "cache/kv_store.h"
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <thread>
+#include <vector>
+
+using dfkv::BlockKey;
+using dfkv::KVStore;
+using dfkv::Status;
+
+namespace fs = std::filesystem;
+
+class KVStoreTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir_ = fs::temp_directory_path() /
+           ("dfkv_store_" + std::to_string(::testing::UnitTest::GetInstance()
+                                               ->current_test_info()
+                                               ->line()));
+    fs::remove_all(dir_);
+    fs::create_directories(dir_);
+  }
+  void TearDown() override { fs::remove_all(dir_); }
+  KVStore::Options Opts(uint64_t cap = (1ull << 30), size_t shards = 16) {
+    return KVStore::Options{dir_.string(), cap, shards};
+  }
+  fs::path dir_;
+};
+
+TEST_F(KVStoreTest, CacheThenRangeRoundTripAndImmediateVisibility) {
+  KVStore s(Opts());
+  BlockKey k{111, 0, 1};
+  std::string v = "the-kv-bytes-0123456789";
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  // sync visibility: cached immediately after Cache() returns
+  EXPECT_TRUE(s.IsCached(k));
+  std::string out;
+  ASSERT_EQ(s.Range(k, 0, v.size(), &out), Status::kOk);
+  EXPECT_EQ(out, v);
+}
+
+TEST_F(KVStoreTest, RangeIntoReadsStraightIntoCallerBuffer) {
+  KVStore s(Opts());
+  BlockKey k{222, 0, 1};
+  std::string v = "zero-copy-server-side-payload-bytes";
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  char buf[64];
+  size_t got = 0;
+  ASSERT_EQ(s.RangeInto(k, 0, v.size(), buf, sizeof(buf), &got), Status::kOk);
+  EXPECT_EQ(got, v.size());
+  EXPECT_EQ(std::string(buf, got), v);
+  // miss => NotFound, out_len 0
+  got = 12345;
+  EXPECT_EQ(s.RangeInto(BlockKey{999, 0, 1}, 0, 64, buf, sizeof(buf), &got), Status::kNotFound);
+  EXPECT_EQ(got, 0u);
+  // dst_cap caps the read
+  ASSERT_EQ(s.RangeInto(k, 0, v.size(), buf, 4, &got), Status::kOk);
+  EXPECT_EQ(got, 4u);
+  EXPECT_EQ(std::string(buf, 4), v.substr(0, 4));
+}
+
+TEST_F(KVStoreTest, RangeDirectReturnsSliceInsideAlignedBuffer) {
+  KVStore s(Opts());
+  BlockKey k{333, 0, 1};
+  std::string v(9000, '\0');
+  for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>((i * 13 + 5) & 0xFF);
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+
+  void* raw = nullptr;
+  ASSERT_EQ(posix_memalign(&raw, 4096, 16 * 1024), 0);
+  char* io = static_cast<char*>(raw);
+  const char* data = nullptr;
+  size_t got = 0;
+  ASSERT_EQ(s.RangeDirect(k, 123, 5000, io, 16 * 1024, &data, &got), Status::kOk);
+  EXPECT_EQ(got, 5000u);
+  EXPECT_GE(data, io);
+  EXPECT_LT(data, io + 16 * 1024);
+  EXPECT_EQ(std::string(data, got), v.substr(123, 5000));
+  std::free(raw);
+}
+
+TEST_F(KVStoreTest, CacheDirectWritesAlignedBuffer) {
+  KVStore s(Opts());
+  BlockKey k{334, 0, 1};
+  std::string v(7000, '\0');
+  for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>((i * 17 + 9) & 0xFF);
+
+  void* raw = nullptr;
+  ASSERT_EQ(posix_memalign(&raw, 4096, 8192), 0);
+  char* io = static_cast<char*>(raw);
+  std::memcpy(io, v.data(), v.size());
+  ASSERT_EQ(s.CacheDirect(k, io, v.size(), 8192), Status::kOk);
+
+  std::string out;
+  ASSERT_EQ(s.Range(k, 0, v.size(), &out), Status::kOk);
+  EXPECT_EQ(out, v);
+  std::free(raw);
+}
+
+TEST_F(KVStoreTest, RangeMissReturnsNotFoundNoS3) {
+  KVStore s(Opts());
+  std::string out;
+  EXPECT_EQ(s.Range(BlockKey{404, 0, 1}, 0, 16, &out), Status::kNotFound);
+  EXPECT_FALSE(s.IsCached(BlockKey{404, 0, 1}));
+}
+
+TEST_F(KVStoreTest, IdempotentCacheSkipsRewrite) {
+  KVStore s(Opts());
+  BlockKey k{7, 0, 1};
+  std::string v = "abc";
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);  // second is a no-op skip
+  EXPECT_EQ(s.Count(), 1u);
+}
+
+TEST_F(KVStoreTest, PartialRange) {
+  KVStore s(Opts());
+  BlockKey k{9, 0, 1};
+  std::string v = "0123456789";
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  std::string out;
+  ASSERT_EQ(s.Range(k, 3, 4, &out), Status::kOk);
+  EXPECT_EQ(out, "3456");
+}
+
+TEST_F(KVStoreTest, LargeObjectOver128KiBLocalRead) {
+  KVStore s(Opts());
+  BlockKey k{42, 0, 1};
+  std::string v(300 * 1024, 'x');  // >128KiB: no max_range_size cap on local path
+  v[123456] = 'Z';
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  std::string out;
+  ASSERT_EQ(s.Range(k, 0, v.size(), &out), Status::kOk);
+  EXPECT_EQ(out, v);
+}
+
+TEST_F(KVStoreTest, LruEvictsLeastRecentlyUsedWhenOverCapacity) {
+  // capacity holds ~2 objects of 1000B. shards=1 so all keys share one stripe and
+  // eviction is the strict single-shard CLOCK (a touched entry gets a second
+  // chance); with the default 16 shards these 3 keys would land in different
+  // stripes and per-shard capacity (2200/16) couldn't hold even one object.
+  KVStore s(Opts(/*cap=*/2200, /*shards=*/1));
+  auto put = [&](uint64_t id) {
+    std::string v(1000, char('a' + (id % 20)));
+    return s.Cache(BlockKey{id, 0, 1}, v.data(), v.size());
+  };
+  ASSERT_EQ(put(1), Status::kOk);
+  ASSERT_EQ(put(2), Status::kOk);
+  // touch #1 so #2 becomes LRU
+  std::string out; ASSERT_EQ(s.Range(BlockKey{1,0,1}, 0, 10, &out), Status::kOk);
+  ASSERT_EQ(put(3), Status::kOk);  // over capacity -> evict LRU (#2)
+  EXPECT_TRUE(s.IsCached(BlockKey{1, 0, 1}));
+  EXPECT_FALSE(s.IsCached(BlockKey{2, 0, 1}));
+  EXPECT_TRUE(s.IsCached(BlockKey{3, 0, 1}));
+  EXPECT_LE(s.UsedBytes(), 2200u);
+  // eviction counters tracked the one evicted 1000-byte object
+  EXPECT_EQ(s.Evictions(), 1u);
+  EXPECT_EQ(s.EvictedBytes(), 1000u);
+}
+
+// All-hot eviction: every resident entry is marked referenced right before each
+// new insert. The persistent CLOCK hand must still make progress — clear a cycle
+// of reference bits, then evict — and keep usage bounded. A naive guard could
+// loop forever (always finds a referenced entry) or let the shard grow without
+// bound; this pins that it does neither.
+TEST_F(KVStoreTest, EvictsUnderAllReferencedPressure) {
+  const uint64_t obj = 1000, cap = 5500;  // ~5 objects fit in one shard
+  KVStore s(Opts(cap, /*shards=*/1));
+  auto put = [&](uint64_t id) {
+    std::string v(obj, char('a' + (id % 20)));
+    return s.Cache(BlockKey{id, 0, 1}, v.data(), v.size());
+  };
+  auto touch = [&](uint64_t id) {
+    std::string out;
+    s.Range(BlockKey{id, 0, 1}, 0, 8, &out);  // sets the CLOCK bit if resident
+  };
+  for (uint64_t id = 1; id <= 40; ++id) {
+    for (uint64_t j = (id > 8 ? id - 8 : 1); j < id; ++j) touch(j);  // make all hot
+    ASSERT_EQ(put(id), Status::kOk) << "id=" << id;
+    EXPECT_LE(s.UsedBytes(), cap) << "id=" << id;  // eviction kept usage bounded
+  }
+  EXPECT_TRUE(s.IsCached(BlockKey{40, 0, 1}));  // the newest insert survives
+}
+
+TEST_F(KVStoreTest, ReloadFromDiskRebuildsIndex) {
+  BlockKey k{55, 0, 1};
+  std::string v = "persisted";
+  {
+    KVStore s(Opts());
+    ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  }
+  KVStore s2(Opts());  // new instance, same dir
+  EXPECT_TRUE(s2.IsCached(k));
+  std::string out;
+  ASSERT_EQ(s2.Range(k, 0, v.size(), &out), Status::kOk);
+  EXPECT_EQ(out, v);
+}
+
+// Stress the sharded index under concurrency: many keys spread over the default
+// 16 stripes, written then read back from 8 threads each. Writers take the
+// exclusive per-shard lock, readers the shared one; correctness here (every
+// reader hits every key with the right bytes) plus a clean TSan run validate the
+// shared_mutex + CLOCK-bit access pattern. 1 GiB cap => no eviction interferes.
+TEST_F(KVStoreTest, ConcurrentShardedReadWrite) {
+  KVStore s(Opts());  // default 16 shards, 1 GiB capacity
+  const int N = 256;
+  auto val = [](int i) { return std::string(300, static_cast<char>('a' + (i % 26))); };
+
+  {  // concurrent writers, interleaved keys across threads (and thus shards)
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 8; ++t)
+      ts.emplace_back([&, t] {
+        for (int i = t; i < N; i += 8) {
+          std::string v = val(i);
+          EXPECT_EQ(s.Cache(BlockKey{static_cast<uint64_t>(i), 0, 1}, v.data(), v.size()),
+                    Status::kOk);
+        }
+      });
+    for (auto& th : ts) th.join();
+  }
+  EXPECT_EQ(s.Count(), static_cast<size_t>(N));
+
+  {  // concurrent readers (shared lock): every thread reads every key correctly
+    std::atomic<int> hits{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 8; ++t)
+      ts.emplace_back([&] {
+        for (int i = 0; i < N; ++i) {
+          std::string out;
+          if (s.Range(BlockKey{static_cast<uint64_t>(i), 0, 1}, 0, 300, &out) == Status::kOk &&
+              out == val(i))
+            hits.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    for (auto& th : ts) th.join();
+    EXPECT_EQ(hits.load(), N * 8);
+  }
+}
+
+TEST_F(KVStoreTest, RemoveDropsBlockReclaimsBytesAndIsIdempotent) {
+  KVStore s(Opts());
+  BlockKey k{555, 0, 1};
+  std::string v = "remove-me-payload-bytes";
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  ASSERT_TRUE(s.IsCached(k));
+  ASSERT_EQ(s.UsedBytes(), v.size());
+
+  EXPECT_EQ(s.Remove(k), Status::kOk);
+  EXPECT_FALSE(s.IsCached(k));
+  EXPECT_EQ(s.UsedBytes(), 0u);
+  EXPECT_EQ(s.Count(), 0u);
+
+  // Removing an absent key is a clean kNotFound (idempotent re-remove too).
+  EXPECT_EQ(s.Remove(k), Status::kNotFound);
+  EXPECT_EQ(s.Remove(BlockKey{556, 0, 1}), Status::kNotFound);
+
+  // Eviction counters are untouched by an explicit Remove (distinct from
+  // capacity eviction).
+  EXPECT_EQ(s.Evictions(), 0u);
+
+  // The key is re-cacheable after removal (file path freed, index slot reusable).
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  EXPECT_TRUE(s.IsCached(k));
+  EXPECT_EQ(s.UsedBytes(), v.size());
+}
+
+TEST_F(KVStoreTest, RemoveKeepsClockHandValidUnderManyKeys) {
+  // shards=1 forces all keys into one CLOCK ring so Remove must keep the
+  // persistent eviction hand valid; interleave removes with caches and verify
+  // the store stays consistent (no crash / stale index).
+  KVStore s(Opts(1ull << 30, 1));
+  std::string v(64, 'x');
+  for (uint64_t i = 0; i < 64; ++i)
+    ASSERT_EQ(s.Cache(BlockKey{i, 0, 1}, v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(s.Count(), 64u);
+  for (uint64_t i = 0; i < 64; i += 2)  // remove every other key
+    EXPECT_EQ(s.Remove(BlockKey{i, 0, 1}), Status::kOk);
+  EXPECT_EQ(s.Count(), 32u);
+  for (uint64_t i = 0; i < 64; ++i)
+    EXPECT_EQ(s.IsCached(BlockKey{i, 0, 1}), (i % 2 == 1));
+  // The survivors are still readable and a fresh cache still evicts correctly.
+  std::string out;
+  EXPECT_EQ(s.Range(BlockKey{1, 0, 1}, 0, 64, &out), Status::kOk);
+}

@@ -58,7 +58,7 @@ io_uring buffer）。dfkv 没有这个限制，能存任意大小的 value，所
 
 **关键难点：dfkv 的 GET 是精确大小匹配的。** 每个 value 在 dfkv 里存为
 `[48B ValueHeader | payload]`，`KVClient::Get` 只有当 `payload_len == 调用方请求的 n`
-且 geometry 头匹配时才算命中（见 [../../src/kv_client.cc](../../src/kv_client.cc) 的 `Get`/`BatchGet`）。
+且 geometry 头匹配时才算命中（见 [../../src/client/kv_client.cc](../../src/client/kv_client.cc) 的 `Get`/`BatchGet`）。
 而 LMCache 会存**变长的不满（unfull）末块**：一个请求最后一个 chunk 的 token 数 < chunk_size，
 字节数也更小。若用满块大小 `full_chunk_size_bytes` 去 GET 这种不满块，`payload_len != n`
 会被判为 miss，导致不满块永远读不回。
@@ -67,9 +67,9 @@ io_uring buffer）。dfkv 没有这个限制，能存任意大小的 value，所
 （从存储头里读出真实 `payload_len`），新增：
 
 - C++：`KVClient::GetAuto(key, out, cap, *out_len)` 与 `KVClient::BatchGetAuto(items, *out_lens)`
-  （[../../src/kv_client.h](../../src/kv_client.h) / [.cc](../../src/kv_client.cc)）。
+  （[../../src/client/kv_client.h](../../src/client/kv_client.h) / [.cc](../../src/client/kv_client.cc)）。
 - C ABI：`dfkv_get_auto` / `dfkv_batch_get_auto`
-  （[../../src/dfkv_c_api.h](../../src/dfkv_c_api.h) / [.cc](../../src/dfkv_c_api.cc)）。
+  （[../../src/client/dfkv_c_api.h](../../src/client/dfkv_c_api.h) / [.cc](../../src/client/dfkv_c_api.cc)）。
 
 `BatchGetAuto` 复用 `BatchGet` 的 **RDMA 零拷贝 `RangeInto` 路径**：把每个 buffer 容量当作
 请求长度，server 返回真实 `[header|payload]`（payload 可能更短），`RangeInto` 把 payload 零拷贝

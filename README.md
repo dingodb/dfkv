@@ -82,7 +82,9 @@ Per-engine connect/config: `docs/hicache/DEPLOY.md` · `docs/vllm/DEPLOY.md` · 
 
 ## Layout
 ```
-src/        portable C++ core (headers + .cc) + dfkv_server_main.cc + dfkv_mds_main.cc
+src/        portable C++ core: common/ (shared types) · utils/ (generic helpers) ·
+            transport/ (TCP/RDMA + wire protocol) · cache/ (storage engine + dfkv_server) ·
+            client/ (KV client + C ABI) · mds/ (membership service + dfkv_mds) · tools/ (CLIs)
 python/     dfkv_hicache.py  (SGLang dynamic backend plugin)
 integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libdfkv.so)
 integration/vllm/     dfkv_vllm       (vLLM KVConnectorBase_V1, GPUDirect RDMA, bypass LMCache)

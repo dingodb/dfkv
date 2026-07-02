@@ -32,27 +32,18 @@ if(DFKV_WITH_URING)
 endif()
 
 # --- portable core library (everything in src/ except *_main.cc + gated rdma) ---
-file(GLOB DFKV_SRCS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc)
-list(REMOVE_ITEM DFKV_SRCS
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_server_main.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_smoke_main.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkvctl_main.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_bench_main.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_mds_main.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_discover_smoke_main.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_verbs.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_transport.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_server.cc)
-if(DFKV_WITH_RDMA)
-  list(APPEND DFKV_SRCS
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_verbs.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_transport.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_server.cc)
+file(GLOB_RECURSE DFKV_SRCS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc)
+list(FILTER DFKV_SRCS EXCLUDE REGEX "_main\\.cc$")
+if(NOT DFKV_WITH_RDMA)
+  list(REMOVE_ITEM DFKV_SRCS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/rdma_verbs.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/rdma_transport.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cache/rdma_server.cc)
 endif()
 
 add_library(dfkv_core STATIC ${DFKV_SRCS})
 target_include_directories(dfkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(dfkv_core PRIVATE _GNU_SOURCE  # O_DIRECT/fallocate in kv_store.cc
+target_compile_definitions(dfkv_core PRIVATE _GNU_SOURCE  # O_DIRECT/fallocate in src/cache/kv_store.cc
   DFKV_VERSION="${PROJECT_VERSION}")
 find_package(Threads REQUIRED)
 target_link_libraries(dfkv_core PUBLIC Threads::Threads)
@@ -68,7 +59,7 @@ endif()
 # C ABI shared lib for the Python (ctypes) plugin
 add_library(dfkv SHARED ${DFKV_SRCS})
 target_include_directories(dfkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(dfkv PRIVATE _GNU_SOURCE  # O_DIRECT/fallocate in kv_store.cc
+target_compile_definitions(dfkv PRIVATE _GNU_SOURCE  # O_DIRECT/fallocate in src/cache/kv_store.cc
   DFKV_VERSION="${PROJECT_VERSION}")
 target_link_libraries(dfkv PUBLIC Threads::Threads)
 if(DFKV_WITH_RDMA)
@@ -80,18 +71,18 @@ if(DFKV_WITH_URING)
   target_link_libraries(dfkv PUBLIC ${URING_LIB})
 endif()
 
-# standalone cache-node daemon + CLI tools
-add_executable(dfkv_server ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_server_main.cc)
+# daemons (entry points live with their subsystems) + CLI tools
+add_executable(dfkv_server ${CMAKE_CURRENT_SOURCE_DIR}/src/cache/dfkv_server_main.cc)
 target_link_libraries(dfkv_server PRIVATE dfkv_core)
-add_executable(dfkv_mds ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_mds_main.cc)
+add_executable(dfkv_mds ${CMAKE_CURRENT_SOURCE_DIR}/src/mds/dfkv_mds_main.cc)
 target_link_libraries(dfkv_mds PRIVATE dfkv_core)
-add_executable(dfkv_smoke ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_smoke_main.cc)
+add_executable(dfkv_smoke ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_smoke_main.cc)
 target_link_libraries(dfkv_smoke PRIVATE dfkv_core)
-add_executable(dfkvctl ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkvctl_main.cc)
+add_executable(dfkvctl ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkvctl_main.cc)
 target_link_libraries(dfkvctl PRIVATE dfkv_core)
-add_executable(dfkv_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_bench_main.cc)
+add_executable(dfkv_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_bench_main.cc)
 target_link_libraries(dfkv_bench PRIVATE dfkv_core)
-add_executable(dfkv_discover_smoke ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_discover_smoke_main.cc)
+add_executable(dfkv_discover_smoke ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_discover_smoke_main.cc)
 target_link_libraries(dfkv_discover_smoke PRIVATE dfkv_core)
 
 include(GNUInstallDirs)
@@ -124,9 +115,9 @@ if(DFKV_BUILD_TESTS)
   FetchContent_MakeAvailable(googletest)
   include(GoogleTest)
 
-  file(GLOB DFKV_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cc)
+  file(GLOB_RECURSE DFKV_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cc)
   # rdma_loopback_test needs the RDMA transport/server symbols -> RDMA build only.
-  list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdma_loopback_test.cc)
+  list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/transport/rdma_loopback_test.cc)
   foreach(t ${DFKV_TESTS})
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
@@ -134,7 +125,7 @@ if(DFKV_BUILD_TESTS)
     gtest_discover_tests(${name})
   endforeach()
   if(DFKV_WITH_RDMA)  # exercised in CI under Soft-RoCE (rdma_rxe); skips if no device
-    add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdma_loopback_test.cc)
+    add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/transport/rdma_loopback_test.cc)
     target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
     gtest_discover_tests(rdma_loopback_test)
   endif()

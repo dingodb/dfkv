@@ -90,12 +90,12 @@ integration/lmcache/
 
 为支持变长读，给 dfkv C ABI 增加变长 get（其余 dfkv 核心不动）：
 
-- [../../src/kv_client.h](../../src/kv_client.h) / [.cc](../../src/kv_client.cc)：
+- [../../src/client/kv_client.h](../../src/client/kv_client.h) / [.cc](../../src/client/kv_client.cc)：
   - `bool GetAuto(key, void* out, size_t cap, size_t* out_len)` —— 仿已有 string 版 `GetAuto`，
     `Range(0, kSize+cap)` → 解析头 → `HeaderMatches` → 校验 `payload_len<=cap` → memcpy + 回填真实长度。
   - `std::vector<bool> BatchGetAuto(items, out_lens)` —— TCP 走逐项 `GetAuto`；RDMA 仿 `BatchGet`
     的 `RangeInto` 零拷贝路径，按 (node,cap) 分组，接受任意 `payload_len<=cap` 并回填 `out_lens`。
-- [../../src/dfkv_c_api.h](../../src/dfkv_c_api.h) / [.cc](../../src/dfkv_c_api.cc)：
+- [../../src/client/dfkv_c_api.h](../../src/client/dfkv_c_api.h) / [.cc](../../src/client/dfkv_c_api.cc)：
   - `int dfkv_get_auto(c, key, ptr, cap, *out_len)` —— 1=命中/0=未命中。
   - `int dfkv_batch_get_auto(c, keys, ptrs, caps, n, out_hit, out_len)` —— 仿 `dfkv_batch_get` 的
     空指针保护，转调 `BatchGetAuto`。

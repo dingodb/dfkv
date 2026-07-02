@@ -1,0 +1,168 @@
+// TDD R11 — server metrics counters + Prometheus text + remote Stats op.
+#include "cache/kv_node_server.h"
+#include "client/key_map.h"
+#include "utils/net_util.h"
+#include "transport/tcp_transport.h"
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <thread>
+#include <unistd.h>
+
+#include <filesystem>
+#include <memory>
+#include <string>
+
+namespace fs = std::filesystem;
+using namespace dfkv;  // NOLINT
+
+namespace {
+std::unique_ptr<KvNodeServer> Start(fs::path dir, std::string* addr) {
+  fs::remove_all(dir); fs::create_directories(dir);
+  auto s = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
+  EXPECT_EQ(s->Start(0), Status::kOk);
+  *addr = "127.0.0.1:" + std::to_string(s->port());
+  return s;
+}
+}  // namespace
+
+TEST(Metrics, CountersTrackOps) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_a";
+  auto s = Start(dir, &addr);
+  TcpTransport t;
+  std::string v(100, 'm');
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("a"), v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("b"), v.data(), v.size()), Status::kOk);
+  std::string out;
+  ASSERT_EQ(t.Range(addr, ToBlockKey("a"), 0, v.size(), &out), Status::kOk);   // hit
+  ASSERT_EQ(t.Range(addr, ToBlockKey("zzz"), 0, 8, &out), Status::kNotFound);  // miss
+  bool e = false;
+  ASSERT_EQ(t.Exist(addr, ToBlockKey("a"), &e), Status::kOk); EXPECT_TRUE(e);   // exist hit
+  ASSERT_EQ(t.Exist(addr, ToBlockKey("nope"), &e), Status::kOk); EXPECT_FALSE(e); // exist miss
+
+  EXPECT_EQ(s->m_cache_put(), 2u);
+  EXPECT_EQ(s->m_cache_hit(), 1u);
+  EXPECT_EQ(s->m_cache_miss(), 1u);
+  EXPECT_EQ(s->m_exist_hit(), 1u);
+  EXPECT_EQ(s->m_exist_miss(), 1u);
+
+  std::string text = s->MetricsText();
+  EXPECT_NE(text.find("dfkv_cache_hit_total 1"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_cache_put_total 2"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_objects 2"), std::string::npos) << text;
+  s->Stop();
+}
+
+TEST(Metrics, PrometheusFormatAndIdentity) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_c";
+  auto s = Start(dir, &addr);
+  s->set_identity("n1", "g1");
+  std::string text = s->MetricsText();
+  // HELP/TYPE metadata present
+  EXPECT_NE(text.find("# TYPE dfkv_cache_hit_total counter"), std::string::npos) << text;
+  EXPECT_NE(text.find("# TYPE dfkv_used_bytes gauge"), std::string::npos) << text;
+  // identity labels applied to series
+  EXPECT_NE(text.find("dfkv_cache_hit_total{node=\"n1\",group=\"g1\"} 0"), std::string::npos) << text;
+  // build_info + uptime present
+  EXPECT_NE(text.find("dfkv_build_info{"), std::string::npos) << text;
+  EXPECT_NE(text.find("version=\""), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_uptime_seconds"), std::string::npos) << text;
+  s->Stop();
+}
+
+TEST(Metrics, LabelValuesAreEscaped) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_esc";
+  auto s = Start(dir, &addr);
+  s->set_identity("n\"1", "g\\x");  // identity with a quote + backslash
+  std::string text = s->MetricsText();
+  // raw `n"1` would break the scrape; must appear escaped
+  EXPECT_NE(text.find("node=\"n\\\"1\",group=\"g\\\\x\""), std::string::npos) << text;
+  EXPECT_EQ(text.find("node=\"n\"1\""), std::string::npos) << "unescaped quote leaked";
+  s->Stop();
+}
+
+TEST(Metrics, NoIdentityKeepsUnlabeledSeries) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_d";
+  auto s = Start(dir, &addr);  // no set_identity
+  std::string text = s->MetricsText();
+  // back-compat: bare metric line, no label braces
+  EXPECT_NE(text.find("dfkv_cache_hit_total 0"), std::string::npos) << text;
+  s->Stop();
+}
+
+TEST(Metrics, DepthSeriesPresent) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_e";
+  auto s = Start(dir, &addr);
+  TcpTransport t;
+  std::string v(100, 'q');
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("a"), v.data(), v.size()), Status::kOk);
+  std::string out;
+  ASSERT_EQ(t.Range(addr, ToBlockKey("a"), 0, v.size(), &out), Status::kOk);
+  std::string text = s->MetricsText();
+  EXPECT_NE(text.find("# TYPE dfkv_op_latency_seconds histogram"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_op_latency_seconds_count{op=\"get\"}"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_op_latency_seconds_count{op=\"put\"}"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_evictions_total"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_open_connections"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_errors_total{op=\"get\",status=\"io\"}"), std::string::npos) << text;
+  EXPECT_NE(text.find("dfkv_disk_used_bytes{disk="), std::string::npos) << text;
+  s->Stop();
+}
+
+TEST(Metrics, OpenConnectionsTracksLiveConn) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_f";
+  auto s = Start(dir, &addr);
+  {
+    TcpTransport t;  // pooled keep-alive connection held open for this scope
+    std::string out;
+    ASSERT_EQ(t.Range(addr, ToBlockKey("x"), 0, 1, &out), Status::kNotFound);
+    // a connection is open while the pooled fd lives
+    EXPECT_NE(s->MetricsText().find("dfkv_open_connections"), std::string::npos);
+  }  // transport destructor closes the pooled fd; server-side handler exits
+  s->Stop();
+}
+
+TEST(Metrics, ReapsConnHandlerThreads) {
+  // Short-lived client connections (connect + immediate close) each spawn a
+  // handler thread that exits on peer-close. Reaping at accept time must keep the
+  // unreaped handler-thread list bounded, not growing ~1 per connection.
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_reap";
+  auto s = Start(dir, &addr);
+  for (int i = 0; i < 80; ++i) {
+    int fd = net::Dial(addr, 1000, 1000);
+    ASSERT_GE(fd, 0);
+    ::close(fd);  // peer close -> handler's ReadAll fails -> handler exits
+  }
+  // Reaping fires on accept; nudge a few more + poll until it drains.
+  size_t live = 999;
+  for (int r = 0; r < 40; ++r) {
+    int fd = net::Dial(addr, 1000, 1000);
+    if (fd >= 0) ::close(fd);
+    live = s->live_conn_count();
+    if (live <= 5) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  EXPECT_LE(live, 5u) << "conn handler threads not reaped";
+  s->Stop();
+}
+
+TEST(Metrics, RemoteStatsOp) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_b";
+  auto s = Start(dir, &addr);
+  TcpTransport t;
+  std::string v(50, 'x');
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("k"), v.data(), v.size()), Status::kOk);
+  std::string text;
+  ASSERT_EQ(t.Stats(addr, &text), Status::kOk);
+  EXPECT_NE(text.find("dfkv_cache_put_total 1"), std::string::npos) << text;
+  s->Stop();
+}

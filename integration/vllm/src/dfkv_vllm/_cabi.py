@@ -2,7 +2,7 @@
 
 Self-contained: declares only the symbols the vLLM connector uses, so this
 package does not depend on the LMCache integration package. Symbol signatures
-mirror ``src/dfkv_c_api.h``.
+mirror ``src/client/dfkv_c_api.h``.
 
 The library is found via (highest precedence first):
   1. explicit ``lib_path`` argument
