@@ -500,8 +500,24 @@ void RdmaServer::Serve(int boot_fd) {
         // If the batch infrastructure fails, fall back to a synchronous pread per
         // deferred request in the emit pass below (correctness-first).
         bool batch_ok = true;
-        if (!descs.empty())
+        if (!descs.empty()) {
           batch_ok = ring.BatchRead(descs.data(), static_cast<int>(descs.size()));
+          // A failed batch may have left async reads in flight against the
+          // recv-slot dbufs. Drain (reap-and-discard) until the kernel is done
+          // with them BEFORE the emit pass touches those buffers: the sync
+          // pread fallback and the recv rearm would otherwise race the kernel's
+          // writes and put mixed-generation bytes on the wire — undetectable by
+          // the client (ValueHeader carries no CRC; RDMA ICRC only covers the
+          // network). If the drain itself times out the buffers still belong to
+          // the kernel: the only safe move is to drop the connection while the
+          // endpoint (and its registered buffers) is still alive; the client
+          // re-dials. Once poisoned, later BatchRead calls return false without
+          // submitting, so the connection continues on the sync fallback.
+          if (!batch_ok && !ring.Drain()) {
+            fail = true;
+            break;  // un-emitted queue entries' fds are closed by the teardown below
+          }
+        }
 
         // Emit every reply in STRICT arrival order (every read is now complete,
         // so an async reply never trails a later request's reply).
