@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """dfkv connector telemetry — shared, single-source-of-truth package.
 
-Canonical source lives in ``python/dfkv_telemetry/`` and is shipped with the
-SGLang plugin via CMake ``install(FILES ...)``; the vLLM and LMCache pip
-connectors vendor a byte-identical copy (guarded by a drift test). Keep it
-pure-python and 3.9-compatible.
+Canonical source lives in ``integration/hicache/dfkv_telemetry/`` and is
+shipped with the SGLang plugin via CMake ``install(FILES ...)``; the vLLM and
+LMCache pip connectors vendor a byte-identical copy (guarded by a drift test).
+Keep it pure-python and 3.9-compatible.
 
 Subpackages:
   config        env/extra_config resolution + connector identity

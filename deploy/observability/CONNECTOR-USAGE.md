@@ -25,7 +25,7 @@ dfkv_server / dfkv_mds  <--Prometheus pull (/metrics)---------/        ^
 |---|---|---|---|---|
 | vLLM | `dfkv-vllm` | `vllm` | `--kv-transfer-config` | **仅环境变量** |
 | LMCache | `dfkv-connector` | `lmcache` | LMCache yaml `remote_storage_plugins` | **仅环境变量** |
-| SGLang HiCache | dfkv 仓库内 `python/dfkv_hicache.py` | `hicache` | `--hicache-storage-backend dynamic` | **extra_config 或环境变量**(extra_config 优先) |
+| SGLang HiCache | dfkv 仓库内 `integration/hicache/dfkv_hicache.py` | `hicache` | `--hicache-storage-backend dynamic` | **extra_config 或环境变量**(extra_config 优先) |
 
 ---
 
@@ -138,7 +138,7 @@ export DFKV_CONNECTOR_ID=lmcache-node1          # 可选
 
 ---
 
-## 4. SGLang HiCache 连接器(`python/dfkv_hicache.py`)
+## 4. SGLang HiCache 连接器(`integration/hicache/dfkv_hicache.py`)
 
 ### 4.1 接入引擎
 SGLang 通过 `--hicache-storage-backend dynamic` 加载,**所有配置走 `extra_config`**

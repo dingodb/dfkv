@@ -9,7 +9,7 @@ import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "..", "python"))  # <repo>/python
+sys.path.insert(0, os.path.join(HERE, "..", "..", "integration", "hicache"))  # <repo>/integration/hicache
 
 import dfkv_telemetry  # noqa: E402
 from dfkv_telemetry import config, metrics, tracing  # noqa: E402

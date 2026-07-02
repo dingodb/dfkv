@@ -118,10 +118,10 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`，跑连接器 smoke，确认
 
 ## 实现位置
 
-- [python/dfkv_telemetry/tracing.py](../python/dfkv_telemetry/tracing.py) — `configure()` / `span()` 上下文管理器、noop 单例、采样判定、span 组装。
-- [python/dfkv_telemetry/otlp_traces.py](../python/dfkv_telemetry/otlp_traces.py) — 纯 stdlib OTLP/HTTP-JSON traces 导出器（有界缓冲 + 后台批量 POST）。
-- [python/dfkv_telemetry/config.py](../python/dfkv_telemetry/config.py) — 追踪开关 / 阈值的 env+extra_config 解析（`tracing_enabled`）。
-- 连接器接线：[python/dfkv_hicache.py](../python/dfkv_hicache.py)、[integration/vllm/src/dfkv_vllm/dfkv_client.py](../integration/vllm/src/dfkv_vllm/dfkv_client.py)、[integration/lmcache/src/dfkv_connector/native_client.py](../integration/lmcache/src/dfkv_connector/native_client.py)。
+- [integration/hicache/dfkv_telemetry/tracing.py](../integration/hicache/dfkv_telemetry/tracing.py) — `configure()` / `span()` 上下文管理器、noop 单例、采样判定、span 组装。
+- [integration/hicache/dfkv_telemetry/otlp_traces.py](../integration/hicache/dfkv_telemetry/otlp_traces.py) — 纯 stdlib OTLP/HTTP-JSON traces 导出器（有界缓冲 + 后台批量 POST）。
+- [integration/hicache/dfkv_telemetry/config.py](../integration/hicache/dfkv_telemetry/config.py) — 追踪开关 / 阈值的 env+extra_config 解析（`tracing_enabled`）。
+- 连接器接线：[integration/hicache/dfkv_hicache.py](../integration/hicache/dfkv_hicache.py)、[integration/vllm/src/dfkv_vllm/dfkv_client.py](../integration/vllm/src/dfkv_vllm/dfkv_client.py)、[integration/lmcache/src/dfkv_connector/native_client.py](../integration/lmcache/src/dfkv_connector/native_client.py)。
 - 单测：[tests/python/test_dfkv_telemetry.py](../tests/python/test_dfkv_telemetry.py)（`Tracing*` / `OtlpTraces*` 用例）。
 
 > vLLM / LMCache 连接器各自 vendor 一份逐字节一致的 `_telemetry` 副本（含 `tracing.py`/`otlp_traces.py`），

@@ -20,7 +20,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)                                   # shim 'sglang' + FakeMlaPool
-sys.path.insert(0, os.path.join(HERE, "..", "..", "python"))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "integration", "hicache"))
 os.environ.setdefault("DFKV_BUILD", os.path.join(HERE, "..", "..", "build"))
 
 import numpy as np  # noqa: E402

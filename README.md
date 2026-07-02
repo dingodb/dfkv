@@ -30,7 +30,7 @@ three engines through thin adapters over one portable core:
   MDS and fail over automatically.
 - **`libdfkv.so`** — C ABI client (key→consistent-hash routing, value header with
   CRC + model/page/dtype/layer geometry guard, Put/Get/Exist).
-- **`python/dfkv_hicache.py`** — SGLang `HiCacheStorage` plugin loaded via
+- **`integration/hicache/dfkv_hicache.py`** — SGLang `HiCacheStorage` plugin loaded via
   `--hicache-storage-backend dynamic` (no SGLang fork). MLA: one packed-latent
   object per page, no tp_rank suffix, `backup_skip` (only tp_rank 0 writes).
 
@@ -85,7 +85,8 @@ Per-engine connect/config: `docs/hicache/DEPLOY.md` · `docs/vllm/DEPLOY.md` · 
 src/        portable C++ core: common/ (shared types) · utils/ (generic helpers) ·
             transport/ (TCP/RDMA + wire protocol) · cache/ (storage engine + dfkv_server) ·
             client/ (KV client + C ABI) · mds/ (membership service + dfkv_mds) · tools/ (CLIs)
-python/     dfkv_hicache.py  (SGLang dynamic backend plugin)
+integration/hicache/  dfkv_hicache.py (SGLang dynamic backend plugin) + dfkv_telemetry/
+                      (canonical shared telemetry pkg, vendored by the other connectors)
 integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libdfkv.so)
 integration/vllm/     dfkv_vllm       (vLLM KVConnectorBase_V1, GPUDirect RDMA, bypass LMCache)
 tests/      gtest suites + tests/python (unittest + no-torch sglang shim)
@@ -96,7 +97,7 @@ docs/vllm/     vLLM connector docs (DEPLOY — config reference + recommended se
 ```
 
 ## Engine integrations
-- **SGLang HiCache**: `python/dfkv_hicache.py` — see `docs/hicache/DEPLOY.md` (connect/config/use;
+- **SGLang HiCache**: `integration/hicache/dfkv_hicache.py` — see `docs/hicache/DEPLOY.md` (connect/config/use;
   cluster deploy is `docs/DEPLOY.md`).
 - **LMCache**: `integration/lmcache/` (`dfkv_connector`) — see `docs/lmcache/DESIGN.md`,
   `docs/lmcache/IMPLEMENTATION.md`, `docs/lmcache/DEPLOY.md`.
