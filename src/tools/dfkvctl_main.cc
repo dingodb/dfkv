@@ -47,7 +47,11 @@ static bool QueryMembers(const std::string& mds, const std::string& group,
   MdsMemberPoller poller(eps, group,
                          [&](const std::vector<MemberInfo>& ms) { *out = ms; got = true; },
                          1000, 2000);
-  poller.PollOnce();
+  // Try up to one full round of the endpoint list: PollOnce picks a single MDS
+  // per call and MarkFailed's backoff steers the next Pick to a different one,
+  // so a dead first endpoint no longer fails the whole command while other MDS
+  // instances are healthy (RUNBOOK uses `dfkvctl ring` to verify upgrades).
+  for (size_t i = 0; i < eps.size() && !got; ++i) poller.PollOnce();
   return got;
 }
 

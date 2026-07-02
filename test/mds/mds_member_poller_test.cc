@@ -186,3 +186,21 @@ TEST(MdsMemberPoller, FirstViewEmptyIsAdopted) {
   EXPECT_EQ(fires, 1);
   EXPECT_EQ(poller.empty_view_rejected(), 0u);
 }
+
+TEST(MdsMemberPoller, FailsOverPastDeadEndpointAcrossPolls) {
+  // Mirrors dfkvctl's QueryMembers: a dead first endpoint must not fail the
+  // query while a healthy MDS is listed. One PollOnce picks one endpoint;
+  // MarkFailed's backoff steers the next Pick to the live one, so a loop of
+  // eps.size() PollOnce calls succeeds.
+  ScriptedMds live({2});                       // healthy MDS, 2 members
+  const std::string dead = "127.0.0.1:9";      // discard port: connect refused fast
+  std::vector<std::string> eps = {dead, live.ep()};
+  std::vector<MemberInfo> got;
+  MdsMemberPoller poller(eps, "g",
+      [&](const std::vector<MemberInfo>& ms) { got = ms; });
+
+  bool ok = false;
+  for (size_t i = 0; i < eps.size() && !ok; ++i) ok = poller.PollOnce();
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(got.size(), 2u) << "failover to the live MDS must return its members";
+}
