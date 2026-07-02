@@ -52,7 +52,13 @@ class UringReader {
   }
 
   ~UringReader() {
-    if (ok_) io_uring_queue_exit(&ring_);
+    if (ok_) {
+      // Never let the kernel finish an async read into a buffer after we are
+      // gone: queue_exit does NOT cancel in-flight requests, so an undrained
+      // read would DMA into whatever lives at the (freed/reused) buffer later.
+      Drain();
+      io_uring_queue_exit(&ring_);
+    }
   }
 
   UringReader(const UringReader&) = delete;
@@ -61,14 +67,49 @@ class UringReader {
   bool ok() const { return ok_; }
   unsigned depth() const { return depth_; }
 
+  // True after any BatchRead infrastructure failure. A poisoned ring refuses
+  // further BatchRead calls: a failed batch may have left (a) reads in flight
+  // in the kernel and (b) prepped-but-unsubmitted SQEs dormant in the SQ ring.
+  // A later submit would resurrect those dormant SQEs and execute them against
+  // a PREVIOUS batch's buffers (by then rearmed/reused) — silent corruption.
+  // The caller keeps the connection alive on the synchronous fallback instead.
+  bool poisoned() const { return poisoned_; }
+
+  // Reap-and-discard every read the kernel has accepted, blocking until the
+  // buffers are quiescent. MUST be called (and must succeed) after a failed
+  // BatchRead before the caller touches, reuses, or frees any buffer a desc
+  // pointed at — the in-flight reads still write into them. Returns false if
+  // the kernel did not complete them within timeout_ms per wait (the buffers
+  // must then be treated as still owned by the kernel; the only safe move is
+  // to tear the connection down and let the endpoint's registered buffers
+  // outlive the reads). No-op (true) when nothing is in flight.
+  bool Drain(int timeout_ms = 5000) {
+    if (!ok_) return true;
+    while (inflight_ > 0) {
+      struct __kernel_timespec ts{timeout_ms / 1000,
+                                  static_cast<long long>(timeout_ms % 1000) * 1000000LL};
+      struct io_uring_cqe* cqe = nullptr;
+      int w = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+      if (w == -EINTR) continue;
+      if (w < 0 || cqe == nullptr) return false;  // -ETIME: reads still in flight
+      io_uring_cqe_seen(&ring_, cqe);
+      --inflight_;
+    }
+    return true;
+  }
+
   // Submit up to QUEUE_DEPTH reads at a time (each at its own fd/offset/buffer),
   // wait for the whole sub-batch, fill each desc.result, then repeat until all
   // `cnt` descs are done. Returns true if every read was submitted+reaped (a
   // per-read short/EOF/error is recorded in desc.result, NOT a hard failure — the
-  // caller validates each). Returns false only on a submit/wait infrastructure
-  // failure (the caller then falls back to the synchronous path for safety).
+  // caller validates each). Returns false on a submit/wait infrastructure
+  // failure; the ring is then POISONED (see poisoned()) and reads may still be
+  // in flight against the descs' buffers — the caller MUST Drain() before it
+  // touches or reuses any of them, and may only use the synchronous path from
+  // then on.
   bool BatchRead(ReadDesc* descs, int cnt) {
-    if (!ok_ || cnt <= 0) return false;
+    if (!ok_ || poisoned_ || cnt <= 0) return false;
+    ++gen_;  // tags this batch's user_data so stale CQEs can never be misrouted
     // Per-desc bytes already read (for short-read residual re-prep). `descs[i].result`
     // is the FINAL byte count exposed to the caller (>=0) or -errno on hard error.
     // done_[i] tracks accumulated progress while residuals are still in flight.
@@ -76,12 +117,19 @@ class UringReader {
     int idx = 0;
     while (idx < cnt) {
       const int batch = std::min(cnt - idx, static_cast<int>(depth_));
-      // Use the descriptor's array index as user_data so we can map each CQE
-      // back to its desc regardless of completion order.
+      // user_data = (gen_ << 32) | desc index: the index maps each CQE back to
+      // its desc regardless of completion order; the generation makes a CQE
+      // from any earlier (failed) batch recognizably stale instead of being
+      // silently misattributed to a same-numbered desc of THIS batch.
       for (int i = 0; i < batch; ++i) {
         if (!PrepRead(idx + i, descs[idx + i].buf, descs[idx + i].len,
-                      descs[idx + i].off, descs[idx + i].fd))
-          return false;  // SQ exhausted unexpectedly (batch <= depth_)
+                      descs[idx + i].off, descs[idx + i].fd)) {
+          // SQ exhausted unexpectedly (batch <= depth_). The SQEs prepped so
+          // far are dormant in the SQ ring; poison so no later submit can
+          // resurrect them against reused buffers.
+          poisoned_ = true;
+          return false;
+        }
       }
       // Submit all `batch` SQEs and wait for at least one CQE. Two hazards:
       //  (1) io_uring_submit_and_wait can return -EINTR after the SQEs are already
@@ -98,13 +146,16 @@ class UringReader {
                        : io_uring_submit_and_wait(&ring_, 1);
         if (s < 0) {
           if (s == -EINTR) { waited = true; continue; }  // SQEs already queued
-          // Submit can't make progress and leftover SQEs would linger in the SQ
-          // ring; bail so the caller falls back to a full synchronous pread pass
-          // (correctness-first) rather than risk resurrecting stale SQEs.
+          // Submit can't make progress: reads already accepted are in flight
+          // against the descs' buffers and leftover SQEs linger dormant in the
+          // SQ ring. Poison and bail; the caller must Drain() before touching
+          // any buffer and stays on the synchronous path afterwards.
+          poisoned_ = true;
           return false;
         }
-        if (s == 0 && waited) return false;  // no forward progress: avoid spin
+        if (s == 0 && waited) { poisoned_ = true; return false; }  // no forward progress
         accepted += s;
+        inflight_ += static_cast<uint64_t>(s);  // kernel now owns these reads
         waited = true;  // first call already armed the wait; later calls just submit
       }
       int outstanding = accepted;
@@ -115,18 +166,22 @@ class UringReader {
       int reaped = 0;
       const int kMaxReaps = outstanding + 4 * batch;  // residuals bounded per desc
       while (outstanding > 0) {
-        if (reaped >= kMaxReaps) return false;
+        if (reaped >= kMaxReaps) { poisoned_ = true; return false; }
         struct io_uring_cqe* cqe = nullptr;
         int w = io_uring_wait_cqe(&ring_, &cqe);
         if (w == -EINTR) continue;  // wait interrupted: the CQE is still there
-        if (w < 0 || cqe == nullptr) return false;
-        const uint64_t di = static_cast<uint64_t>(
+        if (w < 0 || cqe == nullptr) { poisoned_ = true; return false; }
+        const uint64_t ud = static_cast<uint64_t>(
             reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe)));
+        const uint32_t g = static_cast<uint32_t>(ud >> 32);
+        const uint64_t di = ud & 0xffffffffu;
         const long res = cqe->res;
         io_uring_cqe_seen(&ring_, cqe);
         ++reaped;
+        --inflight_;  // the kernel is done with that read's buffer
+        if (g != gen_) continue;  // stale CQE from an earlier batch: not ours
         --outstanding;
-        if (di >= static_cast<uint64_t>(cnt)) continue;  // stale/foreign user_data
+        if (di >= static_cast<uint64_t>(cnt)) continue;  // foreign user_data (defensive)
         ReadDesc& d = descs[di];
         if (res < 0) { d.result = res; continue; }            // hard error: report -errno
         if (res == 0) { d.result = static_cast<long>(done_[di]); continue; }  // EOF
@@ -136,15 +191,18 @@ class UringReader {
         if (!PrepRead(static_cast<int>(di),
                       static_cast<char*>(d.buf) + done_[di],
                       static_cast<unsigned>(d.len - done_[di]),
-                      d.off + done_[di], d.fd))
+                      d.off + done_[di], d.fd)) {
+          poisoned_ = true;  // outstanding reads of this batch are still in flight
           return false;
-        // Submit the residual SQE. Retry on EINTR (submit does not wait, so it is
-        // safe to re-enter); bail on any other short/error so the caller falls back
-        // to a full synchronous pread pass rather than risk a stuck CQE wait.
+        }
+        // Submit the residual SQE. Retry on EINTR (submit does not wait, so it
+        // is safe to re-enter); poison on any other short/error — outstanding
+        // reads remain in flight and the residual SQE may linger dormant.
         int s;
         do { s = io_uring_submit(&ring_); } while (s == -EINTR);
-        if (s < 1) return false;
+        if (s < 1) { poisoned_ = true; return false; }
         ++outstanding;  // the residual read is now in flight
+        ++inflight_;
       }
       idx += batch;
     }
@@ -152,8 +210,9 @@ class UringReader {
   }
 
  private:
-  // Prep a single read SQE with user_data = desc index. Returns false only if the
-  // SQ ring is unexpectedly exhausted (the caller never queues more than depth_).
+  // Prep a single read SQE with user_data = (gen_ << 32) | desc index. Returns
+  // false only if the SQ ring is unexpectedly exhausted (the caller never
+  // queues more than depth_).
   bool PrepRead(int desc_idx, void* buf, unsigned len, uint64_t off, int fd) {
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
     if (!sqe) return false;
@@ -161,13 +220,18 @@ class UringReader {
     // Use the void* user_data API (not set_data64) so we build against
     // liburing >= 2.0 (the _data64 variants only exist in liburing >= 2.2).
     io_uring_sqe_set_data(
-        sqe, reinterpret_cast<void*>(static_cast<uintptr_t>(desc_idx)));
+        sqe, reinterpret_cast<void*>(static_cast<uintptr_t>(
+                 (static_cast<uint64_t>(gen_) << 32) |
+                 static_cast<uint32_t>(desc_idx))));
     return true;
   }
 
   struct io_uring ring_{};
   bool ok_ = false;
+  bool poisoned_ = false;   // a failed batch left in-flight reads / dormant SQEs
   unsigned depth_ = 0;
+  uint32_t gen_ = 0;        // per-BatchRead generation tag (CQE routing)
+  uint64_t inflight_ = 0;   // reads the kernel has accepted but we haven't reaped
   std::vector<uint64_t> done_;  // per-desc bytes read so far (residual tracking)
 };
 
