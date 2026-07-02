@@ -95,6 +95,10 @@ class KVStore {
   size_t Count() const;
   uint64_t Evictions() const { return evictions_.load(std::memory_order_relaxed); }
   uint64_t EvictedBytes() const { return evicted_bytes_.load(std::memory_order_relaxed); }
+  // Orphan ".tmp" files removed at construction (crash-between-write-and-rename
+  // leaks). Diagnostic: a persistently non-zero value across restarts points at
+  // frequent mid-write kills.
+  uint64_t TmpReclaimed() const { return tmp_reclaimed_.load(std::memory_order_relaxed); }
   const std::string& Dir() const { return opt_.cache_dir; }
 
  private:
@@ -127,6 +131,7 @@ class KVStore {
   std::atomic<uint64_t> tmp_seq_{0};  // unique suffix for concurrent lock-free writes
   // Eviction counters (relaxed): incremented in EvictLocked across shards.
   std::atomic<uint64_t> evictions_{0}, evicted_bytes_{0};
+  std::atomic<uint64_t> tmp_reclaimed_{0};  // orphan .tmp removed at startup
 };
 
 }  // namespace dfkv
