@@ -12,6 +12,7 @@
 #include <memory>
 #include <vector>
 
+#include "utils/args.h"
 #include "cache/kv_node_server.h"
 #include "utils/wire_limits.h"
 #include "utils/log.h"
@@ -53,24 +54,33 @@ int main(int argc, char** argv) {
       dfkv::Version());
     return help ? 0 : 1;
   }
-  std::string dir = "/tmp/dfkv_node";
-  std::string rdma_dev, mds, group = "default", node_id, advertise, metrics_bind;
-  int weight = 1;
-  int port = 0, rdma_port = -1, metrics_port = -1;
-  unsigned long long cap = 1ull << 30;
-  for (int i = 1; i + 1 < argc; i += 2) {
-    if (!std::strcmp(argv[i], "--dir")) dir = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--port")) port = std::atoi(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--cap")) cap = std::strtoull(argv[i + 1], nullptr, 10);
-    else if (!std::strcmp(argv[i], "--rdma-port")) rdma_port = std::atoi(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--rdma-dev")) rdma_dev = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--mds")) mds = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--group")) group = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--id")) node_id = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--advertise")) advertise = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--weight")) weight = std::atoi(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--metrics-port")) metrics_port = std::atoi(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--metrics-bind")) metrics_bind = argv[i + 1];
+  dfkv::Args args(argc, argv,
+                  {"--dir", "--port", "--cap", "--rdma-port", "--rdma-dev",
+                   "--mds", "--group", "--id", "--advertise", "--weight",
+                   "--metrics-port", "--metrics-bind"});
+  std::string dir = args.Get("--dir", "/tmp/dfkv_node");
+  std::string rdma_dev = args.Get("--rdma-dev", "");
+  std::string mds = args.Get("--mds", "");
+  std::string group = args.Get("--group", "default");
+  std::string node_id = args.Get("--id", "");
+  std::string advertise = args.Get("--advertise", "");
+  std::string metrics_bind = args.Get("--metrics-bind", "");
+  int weight = args.GetInt("--weight", 1);
+  int port = args.GetInt("--port", 0);
+  int rdma_port = args.GetInt("--rdma-port", -1);
+  int metrics_port = args.GetInt("--metrics-port", -1);
+  unsigned long long cap = args.GetU64("--cap", 1ull << 30);
+  if (!args.ok()) {
+    std::fprintf(stderr, "dfkv_server: %s\n(run with --help for usage)\n",
+                 args.error().c_str());
+    return 2;
+  }
+  // A mistyped --advertise (no ':') used to wrap rfind(':')+1 into a garbage
+  // port; reject it up front rather than register an unreachable address.
+  if (!advertise.empty() && !dfkv::IsValidHostPort(advertise)) {
+    std::fprintf(stderr, "dfkv_server: --advertise must be host:port (1..65535), "
+                 "got '%s'\n", advertise.c_str());
+    return 2;
   }
   (void)rdma_port;
   std::signal(SIGINT, OnSig);

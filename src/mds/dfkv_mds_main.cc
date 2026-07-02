@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 
+#include <chrono>
+#include "utils/args.h"
 #include "mds/mds_server.h"
 #include "utils/metrics_http.h"
 #include "common/version.h"
@@ -32,13 +34,16 @@ int main(int argc, char** argv) {
       dfkv::Version());
     return help ? 0 : 1;
   }
-  std::string etcd = "127.0.0.1:2379", metrics_bind;
-  int port = 0, metrics_port = -1;
-  for (int i = 1; i + 1 < argc; i += 2) {
-    if (!std::strcmp(argv[i], "--etcd")) etcd = argv[i + 1];
-    else if (!std::strcmp(argv[i], "--listen")) port = std::atoi(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--metrics-port")) metrics_port = std::atoi(argv[i + 1]);
-    else if (!std::strcmp(argv[i], "--metrics-bind")) metrics_bind = argv[i + 1];
+  dfkv::Args args(argc, argv,
+                  {"--etcd", "--listen", "--metrics-port", "--metrics-bind"});
+  std::string etcd = args.Get("--etcd", "127.0.0.1:2379");
+  std::string metrics_bind = args.Get("--metrics-bind", "");
+  int port = args.GetInt("--listen", 0);
+  int metrics_port = args.GetInt("--metrics-port", -1);
+  if (!args.ok()) {
+    std::fprintf(stderr, "dfkv_mds: %s\n(run with --help for usage)\n",
+                 args.error().c_str());
+    return 2;
   }
   dfkv::MdsServer srv(etcd);
   std::signal(SIGINT, OnSig);
@@ -47,12 +52,40 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "dfkv_mds: failed to listen on %d\n", port);
     return 1;
   }
+  // Fail loud on a bad --etcd: probe until etcd answers within a window, else
+  // exit non-zero so the supervisor restarts (and the misconfig is visible)
+  // instead of running "up" while every registration silently fails. Window is
+  // env-tunable (tests use a short one); default 30 s.
+  {
+    int probe_ms = 30000;
+    if (const char* e = std::getenv("DFKV_MDS_ETCD_PROBE_MS")) {
+      int v = std::atoi(e);
+      if (v >= 0) probe_ms = v;
+    }
+    bool up = false;
+    auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+      if (srv.ProbeEtcd()) { up = true; break; }
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - t0).count() >= probe_ms) break;
+      struct timespec ts{0, 200 * 1000 * 1000}; nanosleep(&ts, nullptr);
+    }
+    if (!up) {
+      std::fprintf(stderr,
+                   "dfkv_mds: etcd unreachable at '%s' after %dms — check --etcd "
+                   "(host:port, NO http:// scheme)\n", etcd.c_str(), probe_ms);
+      srv.Stop();
+      return 1;
+    }
+  }
   std::printf("dfkv_mds listening on %d, etcd=%s\n", srv.port(), etcd.c_str());
   std::fflush(stdout);
   // Optional Prometheus /metrics on a dedicated port/thread. Absent => no listener.
   std::unique_ptr<dfkv::MetricsHttpServer> mhttp;
   if (metrics_port >= 0) {
     mhttp = std::make_unique<dfkv::MetricsHttpServer>([&srv] { return srv.MetricsText(); });
+    // /healthz reflects live etcd reachability (503 when a probe fails).
+    mhttp->set_health_check([&srv] { return srv.ProbeEtcd(); });
     if (mhttp->Start(metrics_port, metrics_bind) == dfkv::Status::kOk)
       std::printf("dfkv_mds /metrics on port %d\n", mhttp->port());
     std::fflush(stdout);

@@ -124,7 +124,12 @@ void MetricsHttpServer::Handle(int fd) {
   if (path == "/metrics") {
     out = Resp("200 OK", "text/plain; version=0.0.4", render_ ? render_() : "");
   } else if (path == "/healthz") {
-    out = Resp("200 OK", "text/plain", "ok\n");
+    // A registered predicate (e.g. MDS etcd reachability) gates the status; with
+    // none set, keep the always-healthy 200 the endpoint had before.
+    if (!health_ || health_())
+      out = Resp("200 OK", "text/plain", "ok\n");
+    else
+      out = Resp("503 Service Unavailable", "text/plain", "unavailable\n");
   } else {
     out = Resp("404 Not Found", "text/plain", "not found\n");
   }

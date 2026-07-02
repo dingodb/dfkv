@@ -33,6 +33,12 @@ class MdsServer {
   std::string MetricsText() const { return metrics_.Render(); }
   size_t live_conn_count();  // handler threads not yet reaped (test/diagnostic)
 
+  // One read against etcd (a bounded RangePrefix on a probe key). Returns true
+  // iff etcd answered. Used at startup to fail loud on a misconfigured --etcd
+  // (a wrong endpoint/scheme otherwise runs "healthy" while every registration
+  // silently fails), and by /healthz to reflect etcd reachability.
+  bool ProbeEtcd() { return etcd_.RangePrefix("/dfkv/v1/_healthz_probe/").has_value(); }
+
   static constexpr int kTtlSeconds = 30;
 
  private:

@@ -29,6 +29,11 @@ class MetricsHttpServer {
       : render_(std::move(render)) {}
   ~MetricsHttpServer();
 
+  // Optional /healthz predicate. When set and it returns false, /healthz
+  // answers 503 (e.g. MDS reporting etcd unreachable) instead of a blanket
+  // 200 "ok"; unset keeps the always-200 behavior. Called on the HTTP thread.
+  void set_health_check(std::function<bool()> fn) { health_ = std::move(fn); }
+
   // port 0 => ephemeral (query with port()). bind_addr empty => all interfaces
   // (back-compat); pass e.g. "127.0.0.1" to restrict /metrics to loopback.
   Status Start(int port, const std::string& bind_addr = "");
@@ -53,6 +58,7 @@ class MetricsHttpServer {
   };
 
   std::function<std::string()> render_;
+  std::function<bool()> health_;  // optional /healthz predicate (null => always ok)
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};

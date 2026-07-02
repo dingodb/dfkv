@@ -10,6 +10,7 @@
  *     override (e.g. for older servers that predate tcp_port registration).
  * Geometry flags (must match the writer for get to hit): --model_hash --page_size
  *   --dtype_tag --layer_num --head_num --head_dim --mla 0|1 --tp_size --tp_rank */
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -139,8 +140,10 @@ int main(int argc, char** argv) {
   std::vector<std::string> pos;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    auto nv = [&](uint64_t* d) { if (i + 1 < argc) *d = std::stoull(argv[++i]); };
-    auto nv32 = [&](uint32_t* d) { if (i + 1 < argc) *d = (uint32_t)std::stoul(argv[++i]); };
+    // strtoull/strtoul (not stoull/stoul): the std:: variants THROW on a
+    // non-numeric arg, terminating the tool; strto* return 0 instead.
+    auto nv = [&](uint64_t* d) { if (i + 1 < argc) *d = std::strtoull(argv[++i], nullptr, 0); };
+    auto nv32 = [&](uint32_t* d) { if (i + 1 < argc) *d = (uint32_t)std::strtoul(argv[++i], nullptr, 0); };
     if (a == "--members" && i + 1 < argc) members = argv[++i];
     else if (a == "--mds" && i + 1 < argc) mds = argv[++i];
     else if (a == "--group" && i + 1 < argc) group = argv[++i];

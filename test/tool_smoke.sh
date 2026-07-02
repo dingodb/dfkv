@@ -27,3 +27,21 @@ got=$("$BUILD/dfkvctl" --members "n=127.0.0.1:$P" get k)
 "$BUILD/dfkvctl" --members "n=127.0.0.1:$P" exist k | grep -q true
 "$BUILD/dfkvctl" stat "127.0.0.1:$P" | grep -q dfkv_cache_put_total
 echo "tool_smoke OK (port $P)"
+
+# Strict arg parsing: an unknown flag / bad number / bad --advertise must fail
+# fast (exit 2), not run with silent defaults. (`set -e` is on, so guard the
+# expected-nonzero calls.)
+rc=0; "$BUILD/dfkv_server" --dir "$D" --capp 5 --port 0 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || { echo "dfkv_server unknown flag: expected exit 2, got $rc"; exit 1; }
+rc=0; "$BUILD/dfkv_server" --dir "$D" --cap 5TiB --port 0 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || { echo "dfkv_server bad --cap: expected exit 2, got $rc"; exit 1; }
+rc=0; "$BUILD/dfkv_server" --dir "$D" --advertise no-colon --port 0 >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || { echo "dfkv_server bad --advertise: expected exit 2, got $rc"; exit 1; }
+echo "strict-args smoke OK"
+
+# MDS must fail loud (exit 1) when etcd is unreachable, within the probe window,
+# instead of running "healthy" while every registration silently fails.
+rc=0; DFKV_MDS_ETCD_PROBE_MS=500 "$BUILD/dfkv_mds" --listen 0 --etcd 127.0.0.1:9 \
+  >/dev/null 2>&1 || rc=$?
+[ "$rc" = 1 ] || { echo "dfkv_mds bad etcd: expected exit 1, got $rc"; exit 1; }
+echo "mds etcd-probe smoke OK"

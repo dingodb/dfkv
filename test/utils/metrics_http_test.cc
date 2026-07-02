@@ -90,3 +90,22 @@ TEST(MetricsHttp, StopIsIdempotent) {
   srv.Stop();
   srv.Stop();  // must not crash / hang
 }
+
+TEST(MetricsHttp, HealthCheckPredicateGates503) {
+  std::atomic<bool> healthy{true};
+  MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+  srv.set_health_check([&] { return healthy.load(); });
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+  int port = srv.port();
+
+  std::string ok = HttpGet(port, "/healthz");
+  EXPECT_NE(ok.find("200"), std::string::npos) << ok;
+  EXPECT_NE(ok.find("ok"), std::string::npos) << ok;
+
+  healthy.store(false);
+  std::string bad = HttpGet(port, "/healthz");
+  EXPECT_NE(bad.find("503"), std::string::npos) << bad;
+  EXPECT_NE(bad.find("unavailable"), std::string::npos) << bad;
+
+  srv.Stop();
+}

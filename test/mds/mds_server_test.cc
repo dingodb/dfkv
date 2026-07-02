@@ -142,3 +142,15 @@ TEST(MdsServer, RejectsPathTraversalGroupAndId) {
   EXPECT_EQ(st, Status::kInvalid);
   mds.Stop();
 }
+
+TEST(MdsServer, ProbeEtcdReflectsReachability) {
+  // Dead endpoint: probe must fail fast (used at startup to exit non-zero on a
+  // misconfigured --etcd instead of running "up" with silent write failures).
+  { MdsServer dead("127.0.0.1:9", /*timeout_ms=*/500);
+    EXPECT_FALSE(dead.ProbeEtcd()); }
+
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD for the reachable case";
+  MdsServer live(ep);
+  EXPECT_TRUE(live.ProbeEtcd());
+}
