@@ -216,7 +216,10 @@ Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
   // that isn't reused before a crash simply "resurrects" its (still-valid,
   // content-addressed) key on restart -- correct cache data, never corruption
   // (design's resurrectable-remove semantics).
-  for (const auto& ev : evicted) payload_len_.erase(ev);
+  for (const auto& ev : evicted) {
+    auto pit = payload_len_.find(ev);
+    if (pit != payload_len_.end()) { evicted_bytes_ += pit->second; payload_len_.erase(pit); }
+  }
   if (!WritePayload(ref, data, len) ||
       !WriteRecord(ref, key, static_cast<uint32_t>(len), /*valid=*/true)) {
     alloc_->Remove(fn);  // roll back the reservation on I/O failure
@@ -224,6 +227,27 @@ Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
   }
   payload_len_[fn] = static_cast<uint32_t>(len);
   return Status::kOk;
+}
+
+Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
+                                  size_t cap) {
+  (void)cap;  // buffered engine: no aligned-buffer requirement, just the bytes
+  return Cache(key, data, len);
+}
+
+Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
+                                  uint64_t length, char* io_buf, size_t io_cap,
+                                  const char** out_data, size_t* out_len) {
+  size_t got = 0;
+  Status st = RangeInto(key, offset, length, io_buf, io_cap, &got);
+  if (st == Status::kOk) { if (out_data) *out_data = io_buf; if (out_len) *out_len = got; }
+  return st;
+}
+
+Status DiskSlabStore::RangeDirectPrep(const BlockKey&, uint64_t, uint64_t, size_t,
+                                      RangePrep* out) {
+  if (out) *out = RangePrep{};  // fd = -1
+  return Status::kInvalid;      // no async prep -> RDMA server uses sync RangeDirect
 }
 
 Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
@@ -287,5 +311,9 @@ size_t DiskSlabStore::Count() const { return alloc_->Count(); }
 uint64_t DiskSlabStore::UsedBytes() const { return alloc_->UsedBytes(); }
 uint64_t DiskSlabStore::Capacity() const { return alloc_->Capacity(); }
 uint64_t DiskSlabStore::Evictions() const { return alloc_->Evictions(); }
+uint64_t DiskSlabStore::EvictedBytes() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return evicted_bytes_;
+}
 
 }  // namespace dfkv

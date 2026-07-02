@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
   dfkv::Args args(argc, argv,
                   {"--dir", "--port", "--cap", "--rdma-port", "--rdma-dev",
                    "--mds", "--group", "--id", "--advertise", "--weight",
-                   "--metrics-port", "--metrics-bind"});
+                   "--metrics-port", "--metrics-bind", "--store-engine"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -70,6 +70,11 @@ int main(int argc, char** argv) {
   int rdma_port = args.GetInt("--rdma-port", -1);
   int metrics_port = args.GetInt("--metrics-port", -1);
   unsigned long long cap = args.GetU64("--cap", 1ull << 30);
+  // Storage backend: "file" (default) or "slab". Propagated via env so the
+  // DiskCacheGroup (constructed inside KvNodeServer) picks it up; --store-engine
+  // wins over a pre-set DFKV_STORE_ENGINE.
+  std::string store_engine = args.Get("--store-engine", "");
+  if (!store_engine.empty()) ::setenv("DFKV_STORE_ENGINE", store_engine.c_str(), 1);
   if (!args.ok()) {
     std::fprintf(stderr, "dfkv_server: %s\n(run with --help for usage)\n",
                  args.error().c_str());

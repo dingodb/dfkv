@@ -27,10 +27,11 @@
 
 #include "common/kv_types.h"
 #include "common/status.h"
+#include "cache/store_engine.h"
 
 namespace dfkv {
 
-class KVStore {
+class KVStore : public StoreEngine {
  public:
   struct Options {
     std::string cache_dir;
@@ -44,25 +45,25 @@ class KVStore {
   explicit KVStore(Options opt);
 
   // Synchronous, idempotent (skips if already present). No S3 upload.
-  Status Cache(const BlockKey& key, const void* data, size_t len);
+  Status Cache(const BlockKey& key, const void* data, size_t len) override;
   // Same semantics as Cache(), but `data` must point at a 4096-aligned
   // buffer with at least `cap` bytes. The O_DIRECT write uses it directly, so the
   // server PUT path avoids a payload-sized bounce-buffer copy.
-  Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap);
+  Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap) override;
   // [offset, offset+length) from the local block; NotFound if absent.
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
-               std::string* out);
+               std::string* out) override;
   // Like Range but reads straight into a caller buffer (no std::string), saving a
   // copy on the server GET path. Reads up to min(length, file-offset, dst_cap)
   // bytes into dst; *out_len = bytes read. NotFound if absent.
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
-                   char* dst, size_t dst_cap, size_t* out_len);
+                   char* dst, size_t dst_cap, size_t* out_len) override;
   // O_DIRECT range read into a caller-provided aligned buffer. The disk read may
   // cover an aligned superset of the requested range; *out_data points inside
   // io_buf at the exact requested bytes and can be scatter-sent directly.
   Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                      char* io_buf, size_t io_cap, const char** out_data,
-                     size_t* out_len);
+                     size_t* out_len) override;
 
   // Async-friendly split of RangeDirect. Does ONLY the cheap, lock-protected
   // prep: index lookup, O_DIRECT open, range clamp, and O_DIRECT alignment math.
@@ -73,36 +74,30 @@ class KVStore {
   //   read aligned_len bytes at aligned_off into io_buf, then the requested bytes
   //   are at io_buf+head for payload_len bytes. payload_len==0 is a valid zero-len
   //   hit (fd<0, nothing to read). io_cap must be >= aligned_len.
-  struct RangePrep {
-    int fd = -1;              // owned by caller on kOk (caller closes); -1 if no read
-    uint64_t aligned_off = 0; // O_DIRECT-aligned read start
-    size_t aligned_len = 0;   // O_DIRECT-aligned read length (multiple of 4096)
-    size_t head = 0;          // offset of requested bytes within the aligned read
-    size_t payload_len = 0;   // exact requested bytes (after clamp to file size)
-  };
+  using RangePrep = ::dfkv::RangePrep;  // shared with StoreEngine
   Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
-                         size_t io_cap, RangePrep* out);
+                         size_t io_cap, RangePrep* out) override;
 
-  bool IsCached(const BlockKey& key) const;
+  bool IsCached(const BlockKey& key) const override;
 
   // Explicitly drop a cached block: deletes the file, removes it from the
   // shard index + CLOCK ring, and reclaims its bytes (exclusive shard lock).
   // kOk if removed, kNotFound if absent. Used by the LMCache L2 eviction path
   // (dfkv_remove / DfkvL2Adapter.delete); distinct from capacity eviction so
   // it does NOT touch the eviction counters.
-  Status Remove(const BlockKey& key);
+  Status Remove(const BlockKey& key) override;
 
-  uint64_t UsedBytes() const;
-  size_t Count() const;
-  uint64_t Evictions() const { return evictions_.load(std::memory_order_relaxed); }
-  uint64_t EvictedBytes() const { return evicted_bytes_.load(std::memory_order_relaxed); }
+  uint64_t UsedBytes() const override;
+  size_t Count() const override;
+  uint64_t Evictions() const override { return evictions_.load(std::memory_order_relaxed); }
+  uint64_t EvictedBytes() const override { return evicted_bytes_.load(std::memory_order_relaxed); }
   // Orphan ".tmp" files removed at construction (crash-between-write-and-rename
   // leaks). Diagnostic: a persistently non-zero value across restarts points at
   // frequent mid-write kills.
   uint64_t TmpReclaimed() const { return tmp_reclaimed_.load(std::memory_order_relaxed); }
   // PUTs that hit a real ENOSPC, force-evicted, and retried successfully.
   uint64_t EnospcEvictions() const { return enospc_evictions_.load(std::memory_order_relaxed); }
-  const std::string& Dir() const { return opt_.cache_dir; }
+  const std::string& Dir() const override { return opt_.cache_dir; }
 
   // Test-only: override the disk write for the Cache() path so a test can
   // inject a transient ENOSPC (returning false with *out_errno=ENOSPC once,

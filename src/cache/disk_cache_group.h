@@ -14,6 +14,7 @@
 
 #include "utils/con_hash.h"
 #include "cache/kv_store.h"
+#include "cache/store_engine.h"
 #include "common/kv_types.h"
 
 namespace dfkv {
@@ -23,6 +24,10 @@ class DiskCacheGroup {
   struct Options {
     std::vector<std::string> cache_dirs;   // one per NVMe SSD
     uint64_t capacity_bytes = (1ull << 30);  // TOTAL, split evenly across disks
+    // Backend: "file" (KVStore, default) or "slab" (DiskSlabStore). Empty =>
+    // read DFKV_STORE_ENGINE (default "file"). Selectable so slab lands off by
+    // default with zero production impact.
+    std::string engine;
   };
 
   explicit DiskCacheGroup(Options opt);
@@ -56,10 +61,10 @@ class DiskCacheGroup {
   size_t DiskObjects(size_t i) const { return disks_[i]->Count(); }
 
  private:
-  KVStore* Route(const BlockKey& key) const;
+  StoreEngine* Route(const BlockKey& key) const;
 
-  std::vector<std::unique_ptr<KVStore>> disks_;
-  std::unordered_map<std::string, KVStore*> by_id_;  // disk id -> store
+  std::vector<std::unique_ptr<StoreEngine>> disks_;
+  std::unordered_map<std::string, StoreEngine*> by_id_;  // disk id -> store
   ConHash ring_;
 };
 

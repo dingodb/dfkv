@@ -23,12 +23,13 @@
 #include <vector>
 
 #include "cache/slab_allocator.h"
+#include "cache/store_engine.h"
 #include "common/kv_types.h"
 #include "common/status.h"
 
 namespace dfkv {
 
-class DiskSlabStore {
+class DiskSlabStore : public StoreEngine {
  public:
   struct Options {
     std::string dir;
@@ -49,18 +50,31 @@ class DiskSlabStore {
   DiskSlabStore(const DiskSlabStore&) = delete;
   DiskSlabStore& operator=(const DiskSlabStore&) = delete;
 
-  Status Cache(const BlockKey& key, const void* data, size_t len);
+  Status Cache(const BlockKey& key, const void* data, size_t len) override;
+  // Buffered engine: the aligned direct-PUT buffer is just written as bytes.
+  Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap) override;
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
-               std::string* out);
+               std::string* out) override;
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
-                   char* dst, size_t dst_cap, size_t* out_len);
-  bool IsCached(const BlockKey& key) const;
-  Status Remove(const BlockKey& key);
+                   char* dst, size_t dst_cap, size_t* out_len) override;
+  // Buffered engine: read straight into io_buf and point out_data at it (no
+  // O_DIRECT alignment head); the RDMA server scatter-sends from io_buf.
+  Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
+                     char* io_buf, size_t io_cap, const char** out_data,
+                     size_t* out_len) override;
+  // No async prep for a buffered engine: return kInvalid so the RDMA server
+  // uses the synchronous RangeDirect path.
+  Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
+                         size_t io_cap, RangePrep* out) override;
+  bool IsCached(const BlockKey& key) const override;
+  Status Remove(const BlockKey& key) override;
 
-  size_t Count() const;
-  uint64_t UsedBytes() const;
+  size_t Count() const override;
+  uint64_t UsedBytes() const override;
   uint64_t Capacity() const;
-  uint64_t Evictions() const;
+  uint64_t Evictions() const override;
+  uint64_t EvictedBytes() const override;
+  const std::string& Dir() const override { return opt_.dir; }
   uint64_t TableRebuilt() const { return table_rebuilt_; }  // records restored at open
 
  private:
@@ -88,6 +102,7 @@ class DiskSlabStore {
   mutable std::mutex mu_;
   bool ok_ = false;
   uint64_t table_rebuilt_ = 0;
+  uint64_t evicted_bytes_ = 0;
 };
 
 }  // namespace dfkv
