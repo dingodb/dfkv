@@ -47,6 +47,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 # dfkv: get_dp_engine_index replaces mooncake_utils.get_mooncake_dp_engine_index;
 # dfkv handles its own RDMA bootstrap so the transfer-engine helpers are dropped.
+from ._determinism import ensure_deterministic_block_hashing
 from .coordinator import (
     ExternalCachedBlockPool,
     DfkvStoreCoordinator,
@@ -691,6 +692,9 @@ class DfkvStoreWorker:
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
 
         assert vllm_config.kv_transfer_config is not None
+        # Store keys embed block_hashes: refuse to start with process-local
+        # hashing (silent 0% cross-instance/cross-restart hit rate otherwise).
+        ensure_deterministic_block_hashing(vllm_config.cache_config)
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "load_async", True
