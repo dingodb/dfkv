@@ -2,7 +2,7 @@
 
 把 KV cache 块存到 **dfkv** 集群的 LMCache `RemoteConnector`。它通过 dfkv 的 C ABI
 （`libdfkv.so`，Python ctypes 加载）对接 dfkv —— 与本仓库的 SGLang HiCache 插件
-（[../hicache/DINGOFS_MODULE_README.md](../hicache/DINGOFS_MODULE_README.md)）走同一套底层 KV 客户端。
+（[../DINGOFS_MODULE_README.md](../DINGOFS_MODULE_README.md)）走同一套底层 KV 客户端。
 
 本 connector 移植自 dingofs 项目的 LMCache connector，但做了两处实质性改动，详见下文。
 
