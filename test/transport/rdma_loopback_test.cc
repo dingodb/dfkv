@@ -322,6 +322,43 @@ TEST(RdmaLoopback, PoolMrSharedAcrossBuffers) {
   EXPECT_NE(c, a);  // outside the pool -> ad-hoc registration
 }
 
+// The host KV pool belongs to the PD, not to a connection: many endpoints on
+// the same device must register it ONCE (the #P1-2 fix), not once per connection
+// (the pre-fix storm — re-running ibv_reg_mr over a tens-of-GB region on every
+// reconnect). Verified via the pool-registration counter delta, and by every
+// endpoint resolving an in-pool buffer to the SAME MR (shared lkey).
+TEST(RdmaLoopback, PoolMrRegisteredOncePerDeviceNotPerConnection) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  // A distinct region per test run so the counter delta is attributable here.
+  std::vector<char> region(512 * 1024);
+  const uint64_t regs0 = rdma::RcEndpoint::PoolMrRegistrations();
+  const uint64_t adhoc0 = rdma::RcEndpoint::AdhocUserMrTotal();
+
+  constexpr int N = 8;
+  std::vector<std::unique_ptr<rdma::RcEndpoint>> eps;
+  ibv_mr* first = nullptr;
+  for (int i = 0; i < N; ++i) {
+    eps.push_back(std::make_unique<rdma::RcEndpoint>());
+    ASSERT_TRUE(eps.back()->Open(nullptr, 64 * 1024, 1)) << "endpoint " << i;
+    ASSERT_TRUE(eps.back()->AddPoolMr(region.data(), region.size()));
+    ibv_mr* m = eps.back()->RegisterUser(region.data() + 4096, 4096);
+    ASSERT_NE(m, nullptr);
+    if (i == 0) first = m;
+    else EXPECT_EQ(m, first) << "all endpoints on one PD share the pool MR";
+  }
+  EXPECT_EQ(rdma::RcEndpoint::PoolMrRegistrations() - regs0, 1u)
+      << N << " endpoints registered the region " << (rdma::RcEndpoint::PoolMrRegistrations() - regs0)
+      << " times; must be exactly once per device";
+  EXPECT_EQ(rdma::RcEndpoint::AdhocUserMrTotal() - adhoc0, 0u)
+      << "in-pool buffers must never take the ad-hoc registration path";
+
+  eps.clear();  // all close; region MR freed when the last device ref drops
+  // A fresh endpoint re-registers the (now-freed) region: counter advances by 1.
+  rdma::RcEndpoint again;
+  ASSERT_TRUE(again.Open(nullptr, 64 * 1024, 1));
+  ASSERT_TRUE(again.AddPoolMr(region.data(), region.size()));
+}
+
 // End-to-end: register the host pool once, then Put from / Get into sub-buffers
 // of it. All transfers hit the pool MR (no per-op registration) and round-trip.
 TEST(RdmaLoopback, RegisterMemoryRoundtrip) {

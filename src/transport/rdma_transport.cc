@@ -225,6 +225,17 @@ std::string RdmaTransport::MetricsText() const {
     s += "dfkv_rdma_client_rail_conns_total{dev=\"" + d + "\"} " +
          std::to_string(rail_conns_[i].load(std::memory_order_relaxed)) + "\n";
   }
+  // Effective pipeline depth (DFKV_RDMA_DEPTH; default 1). Per-connection pinned
+  // control memory is ~2*control_cap*depth, so raising depth trades memory for
+  // per-node request pipelining — surfaced so the value in effect is visible.
+  s += "# HELP dfkv_rdma_client_pipeline_depth Effective RDMA pipeline depth (env DFKV_RDMA_DEPTH)\n";
+  s += "# TYPE dfkv_rdma_client_pipeline_depth gauge\n";
+  s += "dfkv_rdma_client_pipeline_depth " + std::to_string(depth_) + "\n";
+  // Ad-hoc (out-of-pool) user MR registrations; should be 0 (see AdhocUserMrTotal).
+  s += "# HELP dfkv_rdma_client_adhoc_user_mr_total User MRs registered outside any pool region\n";
+  s += "# TYPE dfkv_rdma_client_adhoc_user_mr_total counter\n";
+  s += "dfkv_rdma_client_adhoc_user_mr_total " +
+       std::to_string(rdma::RcEndpoint::AdhocUserMrTotal()) + "\n";
   return s;
 }
 

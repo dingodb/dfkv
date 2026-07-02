@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 #include <random>
 #include <string>
@@ -28,9 +29,28 @@ namespace {
 // usable by any QP on it). After the first connection opens a device, all others
 // reuse it -- no further ibv_open_device. Keyed by device name (multi-rail rails
 // are distinct devices -> distinct shared entries, which is correct).
-struct SharedDevice { ibv_context* ctx; ibv_pd* pd; long refs; };
+// A pool MR is the big pre-registered host KV region. It belongs to the PD, not
+// to any one connection, so it is registered ONCE per device and shared by all
+// endpoints — previously each new connection re-ran ibv_reg_mr over the whole
+// (tens-to-hundreds-of-GB) region, a registration storm at reconnect time.
+struct SharedPoolMr { uintptr_t base; size_t size; ibv_mr* mr; };
+struct SharedDevice {
+  ibv_context* ctx;
+  ibv_pd* pd;
+  long refs;
+  std::vector<SharedPoolMr> pool_mrs;  // registered once per PD; freed on last ref
+};
 std::mutex g_dev_mu;
 std::unordered_map<std::string, SharedDevice> g_devs;
+
+// Ad-hoc user MRs registered OUTSIDE any pool region (RegisterUser slow path).
+// In correct deployments every datapath buffer is inside a RegisterMemory pool,
+// so this counter should stay 0; a rising value flags a pool-registration gap.
+std::atomic<uint64_t> g_adhoc_user_mr{0};
+// Actual ibv_reg_mr calls for pool regions (once per PD per region). Diagnostic:
+// with the shared registry this is ~= number of distinct (device,region) pairs,
+// NOT number of connections (the pre-fix behavior).
+std::atomic<uint64_t> g_pool_mr_regs{0};
 
 // Get-or-open the shared {ctx, pd} for `dev_name` (nullptr/"" = first device),
 // bumping its refcount. Returns {nullptr,nullptr} on failure (no refcount taken).
@@ -67,6 +87,7 @@ void ReleaseSharedDevice(ibv_context* ctx) {
   for (auto it = g_devs.begin(); it != g_devs.end(); ++it) {
     if (it->second.ctx != ctx) continue;
     if (--it->second.refs == 0) {
+      for (auto& p : it->second.pool_mrs) if (p.mr) ibv_dereg_mr(p.mr);  // shared MRs
       ibv_dealloc_pd(it->second.pd);
       ibv_close_device(it->second.ctx);
       g_devs.erase(it);
@@ -74,7 +95,37 @@ void ReleaseSharedDevice(ibv_context* ctx) {
     return;
   }
 }
+
+// Register `base`/`size` on the device's shared PD exactly once; subsequent
+// callers (other endpoints on the same PD) get the existing MR with no
+// ibv_reg_mr. Returns the (shared, PD-owned) MR, or nullptr on failure. The MR's
+// lkey is valid for any QP on this PD, so callers may cache the pointer locally
+// for lock-free lookup. Only called at connection setup (not the datapath), so
+// taking g_dev_mu here is fine.
+ibv_mr* SharedAddPoolMr(ibv_context* ctx, ibv_pd* pd, void* base, size_t size) {
+  auto b = reinterpret_cast<uintptr_t>(base);
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  for (auto& d : g_devs) {
+    if (d.second.ctx != ctx) continue;
+    for (const auto& p : d.second.pool_mrs)
+      if (p.base == b && p.size >= size) return p.mr;  // already registered on this PD
+    ibv_mr* mr = ibv_reg_mr(pd, base, size, IBV_ACCESS_LOCAL_WRITE);
+    if (!mr) return nullptr;
+    g_pool_mr_regs.fetch_add(1, std::memory_order_relaxed);  // one actual registration
+    d.second.pool_mrs.push_back(SharedPoolMr{b, size, mr});
+    return mr;
+  }
+  return nullptr;  // device not found (shouldn't happen for a live endpoint)
+}
 }  // namespace
+
+uint64_t RcEndpoint::AdhocUserMrTotal() {
+  return g_adhoc_user_mr.load(std::memory_order_relaxed);
+}
+
+uint64_t RcEndpoint::PoolMrRegistrations() {
+  return g_pool_mr_regs.load(std::memory_order_relaxed);
+}
 
 void SerializeQpInfo(const QpInfo& in, char out[kQpInfoBytes]) {
   std::memset(out, 0, kQpInfoBytes);
@@ -103,7 +154,10 @@ void RcEndpoint::Close() {
   for (auto& [addr, e] : user_mr_) if (e.first) ibv_dereg_mr(e.first);
   user_mr_.clear();
   user_lru_.clear();
-  for (auto& p : pool_mr_) if (p.mr) ibv_dereg_mr(p.mr);
+  // pool_mr_ holds SHARED, PD-owned MRs (SharedAddPoolMr); the SharedDevice
+  // frees them on the last device ref (ReleaseSharedDevice). Just drop the local
+  // lookup cache — do NOT dereg here (that would free an MR other live endpoints
+  // on the same PD still use).
   pool_mr_.clear();
   smr_.clear(); rmr_.clear(); dmr_.clear();
   for (auto* b : sbuf_) delete[] b;
@@ -318,8 +372,12 @@ bool RcEndpoint::PostSend(size_t slot, size_t len) {
 
 bool RcEndpoint::AddPoolMr(void* base, size_t size) {
   auto b = reinterpret_cast<uintptr_t>(base);
-  for (const auto& p : pool_mr_) if (p.base == b) return true;  // already registered
-  ibv_mr* mr = ibv_reg_mr(pd_, base, size, IBV_ACCESS_LOCAL_WRITE);
+  for (const auto& p : pool_mr_) if (p.base == b) return true;  // local cache hit
+  // Register on the shared PD (deduped across all endpoints on this device), then
+  // cache the (shared) MR locally so the datapath RegisterUser lookup stays
+  // lock-free. The MR is owned by the SharedDevice and freed on the last ref, so
+  // this endpoint must NOT dereg it in Close().
+  ibv_mr* mr = SharedAddPoolMr(ctx_, pd_, base, size);
   if (!mr) return false;
   pool_mr_.push_back(PoolMr{b, size, mr});
   return true;
@@ -357,6 +415,7 @@ ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
   }
   ibv_mr* mr = ibv_reg_mr(pd_, addr, len, IBV_ACCESS_LOCAL_WRITE);
   if (mr) {
+    g_adhoc_user_mr.fetch_add(1, std::memory_order_relaxed);  // out-of-pool: should be 0 in prod
     user_lru_.push_front(key);
     user_mr_[key] = {mr, user_lru_.begin()};
   }

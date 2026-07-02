@@ -96,6 +96,16 @@ class RcEndpoint {
   // is acquired so regions declared at any time land on every connection's PD.
   void EnsurePoolMrs(const std::vector<std::pair<void*, size_t>>& regions);
 
+  // Process-wide count of ad-hoc user MRs registered OUTSIDE any pool region
+  // (RegisterUser slow path). Should stay 0 in correct deployments where every
+  // datapath buffer lives inside a RegisterMemory pool; a rising value flags a
+  // pool-registration gap. Diagnostic; surfaced in the transport MetricsText.
+  static uint64_t AdhocUserMrTotal();
+  // Process-wide count of actual ibv_reg_mr calls for pool regions. With the
+  // shared per-PD registry this counts distinct (device,region) pairs, not
+  // connections (the pre-fix per-connection storm). Diagnostic/test.
+  static uint64_t PoolMrRegistrations();
+
   // Resolve a caller buffer to an MR for zero-copy transfer. Fast path: a buffer
   // inside a registered pool region (AddPoolMr) returns that MR with no syscall.
   // Otherwise it is registered ad-hoc and kept in a small LRU cache (stable repeat
