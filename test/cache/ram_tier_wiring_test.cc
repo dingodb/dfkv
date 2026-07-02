@@ -87,6 +87,7 @@ TEST(RamTierWiring, WriteThroughAndServeFromRam) {
   // The async flusher persists every block to disk in the background.
   EXPECT_TRUE(WaitFor([&] { return MetricVal(s->MetricsText(), "dfkv_ram_flushed_total") >= 20; }));
 
+  s.reset();  // stop the flusher before removing the dir (no write race)
   ::unsetenv("DFKV_RAM_TIER");
   ::unsetenv("DFKV_RAM_TIER_BYTES");
   fs::remove_all(dir);
@@ -108,6 +109,7 @@ TEST(RamTierWiring, SurvivesAsMissWhenRangePastEnd) {
   EXPECT_EQ(t.Range(addr, ToBlockKey("absent"), 0, 4, &out), Status::kNotFound);
   EXPECT_GE(MetricVal(s->MetricsText(), "dfkv_ram_miss_total"), 1);
 
+  s.reset();  // stop the flusher before removing the dir (no write race)
   ::unsetenv("DFKV_RAM_TIER");
   ::unsetenv("DFKV_RAM_TIER_BYTES");
   fs::remove_all(dir);
@@ -133,6 +135,7 @@ TEST(RamTierWiring, ExistAndRemoveSeeRam) {
   std::string out;
   EXPECT_EQ(t.Range(addr, ToBlockKey("live"), 0, v.size(), &out), Status::kNotFound);
 
+  s.reset();  // stop the flusher before removing the dir (no write race)
   ::unsetenv("DFKV_RAM_TIER");
   ::unsetenv("DFKV_RAM_TIER_BYTES");
   fs::remove_all(dir);
@@ -154,5 +157,6 @@ TEST(RamTierWiring, DisabledByDefaultNoRamMetrics) {
   EXPECT_EQ(MetricVal(m, "dfkv_ram_put_total"), -1);
   EXPECT_EQ(s->m_cache_put(), 1u);   // normal disk accounting intact
   EXPECT_EQ(s->m_cache_hit(), 1u);
+  s.reset();
   fs::remove_all(dir);
 }
