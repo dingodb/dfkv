@@ -25,6 +25,16 @@ enum class WireOp : uint8_t {
 };
 
 constexpr uint8_t kProtoVersion = 1;
+// Protocol v2 appends an 8-byte request seq (echoed in the response) at the TAIL
+// of each prefix, so a v2 frame is a v1 frame + 8 bytes. The seq lets a client
+// correlate a reply to its request explicitly instead of relying on the servers
+// replying in strict arrival order (a cross-component FIFO assumption that any
+// future out-of-order reply would silently break). Servers DUAL-ACCEPT: they
+// decode either version and reply in the SAME version, so a v1 client and a v2
+// client interoperate with the same server -- rolling upgrades need no flag day
+// (upgrade servers first, then clients). Behavior is otherwise identical; the
+// seq is validated but replies stay in arrival order until a later change.
+constexpr uint8_t kProtoVersionV2 = 2;
 
 // Hard ceiling on a single wire frame's variable payload. Decode rejects any
 // frame whose declared length exceeds this, so a garbage/hostile 64-bit length
@@ -35,9 +45,14 @@ constexpr uint8_t kProtoVersion = 1;
 constexpr uint64_t kMaxFrameLen = 1ull << 34;  // 16 GiB
 
 // Request prefix: ver(1) op(1) id(8) index(4) size(4) offset(8) length(8) payload_len(8)
-constexpr size_t kReqPrefix = 1 + 1 + 8 + 4 + 4 + 8 + 8 + 8;  // = 42
+constexpr size_t kReqPrefix = 1 + 1 + 8 + 4 + 4 + 8 + 8 + 8;  // = 42 (v1)
 // Response prefix: ver(1) status(1) data_len(8)
-constexpr size_t kRespPrefix = 1 + 1 + 8;  // = 10
+constexpr size_t kRespPrefix = 1 + 1 + 8;  // = 10 (v1)
+// v2 = v1 layout + an 8-byte trailing seq. A reader takes the v1 prefix first
+// (the version byte is at [0] of both), and reads the extra 8 bytes only when
+// [0] == kProtoVersionV2.
+constexpr size_t kReqPrefixV2 = kReqPrefix + 8;    // = 50
+constexpr size_t kRespPrefixV2 = kRespPrefix + 8;  // = 18
 
 inline void EncodeReq(char* p, WireOp op, const BlockKey& k, uint64_t offset,
                       uint64_t length, uint64_t payload_len) {
@@ -51,6 +66,15 @@ inline void EncodeReq(char* p, WireOp op, const BlockKey& k, uint64_t offset,
   net::PutU64(p + 34, payload_len);
 }
 
+// v2 request: the v1 layout plus an 8-byte seq at the tail (offset kReqPrefix).
+// Writes kReqPrefixV2 bytes.
+inline void EncodeReqV2(char* p, WireOp op, const BlockKey& k, uint64_t offset,
+                        uint64_t length, uint64_t payload_len, uint64_t seq) {
+  EncodeReq(p, op, k, offset, length, payload_len);
+  p[0] = static_cast<char>(kProtoVersionV2);  // overwrite the version byte
+  net::PutU64(p + kReqPrefix, seq);
+}
+
 struct ReqFields {
   uint8_t op;
   uint64_t id;
@@ -59,15 +83,19 @@ struct ReqFields {
   uint64_t offset;
   uint64_t length;
   uint64_t payload_len;
+  uint64_t seq = 0;  // v2 only (0 for a v1 frame)
 };
 
-// Returns false on a protocol-version mismatch or an oversized declared payload
-// (> max_payload); the caller drops the connection in either case. max_payload
-// defaults to the global frame ceiling, so every caller is guarded even without
-// passing a tighter bound.
-inline bool DecodeReq(const char* p, ReqFields* o,
-                      uint64_t max_payload = kMaxFrameLen) {
-  if (static_cast<uint8_t>(p[0]) != kProtoVersion) return false;
+// Returns the decoded frame version (kProtoVersion or kProtoVersionV2), or 0 on
+// a version mismatch / oversized declared payload (> max_payload) — the caller
+// drops the connection when 0. `if (!DecodeReq(...))` therefore still means "bad
+// frame", and a caller that needs the version keeps the return value.
+// For a v2 frame `p` MUST hold kReqPrefixV2 bytes (the seq is read from
+// p+kReqPrefix); for a v1 frame only kReqPrefix bytes are touched.
+inline uint8_t DecodeReq(const char* p, ReqFields* o,
+                         uint64_t max_payload = kMaxFrameLen) {
+  const uint8_t ver = static_cast<uint8_t>(p[0]);
+  if (ver != kProtoVersion && ver != kProtoVersionV2) return 0;
   o->op = static_cast<uint8_t>(p[1]);
   o->id = net::GetU64(p + 2);
   o->index = net::GetU32(p + 10);
@@ -75,8 +103,9 @@ inline bool DecodeReq(const char* p, ReqFields* o,
   o->offset = net::GetU64(p + 18);
   o->length = net::GetU64(p + 26);
   o->payload_len = net::GetU64(p + 34);
-  if (o->payload_len > max_payload) return false;  // reject oversized frame
-  return true;
+  o->seq = (ver == kProtoVersionV2) ? net::GetU64(p + kReqPrefix) : 0;
+  if (o->payload_len > max_payload) return 0;  // reject oversized frame
+  return ver;
 }
 
 inline void EncodeResp(char* p, Status st, uint64_t data_len) {
@@ -85,13 +114,25 @@ inline void EncodeResp(char* p, Status st, uint64_t data_len) {
   net::PutU64(p + 2, data_len);
 }
 
-inline bool DecodeResp(const char* p, Status* st, uint64_t* data_len,
-                       uint64_t max_data = kMaxFrameLen) {
-  if (static_cast<uint8_t>(p[0]) != kProtoVersion) return false;
+// v2 response: v1 layout plus an 8-byte echoed seq. Writes kRespPrefixV2 bytes.
+inline void EncodeRespV2(char* p, Status st, uint64_t data_len, uint64_t seq) {
+  EncodeResp(p, st, data_len);
+  p[0] = static_cast<char>(kProtoVersionV2);
+  net::PutU64(p + kRespPrefix, seq);
+}
+
+// Returns the response frame version (1 or 2), or 0 on version mismatch /
+// oversize. For a v2 frame `p` must hold kRespPrefixV2 bytes. `seq` (nullable)
+// receives the echoed seq (0 for a v1 frame).
+inline uint8_t DecodeResp(const char* p, Status* st, uint64_t* data_len,
+                          uint64_t max_data = kMaxFrameLen, uint64_t* seq = nullptr) {
+  const uint8_t ver = static_cast<uint8_t>(p[0]);
+  if (ver != kProtoVersion && ver != kProtoVersionV2) return 0;
   *st = static_cast<Status>(static_cast<uint8_t>(p[1]));
   *data_len = net::GetU64(p + 2);
-  if (*data_len > max_data) return false;  // reject oversized frame
-  return true;
+  if (seq) *seq = (ver == kProtoVersionV2) ? net::GetU64(p + kRespPrefix) : 0;
+  if (*data_len > max_data) return 0;  // reject oversized frame
+  return ver;
 }
 
 }  // namespace dfkv
