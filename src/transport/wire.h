@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include "common/status.h"
 #include "common/kv_types.h"   // BlockKey
@@ -133,6 +134,18 @@ inline uint8_t DecodeResp(const char* p, Status* st, uint64_t* data_len,
   if (seq) *seq = (ver == kProtoVersionV2) ? net::GetU64(p + kRespPrefix) : 0;
   if (*data_len > max_data) return 0;  // reject oversized frame
   return ver;
+}
+
+// Client-selected wire version, from DFKV_WIRE_VERSION (default 1). Cached once.
+// A v2 client sends v2 frames with a seq and validates the echoed seq; servers
+// dual-accept, so raising this on the client is safe only AFTER every server it
+// talks to is on a dual-accept build (roll servers first, then clients).
+inline uint8_t ClientWireVersion() {
+  static const uint8_t v = [] {
+    const char* e = std::getenv("DFKV_WIRE_VERSION");
+    return (e && e[0] == '2' && e[1] == '\0') ? kProtoVersionV2 : kProtoVersion;
+  }();
+  return v;
 }
 
 }  // namespace dfkv
