@@ -62,6 +62,9 @@ class RdmaServer {
     size_t aligned_len = 0;    // O_DIRECT-aligned read length (multiple of 4096)
     size_t head = 0;           // offset of the requested bytes within the read
     size_t payload_len = 0;    // exact requested bytes (post file-size clamp)
+    // 0 = no hold. A slot-based engine (slab) pins the slot for the read's
+    // duration; passed to range_release_handler_ wherever fd is closed.
+    uint64_t release_token = 0;
   };
   using RangePrepHandler = std::function<Status(
       uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
@@ -69,6 +72,8 @@ class RdmaServer {
   // Optional accounting hook invoked once an async read completes (mirrors the
   // hit/io-error counters the synchronous RangeDirect bumps).
   using RangeCompleteHandler = std::function<void(bool ok, size_t bytes_read)>;
+  // Releases a prep's release_token (slab slot pin) once its read is done.
+  using RangeReleaseHandler = std::function<void(uint64_t token)>;
 
   // dev_name empty => env DFKV_RDMA_DEV, else first device.
   explicit RdmaServer(Handler handler, size_t max_msg = (64u << 20),
@@ -86,6 +91,9 @@ class RdmaServer {
   }
   void set_range_complete_handler(RangeCompleteHandler h) {
     range_complete_handler_ = std::move(h);
+  }
+  void set_range_release_handler(RangeReleaseHandler h) {
+    range_release_handler_ = std::move(h);
   }
 
   // --- RAM hot-tier zero-copy GET (P3 B5-3, ADDITIVE + OFF unless wired) --------
@@ -149,6 +157,7 @@ class RdmaServer {
   CacheDirectHandler cache_direct_handler_;
   RangePrepHandler range_prep_handler_;
   RangeCompleteHandler range_complete_handler_;
+  RangeReleaseHandler range_release_handler_;
   RamRangeHandler ram_range_handler_;
   RamReleaseHandler ram_release_handler_;
   std::vector<std::pair<void*, size_t>> user_regions_;  // RAM arena pool MRs (RegisterMemory)

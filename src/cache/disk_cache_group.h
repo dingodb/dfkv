@@ -44,6 +44,9 @@ class DiskCacheGroup {
   // Cheap prep half of RangeDirect (no disk read); see KVStore::RangeDirectPrep.
   Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
                          size_t io_cap, KVStore::RangePrep* out);
+  // Balance a prep whose RangePrep::token != 0 (slab holds the slot across the
+  // caller's async read); the owning disk's index rides the token's top byte.
+  void RangeRelease(uint64_t token);
   bool IsCached(const BlockKey& key) const;
 
   // Drop a cached block from its owning disk (routes like IsCached). kOk if
@@ -64,6 +67,8 @@ class DiskCacheGroup {
   size_t DiskObjects(size_t i) const { return disks_[i]->Count(); }
 
  private:
+  static constexpr uint64_t kTokenMask = (1ull << 56) - 1;  // engine token bits
+
   StoreEngine* Route(const BlockKey& key) const;
 
   std::string engine_;  // resolved backend name (see EngineName)

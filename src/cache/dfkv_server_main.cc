@@ -57,7 +57,8 @@ int main(int argc, char** argv) {
   dfkv::Args args(argc, argv,
                   {"--dir", "--port", "--cap", "--rdma-port", "--rdma-dev",
                    "--mds", "--group", "--id", "--advertise", "--weight",
-                   "--metrics-port", "--metrics-bind", "--store-engine"});
+                   "--metrics-port", "--metrics-bind", "--store-engine",
+                   "--slab-write"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -75,6 +76,10 @@ int main(int argc, char** argv) {
   // wins over a pre-set DFKV_STORE_ENGINE.
   std::string store_engine = args.Get("--store-engine", "");
   if (!store_engine.empty()) ::setenv("DFKV_STORE_ENGINE", store_engine.c_str(), 1);
+  // Slab write mode: "direct" = O_DIRECT extent writes (device-rate, bounded
+  // tail, no page-cache pressure); default buffered (burst absorption).
+  std::string slab_write = args.Get("--slab-write", "");
+  if (!slab_write.empty()) ::setenv("DFKV_SLAB_WRITE", slab_write.c_str(), 1);
   if (!args.ok()) {
     std::fprintf(stderr, "dfkv_server: %s\n(run with --help for usage)\n",
                  args.error().c_str());
@@ -234,6 +239,11 @@ int main(int argc, char** argv) {
     {
       std::string info = std::string("ver=") + dfkv::Version();
       info += ",engine=" + srv.engine_name();
+      // Only worth a field when it deviates from the default buffered mode.
+      if (srv.engine_name() == "slab") {
+        const char* wm = std::getenv("DFKV_SLAB_WRITE");
+        if (wm && std::string(wm) == "direct") info += ",wr=direct";
+      }
       info += ",disks=" + std::to_string(srv.DiskCount());
       info += ",cap=" + std::to_string(cap);
       info += ",ram=" + (srv.ram_enabled()

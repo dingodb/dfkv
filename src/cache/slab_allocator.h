@@ -67,6 +67,9 @@ class SlabAllocator {
 
   // Look up `key`; on hit sets *out and marks it referenced (CLOCK second chance).
   bool Get(const std::string& key, SlotRef* out);
+  // Get + Pin in ONE lock acquisition -- the read path does both back-to-back on
+  // every GET, and at high op rates the second acquisition is pure contention.
+  bool GetAndPin(const std::string& key, SlotRef* out);
   bool Contains(const std::string& key) const;
 
   // Crash-recovery only: install a key KNOWN (from persistence) to occupy

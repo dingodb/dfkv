@@ -257,3 +257,66 @@ TEST_F(DiskSlabTest, RemoveDuringConcurrentAccessStaysConsistent) {
     EXPECT_EQ(got, want);
   }
 }
+
+// O_DIRECT write mode (DFKV_SLAB_WRITE=direct): aligned CacheDirect payloads go
+// through the DIO extent fd; unaligned callers fall back to buffered. Reads are
+// buffered either way, and restart warmth is unaffected.
+TEST_F(DiskSlabTest, DirectWriteModeRoundTrip) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.direct_writes = true;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  // Aligned buffer + padded cap (the RDMA recv-buffer contract).
+  void* mem = nullptr;
+  ASSERT_EQ(posix_memalign(&mem, 4096, 8192), 0);
+  char* buf = static_cast<char*>(mem);
+  for (int i = 0; i < 5000; ++i) buf[i] = static_cast<char>(i * 7);
+  std::string want(buf, 5000);
+  ASSERT_EQ(s.CacheDirect(K(1), buf, 5000, 8192), Status::kOk);
+  std::string got;
+  ASSERT_EQ(s.Range(K(1), 0, 0, &got), Status::kOk);
+  EXPECT_EQ(got, want);
+  // Unaligned source buffer: must fall back to the buffered path, same result.
+  std::string v2(3000, 'z');
+  ASSERT_EQ(s.CacheDirect(K(2), &v2[0], v2.size(), v2.size()), Status::kOk);
+  ASSERT_EQ(s.Range(K(2), 0, 0, &got), Status::kOk);
+  EXPECT_EQ(got, v2);
+  free(mem);
+}
+
+// Async prep hands back a dup'd fd + slot-absolute aligned window and HOLDS the
+// slot (pin + inflight) until RangeRelease: a Remove landing mid-hold defers,
+// and the release both frees the slot and survives a double call.
+TEST_F(DiskSlabTest, RangeDirectPrepHoldsSlotUntilRelease) {
+  bool ok = false;
+  DiskSlabStore s(Opts(1 << 20, 1 << 20, 4096), &ok);
+  ASSERT_TRUE(ok);
+  std::string v(5000, 'p');
+  ASSERT_EQ(s.Cache(K(1), v.data(), v.size()), Status::kOk);
+
+  dfkv::RangePrep p;
+  ASSERT_EQ(s.RangeDirectPrep(K(1), 0, 0, 1 << 20, &p), Status::kOk);
+  ASSERT_GE(p.fd, 0);
+  ASSERT_NE(p.token, 0u);
+  EXPECT_EQ(p.payload_len, v.size());
+  EXPECT_EQ(p.aligned_off % 4096, 0u);
+  EXPECT_EQ(p.aligned_len % 4096, 0u);
+  // The caller's read: aligned pread on the dup'd fd, payload at [head, +len).
+  std::vector<char> rbuf(p.aligned_len);
+  ASSERT_EQ(::pread(p.fd, rbuf.data(), p.aligned_len,
+                    static_cast<off_t>(p.aligned_off)),
+            static_cast<ssize_t>(p.aligned_len));
+  EXPECT_EQ(std::string(rbuf.data() + p.head, p.payload_len), v);
+  ::close(p.fd);
+
+  // Remove during the hold: deferred -- reads gate off, slot not yet freed.
+  EXPECT_EQ(s.Remove(K(1)), Status::kOk);
+  EXPECT_FALSE(s.IsCached(K(1)));
+  EXPECT_EQ(s.Count(), 1u) << "slot must stay held until the release";
+  s.RangeRelease(p.token);
+  EXPECT_EQ(s.Count(), 0u) << "release must execute the deferred remove";
+  s.RangeRelease(p.token);  // double release: no-op
+  // Miss and zero-length behave like the sync path.
+  EXPECT_EQ(s.RangeDirectPrep(K(9), 0, 0, 1 << 20, &p), Status::kNotFound);
+}

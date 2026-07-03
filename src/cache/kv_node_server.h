@@ -98,6 +98,9 @@ class KvNodeServer {
                          KVStore::RangePrep* out);
   // Account a completed prep-based GET (called after the async read finishes).
   void RangeDirectComplete(bool ok, size_t bytes_read);
+  // Balance a prep whose RangePrep::token != 0 (slab pins the slot across the
+  // async read); routed to the owning engine via the token's disk-index byte.
+  void RangePrepRelease(uint64_t token) { group_.RangeRelease(token); }
 
   // --- RAM hot tier zero-copy serve hooks (P3 B5-3) ----------------------------
   // These let the RDMA server send a RAM hit STRAIGHT from the arena MR (no copy

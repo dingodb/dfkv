@@ -17,12 +17,17 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   }
   const bool use_slab = (engine == "slab");
   engine_ = use_slab ? "slab" : "file";  // resolved truth, reported via EngineName
+  // Slab write mode: DFKV_SLAB_WRITE=direct switches the aligned CacheDirect
+  // path to O_DIRECT extent writes (see DiskSlabStore::Options::direct_writes).
+  const char* wm = std::getenv("DFKV_SLAB_WRITE");
+  const bool slab_direct = wm && std::string(wm) == "direct";
   for (const auto& dir : opt.cache_dirs) {
     std::unique_ptr<StoreEngine> store;
     if (use_slab) {
       DiskSlabStore::Options so;
       so.dir = dir;
       so.capacity_bytes = per_disk;
+      so.direct_writes = slab_direct;
       store = std::make_unique<DiskSlabStore>(so);
     } else {
       store = std::make_unique<KVStore>(KVStore::Options{dir, per_disk});
@@ -89,7 +94,23 @@ Status DiskCacheGroup::RangeDirectPrep(const BlockKey& key, uint64_t offset,
                                        KVStore::RangePrep* out) {
   StoreEngine* d = Route(key);
   if (d == nullptr) return Status::kInvalid;
-  return d->RangeDirectPrep(key, offset, length, io_cap, out);
+  Status st = d->RangeDirectPrep(key, offset, length, io_cap, out);
+  // Brand the engine's token with the disk index so RangeRelease -- which has
+  // no key to route by -- finds its way back (0 stays 0 = nothing to release).
+  if (st == Status::kOk && out && out->token != 0) {
+    for (size_t i = 0; i < disks_.size(); ++i) {
+      if (disks_[i].get() != d) continue;
+      out->token = (static_cast<uint64_t>(i + 1) << 56) | (out->token & kTokenMask);
+      break;
+    }
+  }
+  return st;
+}
+
+void DiskCacheGroup::RangeRelease(uint64_t token) {
+  const size_t i = static_cast<size_t>(token >> 56);
+  if (i == 0 || i > disks_.size()) return;
+  disks_[i - 1]->RangeRelease(token & kTokenMask);
 }
 
 bool DiskCacheGroup::IsCached(const BlockKey& key) const {

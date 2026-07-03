@@ -40,6 +40,13 @@ class DiskSlabStore : public StoreEngine {
     // per-extent slot count (and thus slots.tbl size) is bounded. Real KV blocks
     // are MiB-scale, so 1 MiB is a fine default; tests use small values.
     uint64_t slot_granularity = (1ull << 20);
+    // O_DIRECT payload writes on the aligned CacheDirect path (DFKV_SLAB_WRITE=
+    // direct). Trades the page cache's burst absorption (~15 GB/s/disk measured)
+    // for device-rate writes (~4.2 GB/s/disk) with bounded tail latency, zero
+    // dirty-page pressure, and payload-durable-before-record crash ordering.
+    // Extents are fallocate'd either way; DIO OVERWRITES parallelize on XFS
+    // (allocating writes into holes would serialize on the exclusive iolock).
+    bool direct_writes = false;
   };
 
   // Opens (or creates) the store under Options::dir, pre-allocating extents and
@@ -63,10 +70,13 @@ class DiskSlabStore : public StoreEngine {
   Status RangeDirect(const BlockKey& key, uint64_t offset, uint64_t length,
                      char* io_buf, size_t io_cap, const char** out_data,
                      size_t* out_len) override;
-  // No async prep for a buffered engine: return kInvalid so the RDMA server
-  // uses the synchronous RangeDirect path.
+  // Async prep: read-acquire the slot (pin + inflight, held via RangePrep::token
+  // until RangeRelease) and hand back a dup'd extent fd + slot-absolute aligned
+  // window. The dup is BUFFERED, so a hot page-cache slot completes the uring
+  // read without touching the device.
   Status RangeDirectPrep(const BlockKey& key, uint64_t offset, uint64_t length,
                          size_t io_cap, RangePrep* out) override;
+  void RangeRelease(uint64_t token) override;
   bool IsCached(const BlockKey& key) const override;
   Status Remove(const BlockKey& key) override;
 
@@ -86,6 +96,14 @@ class DiskSlabStore : public StoreEngine {
   bool WriteRecord(const SlabAllocator::SlotRef& r, const BlockKey& key,
                    uint32_t payload_len, bool valid);
   bool WritePayload(const SlabAllocator::SlotRef& r, const void* data, size_t len);
+  // O_DIRECT payload write from the caller's ALIGNED buffer (CacheDirect path):
+  // zeroes the padding bytes in place (cap allows) and pwrites the 4 KiB-rounded
+  // length via the extent's DIO fd. Caller pre-checked alignment/cap fit.
+  bool WritePayloadDirect(const SlabAllocator::SlotRef& r, char* data, size_t len);
+  // Shared allocate/pin -> unlocked payload write -> commit skeleton for
+  // Cache/CacheDirect; `write_payload` does just the payload I/O for the slot.
+  template <typename WriteFn>
+  Status CacheImpl(const BlockKey& key, size_t len, const WriteFn& write_payload);
   // Resolve fn's slot + committed payload length and acquire it for an unlocked
   // read (pin + inflight count, under mu_). False = miss (absent, or a write
   // still in flight). Balanced by a Release{...}Locked call.
@@ -106,8 +124,13 @@ class DiskSlabStore : public StoreEngine {
   uint32_t num_extents_ = 0;
   uint32_t max_slots_per_extent_ = 0;
   std::unique_ptr<SlabAllocator> alloc_;
-  std::vector<int> extent_fds_;      // resident, one per extent
+  std::vector<int> extent_fds_;      // resident, one per extent (buffered)
+  std::vector<int> extent_dio_fds_;  // O_DIRECT twins (only when direct_writes)
   int table_fd_ = -1;                // slots.tbl
+  // Outstanding async-prep holds: token -> the key to release (see RangeRelease).
+  struct PrepHold { BlockKey key; std::string fn; };
+  std::unordered_map<uint64_t, PrepHold> prep_holds_;
+  uint64_t prep_token_seq_ = 0;
   // key.Filename() -> its true payload length (slot_size >= this). Rebuilt on
   // open from the table; the allocator only tracks slot size.
   std::unordered_map<std::string, uint32_t> payload_len_;

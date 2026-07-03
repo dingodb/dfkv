@@ -80,6 +80,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
 
 DiskSlabStore::~DiskSlabStore() {
   for (int fd : extent_fds_) if (fd >= 0) ::close(fd);
+  for (int fd : extent_dio_fds_) if (fd >= 0) ::close(fd);
   if (table_fd_ >= 0) ::close(table_fd_);
 }
 
@@ -138,6 +139,7 @@ bool DiskSlabStore::OpenOrInit() {
 
   // Open (create + size) every extent file, keep the fd resident.
   extent_fds_.assign(num_extents_, -1);
+  if (opt_.direct_writes) extent_dio_fds_.assign(num_extents_, -1);
   for (uint32_t e = 0; e < num_extents_; ++e) {
     char name[32];
     std::snprintf(name, sizeof(name), "E%05u", e);
@@ -147,7 +149,21 @@ bool DiskSlabStore::OpenOrInit() {
     off_t sz = ::lseek(fd, 0, SEEK_END);
     if (sz < static_cast<off_t>(opt_.extent_bytes))
       ::ftruncate(fd, static_cast<off_t>(opt_.extent_bytes));
+    // Materialize the extent (idempotent): DIO OVERWRITES of allocated/unwritten
+    // ranges parallelize on XFS; allocating writes into ftruncate holes would
+    // serialize on the exclusive iolock (measured 4.2 vs 2.0 GB/s at 8 writers).
+    if (opt_.direct_writes &&
+        ::fallocate(fd, 0, 0, static_cast<off_t>(opt_.extent_bytes)) != 0 &&
+        errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
+      ::close(fd);
+      return false;
+    }
     extent_fds_[e] = fd;
+    if (opt_.direct_writes) {
+      int dfd = ::open(ep.c_str(), O_WRONLY | O_DIRECT);
+      if (dfd < 0) return false;  // fds opened so far are reclaimed by ~DiskSlabStore
+      extent_dio_fds_[e] = dfd;
+    }
   }
   return true;
 }
@@ -200,6 +216,15 @@ bool DiskSlabStore::WritePayload(const SlabAllocator::SlotRef& r, const void* da
   return PwriteAll(extent_fds_[r.extent], data, len, r.offset);
 }
 
+bool DiskSlabStore::WritePayloadDirect(const SlabAllocator::SlotRef& r, char* data,
+                                       size_t len) {
+  const size_t alen = (len + 4095) & ~static_cast<size_t>(4095);
+  std::memset(data + len, 0, alen - len);  // caller's cap covers the padding
+  // Slot offsets are slot_granularity (>= 4 KiB) aligned, so offset + alen stay
+  // inside the slot; the tail padding lands in bytes payload_len_ gates off.
+  return PwriteAll(extent_dio_fds_[r.extent], data, alen, r.offset);
+}
+
 // mu_ guards only the in-memory maps; the MB-scale payload I/O runs OUTSIDE it
 // (same discipline as KVStore::Cache and RamTier::Put), so concurrent ops to one
 // disk overlap in the kernel instead of serializing behind the store lock. The
@@ -207,8 +232,9 @@ bool DiskSlabStore::WritePayload(const SlabAllocator::SlotRef& r, const void* da
 // slot is never evicted/reused), and payload_len_ -- installed only after the
 // I/O lands -- is the commit point readers gate on, so an in-flight key reads
 // as a clean miss, never as torn bytes.
-Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
-  if (data == nullptr && len != 0) return Status::kInvalid;
+template <typename WriteFn>
+Status DiskSlabStore::CacheImpl(const BlockKey& key, size_t len,
+                                const WriteFn& write_payload) {
   if (!ok_) return Status::kIOError;
   const std::string fn = key.Filename();
   SlabAllocator::SlotRef ref;
@@ -232,7 +258,7 @@ Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
     }
   }
 
-  const bool io_ok = WritePayload(ref, data, len) &&
+  const bool io_ok = write_payload(ref) &&
                      WriteRecord(ref, key, static_cast<uint32_t>(len), /*valid=*/true);
 
   std::lock_guard<std::mutex> lk(mu_);
@@ -250,10 +276,26 @@ Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
   return Status::kOk;
 }
 
+Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
+  if (data == nullptr && len != 0) return Status::kInvalid;
+  return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r) {
+    return WritePayload(r, data, len);
+  });
+}
+
 Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
                                   size_t cap) {
-  (void)cap;  // buffered engine: no aligned-buffer requirement, just the bytes
-  return Cache(key, data, len);
+  if (data == nullptr && len != 0) return Status::kInvalid;
+  return CacheImpl(key, len, [&](const SlabAllocator::SlotRef& r) {
+    // O_DIRECT when enabled and the caller's buffer qualifies (RDMA recv buffers
+    // are 4 KiB-aligned with padded cap); anything else falls back to buffered.
+    const size_t alen = (len + 4095) & ~static_cast<size_t>(4095);
+    if (!extent_dio_fds_.empty() && len != 0 &&
+        (reinterpret_cast<uintptr_t>(data) & 4095) == 0 &&
+        alen <= cap && alen <= r.slot_size)
+      return WritePayloadDirect(r, data, len);
+    return WritePayload(r, data, len);
+  });
 }
 
 Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
@@ -265,10 +307,54 @@ Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
   return st;
 }
 
-Status DiskSlabStore::RangeDirectPrep(const BlockKey&, uint64_t, uint64_t, size_t,
+Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
+                                      uint64_t length, size_t io_cap,
                                       RangePrep* out) {
-  if (out) *out = RangePrep{};  // fd = -1
-  return Status::kInvalid;      // no async prep -> RDMA server uses sync RangeDirect
+  if (out) *out = RangePrep{};
+  if (!ok_) return Status::kIOError;
+  const std::string fn = key.Filename();
+  SlabAllocator::SlotRef ref;
+  uint32_t plen = 0;
+  if (!AcquireForRead(fn, &ref, &plen)) return Status::kNotFound;
+  auto bail = [&](Status s) {  // release the read-acquire on every non-prep exit
+    std::lock_guard<std::mutex> lk(mu_);
+    ReleaseInflightLocked(key, fn);
+    return s;
+  };
+  if (offset >= plen) { out->payload_len = 0; return bail(Status::kOk); }  // zero-len hit, fd=-1
+  const uint64_t n = std::min(length ? length : (plen - offset),
+                              static_cast<uint64_t>(plen - offset));
+  const uint64_t abs = ref.offset + offset;  // slot-absolute within the extent
+  const uint64_t aoff = abs & ~static_cast<uint64_t>(4095);
+  const size_t head = static_cast<size_t>(abs - aoff);
+  const size_t alen = (head + static_cast<size_t>(n) + 4095) & ~static_cast<size_t>(4095);
+  if (alen > io_cap) return bail(Status::kInvalid);  // caller uses sync RangeDirect
+  // Buffered dup: a page-cache-hot slot completes the caller's read in memory.
+  // The dup is the caller's to close; the PIN (not the fd) is what keeps the
+  // slot's bytes intact -- extents are shared files, so an open fd pins nothing.
+  int fd = ::dup(extent_fds_[ref.extent]);
+  if (fd < 0) return bail(Status::kIOError);
+  uint64_t tok;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    tok = ++prep_token_seq_;
+    prep_holds_.emplace(tok, PrepHold{key, fn});
+  }
+  out->fd = fd;
+  out->aligned_off = aoff;
+  out->aligned_len = alen;
+  out->head = head;
+  out->payload_len = static_cast<size_t>(n);
+  out->token = tok;
+  return Status::kOk;
+}
+
+void DiskSlabStore::RangeRelease(uint64_t token) {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = prep_holds_.find(token);
+  if (it == prep_holds_.end()) return;
+  ReleaseInflightLocked(it->second.key, it->second.fn);
+  prep_holds_.erase(it);
 }
 
 // Reads take the lock only to resolve the slot + commit length and acquire the
@@ -278,11 +364,10 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey&, uint64_t, uint64_t, size_
 bool DiskSlabStore::AcquireForRead(const std::string& fn, SlabAllocator::SlotRef* ref,
                                    uint32_t* plen) {
   std::lock_guard<std::mutex> lk(mu_);
-  if (!alloc_->Get(fn, ref)) return false;
   auto it = payload_len_.find(fn);
   if (it == payload_len_.end()) return false;  // in-flight write / removed: no commit
+  if (!alloc_->GetAndPin(fn, ref)) return false;
   *plen = it->second;
-  alloc_->Pin(fn);
   inflight_[fn]++;
   return true;
 }

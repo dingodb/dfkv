@@ -29,6 +29,11 @@ struct RangePrep {
   size_t aligned_len = 0;   // O_DIRECT-aligned read length (multiple of 4096)
   size_t head = 0;          // offset of requested bytes within the aligned read
   size_t payload_len = 0;   // exact requested bytes (after clamp to file size)
+  // 0 = nothing to release. A slot-based engine (slab) must hold the slot
+  // against eviction/remove while the caller's async read is in flight -- the
+  // caller passes this back via RangeRelease once the read is done (KVStore's
+  // per-key files need no hold: the open fd pins the inode, so token stays 0).
+  uint64_t token = 0;
 };
 
 class StoreEngine {
@@ -47,6 +52,9 @@ class StoreEngine {
                              size_t* out_len) = 0;
   virtual Status RangeDirectPrep(const BlockKey& key, uint64_t offset,
                                  uint64_t length, size_t io_cap, RangePrep* out) = 0;
+  // Balance a prep whose RangePrep::token != 0, after the async read completes
+  // (success or failure). Default: nothing to release.
+  virtual void RangeRelease(uint64_t token) { (void)token; }
   virtual bool IsCached(const BlockKey& key) const = 0;
   virtual Status Remove(const BlockKey& key) = 0;
 

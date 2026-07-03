@@ -446,6 +446,7 @@ void RdmaServer::Serve(int boot_fd) {
         size_t recv_slot = 0;
         int read_idx = -1;   // >=0: index into descs (async read); -1: sync reply
         int fd = -1;         // owned (async only); closed after the batch read
+        uint64_t prep_token = 0;  // slab slot hold; released where fd is closed
         size_t head = 0;
         size_t payload_len = 0;
         Reply reply;         // used when read_idx < 0
@@ -509,11 +510,14 @@ void RdmaServer::Serve(int boot_fd) {
               qd.read_idx = static_cast<int>(descs.size());
               descs.push_back(d);
               qd.fd = pr.fd;
+              qd.prep_token = pr.release_token;
               qd.head = pr.head;
               qd.payload_len = pr.payload_len;
               deferred = true;
             } else if (pst == Status::kOk && pr.fd >= 0) {
               ::close(pr.fd);  // zero-len / oversize: handled by sync build below
+              if (pr.release_token && range_release_handler_)
+                range_release_handler_(pr.release_token);
             }
           }
 
@@ -581,6 +585,10 @@ void RdmaServer::Serve(int boot_fd) {
             ok = got >= 0 && static_cast<size_t>(got) >= qd.head + qd.payload_len;
           }
           if (qd.fd >= 0) { ::close(qd.fd); qd.fd = -1; }
+          if (qd.prep_token) {  // read done (async or sync fallback): drop the slot hold
+            if (range_release_handler_) range_release_handler_(qd.prep_token);
+            qd.prep_token = 0;
+          }
           if (range_complete_handler_)
             range_complete_handler_(ok, ok ? qd.payload_len : 0);
           char* sb = ep.sbuf(qd.send_slot);
@@ -602,7 +610,10 @@ void RdmaServer::Serve(int boot_fd) {
       }
 
       // Connection ending: close any fds still owned by un-emitted queue entries.
-      for (auto& qd : queue) if (qd.fd >= 0) ::close(qd.fd);
+      for (auto& qd : queue) {
+        if (qd.fd >= 0) ::close(qd.fd);
+        if (qd.prep_token && range_release_handler_) range_release_handler_(qd.prep_token);
+      }
     }
     // Release RAM-hit pins for sends that never completed (conn tore down) so the
     // arena slots don't stay pinned forever (B5-3).

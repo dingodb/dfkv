@@ -287,6 +287,17 @@ bool SlabAllocator::Get(const std::string& key, SlotRef* out) {
   return true;
 }
 
+bool SlabAllocator::GetAndPin(const std::string& key, SlotRef* out) {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = index_.find(key);
+  if (it == index_.end()) return false;
+  it->second.referenced = true;  // CLOCK second chance
+  if (it->second.refs == 0) extents_[it->second.ref.extent].pinned++;
+  it->second.refs++;
+  if (out) *out = it->second.ref;
+  return true;
+}
+
 bool SlabAllocator::Contains(const std::string& key) const {
   std::lock_guard<std::mutex> lk(mu_);
   return index_.find(key) != index_.end();
