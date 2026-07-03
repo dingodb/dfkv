@@ -1,15 +1,15 @@
 # dfkv Architecture
 
 A tour of how dfkv is put together: the layers a request flows through, the
-pluggable storage engines, the optional RAM hot tier, and the versioned wire
-protocol. For deployment see [DEPLOY.md](DEPLOY.md); for metrics see
+pluggable storage engines, the optional RAM hot tier, and the wire protocol.
+For deployment see [DEPLOY.md](DEPLOY.md); for metrics see
 [METRICS.md](METRICS.md); for engine connectors and the **client-side**
 env/config reference see [CONNECTORS.md](CONNECTORS.md).
 
 > **Client vs server config:** the storage engine (§5) and RAM tier (§6) are
 > **server-side only** — a client needs no config for them and can't tell which a
-> node runs. The only client-facing knob added in v1.7.0 is `DFKV_WIRE_VERSION`
-> (§4). See [CONNECTORS.md](CONNECTORS.md) §1.
+> node runs. No client-side config is required for any v1.7.x feature (the
+> 96-bit key, §3, is automatic). See [CONNECTORS.md](CONNECTORS.md) §1.
 
 ---
 
@@ -89,26 +89,27 @@ is unaffected.
 
 ---
 
-## 4. Wire protocol & versioning
+## 4. Wire protocol
 
-Fixed-prefix binary frames (`src/transport/wire.h`):
+Fixed-prefix binary frames (`src/transport/wire.h`), protocol version 1:
 
-| | v1 request | v1 response | v2 request | v2 response |
-|-|-----------|-------------|-----------|-------------|
-| prefix bytes | 42 | 10 | 50 | 18 |
+| | request | response |
+|-|---------|----------|
+| prefix bytes | 42 | 10 |
 
-**v2** appends an 8-byte request `seq` echoed in the response, so a client can
-validate that a reply matches the request it paired by FIFO order (defense
-against a torn/misordered stream). The server is **dual-accept**: it decodes
-either version and replies in the matching version, so a fleet upgrades with **no
-flag day** — new servers serve old clients and vice-versa.
+Both prefixes start with a 1-byte protocol version so a mixed-version deploy
+**fails fast** (an unknown version is rejected and the connection dropped)
+instead of mis-parsing. Replies are paired to requests by strict FIFO order —
+on TCP that order is the stream's; on RDMA the RC transport guarantees reliable
+in-order delivery in hardware.
 
-- TCP client wire version is chosen once via `DFKV_WIRE_VERSION` (default `1`).
-- TCP and MDS servers dual-accept v1/v2.
-- **RDMA stays v1-only**: its zero-copy PUT posts the receive scatter split
-  (`[prefix+ValueHeader | payload]`) *before* the version is known, and a v2
-  prefix (8 bytes longer) would misalign the ValueHeader across the split. A
-  version-adaptive recv-scatter is future work; RDMA rejects non-v1 frames.
+> History: v1.7.0/v1.7.1 shipped an experimental opt-in "wire v2" (a request
+> `seq` echoed in the reply, `DFKV_WIRE_VERSION=2`). It was **removed in
+> v1.7.2** as speculative: the RDMA data path — where production traffic runs —
+> already gets ordering + ICRC from RC hardware and never supported v2 (its
+> zero-copy receive posts the scatter split before the version is known), and no
+> deployment used it on TCP. If out-of-order replies are ever needed, a
+> request-id echo will be designed for that purpose then.
 
 ---
 
@@ -214,7 +215,6 @@ a stock `v1.7.0` node behaves exactly like `v1.6.x`.
 
 | Feature | Enable with | Default | Notes |
 |---------|-------------|---------|-------|
-| wire v2 (client) | `DFKV_WIRE_VERSION=2` | v1 | servers dual-accept regardless |
 | slab storage engine | `--store-engine=slab` / `DFKV_STORE_ENGINE=slab` | `file` | needs clean-disk cold start |
 | RAM hot tier | `DFKV_RAM_TIER=1` (+ `DFKV_RAM_TIER_BYTES`) | off | write-through + RDMA zero-copy GET |
 | RDMA transport | build `-DDFKV_WITH_RDMA=ON`, `DFKV_RDMA=1` | TCP | device by name `DFKV_RDMA_DEV` |
@@ -226,7 +226,7 @@ a stock `v1.7.0` node behaves exactly like `v1.6.x`.
 
 ```
 src/common/     ValueHeader, BlockKey, Status — portable shared types
-src/transport/  wire.h (v1/v2 frames) · tcp_transport · rdma_transport / rdma_verbs
+src/transport/  wire.h (wire frames) · tcp_transport · rdma_transport / rdma_verbs
 src/cache/      store_engine.h (interface) · kv_store (file) ·
                 slab_allocator + disk_slab_store (slab) · ram_tier (RAM hot tier) ·
                 disk_cache_group (per-disk routing) · kv_node_server · rdma_server ·

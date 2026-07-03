@@ -481,10 +481,7 @@ void RdmaServer::Serve(int boot_fd) {
           completions_.fetch_add(1, std::memory_order_relaxed);  // a request RECV
           size_t r = static_cast<size_t>(wc.wr_id);
           ReqFields rq;
-          // v1-only for now: the RDMA server's v2 dual-accept (variable prefix +
-          // seq echo) lands with the v2 client (no v2 frames reach here until
-          // then). Reject a non-v1 version cleanly rather than reply v1 to it.
-          if (DecodeReq(ep.rbuf(r), &rq) != kProtoVersion) { fail = true; break; }
+          if (!DecodeReq(ep.rbuf(r), &rq)) { fail = true; break; }
           if (free_send.empty()) { fail = true; break; }
           size_t s = free_send.back(); free_send.pop_back();
 
@@ -641,7 +638,7 @@ sync_serve_loop:;
       completions_.fetch_add(1, std::memory_order_relaxed);  // a request RECV
       size_t r = static_cast<size_t>(wc.wr_id);
       ReqFields rq;
-      if (DecodeReq(ep.rbuf(r), &rq) != kProtoVersion) { fail = true; break; }  // v1-only (see above)
+      if (!DecodeReq(ep.rbuf(r), &rq)) { fail = true; break; }
       if (free_send.empty()) { fail = true; break; }
       size_t s = free_send.back(); free_send.pop_back();
       Reply reply;

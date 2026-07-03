@@ -1,7 +1,6 @@
 #ifndef DFKV_TCP_TRANSPORT_H_
 #define DFKV_TCP_TRANSPORT_H_
 
-#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -9,7 +8,7 @@
 #include <vector>
 
 #include "transport/transport.h"
-#include "transport/wire.h"   // ClientWireVersion / kProtoVersion
+#include "transport/wire.h"
 
 namespace dfkv {
 
@@ -50,8 +49,6 @@ class TcpTransport : public Transport {
   std::unordered_map<std::string, std::vector<int>> pool_;  // node -> idle fds
   int connect_ms_ = 3000;
   int io_ms_ = 10000;
-  const uint8_t wire_ver_ = ClientWireVersion();  // v1 (default) or v2 per env
-  std::atomic<uint64_t> seq_{1};  // per-request seq for v2 reply correlation
 };
 
 }  // namespace dfkv

@@ -18,39 +18,19 @@ constexpr size_t kMaxIdlePerNode = 16;  // cap pooled idle conns per node
 // server's response status (which may itself be NotFound etc.).
 bool OneShot(int fd, WireOp op, const BlockKey& k, uint64_t offset,
              uint64_t length, const void* payload, uint64_t payload_len,
-             Status* st, std::string* out, uint64_t max_data,
-             uint8_t wire_ver, uint64_t seq) {
-  char prefix[kReqPrefixV2];
-  size_t plen;
-  if (wire_ver == kProtoVersionV2) {
-    EncodeReqV2(prefix, op, k, offset, length, payload_len, seq);
-    plen = kReqPrefixV2;
-  } else {
-    EncodeReq(prefix, op, k, offset, length, payload_len);
-    plen = kReqPrefix;
-  }
-  if (!net::WriteAll(fd, prefix, plen)) return false;
+             Status* st, std::string* out, uint64_t max_data) {
+  char prefix[kReqPrefix];
+  EncodeReq(prefix, op, k, offset, length, payload_len);
+  if (!net::WriteAll(fd, prefix, kReqPrefix)) return false;
   if (payload_len && !net::WriteAll(fd, payload, payload_len)) return false;
 
-  char rp[kRespPrefixV2];
+  char rp[kRespPrefix];
   if (!net::ReadAll(fd, rp, kRespPrefix)) return false;
-  // A dual-accept server echoes our version; read the extra 8 bytes only when
-  // it actually replied v2 (peek the version byte, not our request version, so
-  // an old v1-only server that answers v1 is handled gracefully below).
-  if (static_cast<uint8_t>(rp[0]) == kProtoVersionV2 &&
-      !net::ReadAll(fd, rp + kRespPrefix, kRespPrefixV2 - kRespPrefix))
-    return false;
-  uint64_t dlen = 0, resp_seq = 0;
+  uint64_t dlen = 0;
   // max_data caps the server-declared response length BEFORE the allocation
   // below (the caller knows what it asked for; a corrupt/hostile peer must
   // not be able to declare a 16 GiB body).
-  uint8_t rver = DecodeResp(rp, st, &dlen, max_data, &resp_seq);
-  if (!rver) return false;  // bad version / oversize
-  // v2 request: the reply MUST be v2 and echo our seq. A seq mismatch (or an
-  // old server that replied v1) is a protocol violation -- fail the round trip
-  // so the caller drops the connection rather than accept a misattributed reply.
-  if (wire_ver == kProtoVersionV2 && (rver != kProtoVersionV2 || resp_seq != seq))
-    return false;
+  if (!DecodeResp(rp, st, &dlen, max_data)) return false;  // bad version / oversize
   if (dlen) {
     std::string data(dlen, '\0');
     if (!net::ReadAll(fd, &data[0], dlen)) return false;
@@ -104,11 +84,9 @@ Status TcpTransport::RoundTrip(const std::string& node, WireOp op,
     int fd = Acquire(node, &from_pool);
     if (fd < 0) return Status::kIOError;  // dial failed
 
-    // Fresh per-request seq (v2 only): correlates the reply to this request.
-    const uint64_t seq = seq_.fetch_add(1, std::memory_order_relaxed);
     Status st = Status::kIOError;
     if (OneShot(fd, op, k, offset, length, payload, payload_len, &st, out,
-                max_data, wire_ver_, seq)) {
+                max_data)) {
       Release(node, fd);  // healthy -> back to pool
       return st;
     }

@@ -1,6 +1,6 @@
 # dfkv — standalone distributed KV cache for SGLang HiCache (no brpc/MDS/S3 deps).
 cmake_minimum_required(VERSION 3.20)
-project(dfkv VERSION 1.7.1 LANGUAGES CXX)
+project(dfkv VERSION 1.7.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -124,12 +124,6 @@ if(DFKV_BUILD_TESTS)
     target_link_libraries(${name} PRIVATE dfkv_core GTest::gtest_main)
     gtest_discover_tests(${name})
   endforeach()
-  # tcp_client_v2_test caches DFKV_WIRE_VERSION on first use, so the default
-  # discovery above runs it as v1; add a second run pinned to v2 to cover the
-  # v2 client path (seq framing + echoed-seq validation) end-to-end.
-  add_test(NAME tcp_client_v2_test_v2 COMMAND tcp_client_v2_test)
-  set_tests_properties(tcp_client_v2_test_v2 PROPERTIES
-    ENVIRONMENT "DFKV_WIRE_VERSION=2")
   if(DFKV_WITH_RDMA)  # exercised in CI under Soft-RoCE (rdma_rxe); skips if no device
     add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
     target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
