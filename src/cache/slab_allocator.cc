@@ -14,6 +14,59 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(opt) {
   if (opt_.align == 0) opt_.align = 1;
   if (opt_.num_extents == 0) opt_.num_extents = 1;
   extents_.assign(opt_.num_extents, ExtentMeta{});  // all kUnbound (in pool)
+  unbound_ = opt_.num_extents;
+}
+
+void SlabAllocator::PushFreeLocked(Class& C, uint32_t ext, uint32_t slot) {
+  auto& v = C.free_by_ext[ext];
+  if (v.empty()) C.ext_rr.push_back(ext);
+  v.push_back(slot);
+}
+
+bool SlabAllocator::PopFreeLocked(Class& C, Slot* out) {
+  if (C.ext_rr.empty()) return false;
+  if (C.rr_next >= C.ext_rr.size()) C.rr_next = 0;
+  const uint32_t ext = C.ext_rr[C.rr_next];
+  auto vit = C.free_by_ext.find(ext);
+  auto& v = vit->second;
+  const uint32_t slot = v.back();
+  v.pop_back();
+  if (v.empty()) {
+    C.free_by_ext.erase(vit);
+    // Swap-erase keeps rr_next pointing at the moved-in extent: no skip, no advance.
+    C.ext_rr[C.rr_next] = C.ext_rr.back();
+    C.ext_rr.pop_back();
+  } else {
+    ++C.rr_next;  // rotate: the NEXT Put goes to a different extent (inode)
+  }
+  if (out) *out = Slot{ext, slot};
+  return true;
+}
+
+void SlabAllocator::DropFromRotationLocked(Class& C, uint32_t ext) {
+  for (size_t i = 0; i < C.ext_rr.size(); ++i) {
+    if (C.ext_rr[i] != ext) continue;
+    C.ext_rr[i] = C.ext_rr.back();
+    C.ext_rr.pop_back();
+    if (C.rr_next > i) --C.rr_next;
+    return;
+  }
+}
+
+bool SlabAllocator::TakeFreeSlotLocked(Class& C, uint32_t ext, uint32_t slot) {
+  auto vit = C.free_by_ext.find(ext);
+  if (vit == C.free_by_ext.end()) return false;
+  auto& v = vit->second;
+  auto it = std::find(v.begin(), v.end(), slot);
+  if (it == v.end()) return false;
+  *it = v.back();
+  v.pop_back();
+  if (v.empty()) { C.free_by_ext.erase(vit); DropFromRotationLocked(C, ext); }
+  return true;
+}
+
+void SlabAllocator::DropExtentFreeLocked(Class& C, uint32_t ext) {
+  if (C.free_by_ext.erase(ext)) DropFromRotationLocked(C, ext);
 }
 
 size_t SlabAllocator::ClassForLen(size_t aligned_len) {
@@ -57,18 +110,13 @@ bool SlabAllocator::Restore(const std::string& key, uint32_t slot_size,
     m.total_slots = C.slots_per_extent;
     m.free_slots = C.slots_per_extent;
     m.pinned = 0;
-    C.free_slots.reserve(C.free_slots.size() + m.total_slots);
-    for (uint32_t s = 0; s < m.total_slots; ++s) C.free_slots.push_back(Slot{extent, s});
+    --unbound_;
+    for (uint32_t s = 0; s < m.total_slots; ++s) PushFreeLocked(C, extent, s);
   } else if (m.cls != static_cast<int>(cls)) {
     return false;  // persistence inconsistency: two classes on one extent
   }
-  // Reserve the exact slot: pull it out of the class free stack.
-  auto& fs = C.free_slots;
-  auto it = std::find_if(fs.begin(), fs.end(), [extent, slot](const Slot& s) {
-    return s.extent == extent && s.slot == slot;
-  });
-  if (it == fs.end()) return false;  // already taken (duplicate record)
-  fs.erase(it);
+  // Reserve the exact slot: pull it out of the extent's free bucket.
+  if (!TakeFreeSlotLocked(C, extent, slot)) return false;  // taken (duplicate record)
   Entry e;
   e.ref.cls = static_cast<uint32_t>(cls);
   e.ref.extent = extent;
@@ -84,6 +132,7 @@ bool SlabAllocator::Restore(const std::string& key, uint32_t slot_size,
 }
 
 bool SlabAllocator::BindFreeExtent(size_t cls) {
+  if (unbound_ == 0) return false;  // O(1) fast path for the per-Put stripe top-up
   for (uint32_t e = 0; e < extents_.size(); ++e) {
     if (extents_[e].cls != kUnbound) continue;
     Class& C = *classes_[cls];
@@ -93,8 +142,8 @@ bool SlabAllocator::BindFreeExtent(size_t cls) {
     extents_[e].total_slots = total;
     extents_[e].free_slots = total;
     extents_[e].pinned = 0;
-    C.free_slots.reserve(C.free_slots.size() + total);
-    for (uint32_t s = 0; s < total; ++s) C.free_slots.push_back(Slot{e, s});
+    --unbound_;
+    for (uint32_t s = 0; s < total; ++s) PushFreeLocked(C, e, s);
     return true;
   }
   return false;
@@ -105,7 +154,7 @@ void SlabAllocator::FreeSlotLocked(const std::string& key, Entry& e) {
   Class& C = *classes_[cls];
   if (C.hand != C.ring.end() && C.hand == e.ring_it) C.hand = std::next(C.hand);
   C.ring.erase(e.ring_it);
-  C.free_slots.push_back(Slot{ext, slot});
+  PushFreeLocked(C, ext, slot);
   extents_[ext].free_slots++;
   if (e.refs > 0 && extents_[ext].pinned > 0) extents_[ext].pinned--;
   used_bytes_ -= e.ref.slot_size;
@@ -174,15 +223,13 @@ bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted
     auto it = index_.find(v);
     if (it != index_.end()) { FreeSlotLocked(v, it->second); evicted->push_back(v); evictions_++; }
   }
-  // Drop E's now-free slots from the old class's free list, then unbind E.
-  auto& oldfree = classes_[old_cls]->free_slots;
-  oldfree.erase(std::remove_if(oldfree.begin(), oldfree.end(),
-                               [E](const Slot& s) { return s.extent == E; }),
-                oldfree.end());
+  // Drop E's now-free slots from the old class's bookkeeping, then unbind E.
+  DropExtentFreeLocked(*classes_[old_cls], E);
   extents_[E].cls = kUnbound;
   extents_[E].total_slots = 0;
   extents_[E].free_slots = 0;
   extents_[E].pinned = 0;
+  ++unbound_;
   return BindFreeExtent(cls);  // now picks the freshly-unbound E
 }
 
@@ -203,8 +250,11 @@ bool SlabAllocator::Put(const std::string& key, size_t len, SlotRef* out,
   Slot got{0, 0};
   for (;;) {
     Class& C = *classes_[cls];
-    if (!C.free_slots.empty()) { got = C.free_slots.back(); C.free_slots.pop_back(); break; }
-    if (BindFreeExtent(cls)) continue;
+    // Stripe top-up: keep up to kStripeWays extents in this class's rotation so
+    // concurrent writers land on different files (cheap no-op once the pool is
+    // exhausted -- BindFreeExtent bails at unbound_ == 0).
+    while (C.ext_rr.size() < kStripeWays && BindFreeExtent(cls)) {}
+    if (PopFreeLocked(C, &got)) break;
     if (EvictOneFrom(cls, evicted)) continue;
     if (StealExtentFor(cls, evicted)) continue;
     return false;  // nothing to free: all candidate slots are pinned

@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <set>
 #include <string>
@@ -221,4 +222,28 @@ TEST(SlabAllocator, RestoreRejectsInconsistentInput) {
   EXPECT_FALSE(a.Restore("k2", 4096, 0, 0));                      // slot already taken
   // A second class on the same extent is a persistence inconsistency.
   EXPECT_FALSE(a.Restore("k3", 8192, 0, 0));
+}
+
+// Consecutive Puts must STRIPE across extents (different backing files): a
+// single-stack free list hands out one extent's slots back-to-back, funneling
+// every concurrent writer into one inode, and buffered writes to one file
+// serialize on the kernel's per-inode lock.
+TEST(SlabAllocator, ConsecutivePutsStripeAcrossExtents) {
+  SlabAllocator a(Opts(4 * 4096, 4));  // 4 extents x 4 slots of one class
+  std::vector<std::string> ev;
+  SlotRef r;
+  std::vector<uint32_t> extents;
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+    extents.push_back(r.extent);
+  }
+  // First 4 Puts land on 4 DISTINCT extents (pool has 4, stripe width >= 4).
+  std::sort(extents.begin(), extents.end());
+  extents.erase(std::unique(extents.begin(), extents.end()), extents.end());
+  EXPECT_EQ(extents.size(), 4u) << "puts funneled into fewer inodes than available";
+  // The rotation keeps cycling once all extents are bound.
+  ASSERT_TRUE(a.Put("k4", 4096, &r, &ev));
+  uint32_t e4 = r.extent;
+  ASSERT_TRUE(a.Put("k5", 4096, &r, &ev));
+  EXPECT_NE(r.extent, e4) << "back-to-back puts hit the same extent";
 }
