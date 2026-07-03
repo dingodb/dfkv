@@ -173,18 +173,12 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out) {
 
 void MdsServer::Handle(int fd) {
   while (running_) {
-    // Dual-accept v1/v2 (see wire.h): the version byte is in the common v1
-    // prefix; a v2 frame carries 8 more trailing bytes and gets a v2 reply.
-    char prefix[kReqPrefixV2];
+    char prefix[kReqPrefix];
     if (!net::ReadAll(fd, prefix, kReqPrefix)) return;
-    if (static_cast<uint8_t>(prefix[0]) == kProtoVersionV2 &&
-        !net::ReadAll(fd, prefix + kReqPrefix, kReqPrefixV2 - kReqPrefix))
-      return;
     ReqFields rq;
     // MDS frames carry a group name + one MemberInfo (<1 KiB); cap the
     // declared length so a forged prefix can't trigger a giant allocation.
-    uint8_t ver = DecodeReq(prefix, &rq, wire_limits::kMdsMaxReqPayload);
-    if (!ver) return;
+    if (!DecodeReq(prefix, &rq, wire_limits::kMdsMaxReqPayload)) return;
     std::vector<char> payload(rq.payload_len);
     if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
 
@@ -205,11 +199,9 @@ void MdsServer::Handle(int fd) {
       st = ListMembers(group, &data);
     }
 
-    char rp[kRespPrefixV2];
-    size_t rlen;
-    if (ver == kProtoVersionV2) { EncodeRespV2(rp, st, data.size(), rq.seq); rlen = kRespPrefixV2; }
-    else { EncodeResp(rp, st, data.size()); rlen = kRespPrefix; }
-    if (!net::WriteAll(fd, rp, rlen)) return;
+    char rp[kRespPrefix];
+    EncodeResp(rp, st, data.size());
+    if (!net::WriteAll(fd, rp, kRespPrefix)) return;
     if (!data.empty() && !net::WriteAll(fd, data.data(), data.size())) return;
   }
 }

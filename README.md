@@ -87,7 +87,7 @@ Per-engine connect/config + client env/config reference (all connectors): `docs/
 ## Layout
 ```
 src/        portable C++ core: common/ (shared types) · utils/ (generic helpers) ·
-            transport/ (TCP/RDMA + v1/v2 wire protocol) · cache/ (StoreEngine: file
+            transport/ (TCP/RDMA + wire protocol) · cache/ (StoreEngine: file
             KVStore | slab SlabAllocator+DiskSlabStore · RamTier · dfkv_server) ·
             client/ (KV client + C ABI) · mds/ (membership service + dfkv_mds) · tools/ (CLIs)
 integration/hicache/  dfkv_hicache.py (SGLang dynamic backend plugin) + dfkv_telemetry/
@@ -128,11 +128,9 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   load bottleneck. Send-in-flight slot pinning + flush backpressure keep it correct;
   `dfkv_ram_*` metrics expose hit-rate + backpressure. See
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5–6.
-- **Versioned wire protocol** (v1/v2): v2 adds a request `seq` echoed in the reply;
-  servers **dual-accept** both versions (no flag-day rolling upgrade). Client opt-in
-  via `DFKV_WIRE_VERSION=2` (default v1). Block identity is **96-bit** (id + index
-  from MD5) to make same-model hash collisions — a silent cross-key read — vanishingly
-  unlikely. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3–4.
+- **96-bit block identity** (id + index from MD5): makes same-model hash
+  collisions — a silent cross-key read — vanishingly unlikely. Automatic in the
+  v1.7.x client, no config. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3.
 - **Connection pooling + keep-alive** (TCP_NODELAY): ~250× lower latency vs dial-per-call.
 - **Batch APIs** with concurrent fan-out across nodes (`BatchPut/Get/Exist`, C ABI + plugin).
 - **Connect/IO timeouts + stale-connection retry**: a hung node fails fast, never hangs.

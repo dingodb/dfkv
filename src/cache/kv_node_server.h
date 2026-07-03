@@ -61,8 +61,6 @@ class KvNodeServer {
   size_t m_exist_miss() const { return exist_miss_.load(std::memory_order_relaxed); }
   size_t m_remove_ok() const { return remove_ok_.load(std::memory_order_relaxed); }
   size_t m_remove_miss() const { return remove_miss_.load(std::memory_order_relaxed); }
-  size_t m_wire_v1() const { return wire_v1_requests_.load(std::memory_order_relaxed); }
-  size_t m_wire_v2() const { return wire_v2_requests_.load(std::memory_order_relaxed); }
   std::string MetricsText() const;  // Prometheus text format
 
   // Transport-agnostic request processing (shared by the TCP handler and, when
@@ -129,7 +127,6 @@ class KvNodeServer {
   std::atomic<size_t> open_connections_{0};
   Sampler lat_sampler_{64};        // 1-in-64 latency sampling (near-zero hot-path cost)
   LatencyHist get_lat_, put_lat_;  // server-side op latency (sampled)
-  std::atomic<uint64_t> wire_v1_requests_{0}, wire_v2_requests_{0};  // by frame version
   std::string members_;  // advertised cluster membership (kMembers)
   uint64_t max_request_payload_ = 0;  // 0 = resolve default lazily (see .cc)
   std::string node_id_, node_group_;       // identity for Prometheus labels (optional)

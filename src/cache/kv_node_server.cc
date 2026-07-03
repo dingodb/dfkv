@@ -176,10 +176,6 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_bytes_read_total", "counter", "Payload bytes read",
          bytes_read_.load(std::memory_order_relaxed));
   metric("dfkv_accepts_total", "counter", "TCP connections accepted", AcceptCount());
-  metric("dfkv_wire_v1_requests_total", "counter", "TCP requests decoded as wire v1",
-         wire_v1_requests_.load(std::memory_order_relaxed));
-  metric("dfkv_wire_v2_requests_total", "counter", "TCP requests decoded as wire v2",
-         wire_v2_requests_.load(std::memory_order_relaxed));
   metric("dfkv_evictions_total", "counter", "Objects evicted (capacity pressure)",
          group_.Evictions());
   metric("dfkv_evicted_bytes_total", "counter", "Bytes evicted", group_.EvictedBytes());
@@ -519,19 +515,10 @@ void KvNodeServer::Handle(int fd) {
                                    ? max_request_payload_
                                    : wire_limits::MaxRequestPayload();
   while (running_) {
-    // Dual-accept v1/v2: read the common v1 prefix, then 8 more bytes only when
-    // the version byte marks a v2 frame; reply in the SAME version. A v1 and a
-    // v2 client thus share this server with no flag-day upgrade.
-    char prefix[kReqPrefixV2];
+    char prefix[kReqPrefix];
     if (!net::ReadAll(fd, prefix, kReqPrefix)) return;  // peer closed / error
-    if (static_cast<uint8_t>(prefix[0]) == kProtoVersionV2 &&
-        !net::ReadAll(fd, prefix + kReqPrefix, kReqPrefixV2 - kReqPrefix))
-      return;
     ReqFields rq;
-    uint8_t ver = DecodeReq(prefix, &rq, max_payload);
-    if (!ver) return;  // bad version / oversize => drop
-    (ver == kProtoVersionV2 ? wire_v2_requests_ : wire_v1_requests_)
-        .fetch_add(1, std::memory_order_relaxed);
+    if (!DecodeReq(prefix, &rq, max_payload)) return;  // bad version / oversize => drop
     std::vector<char> payload(rq.payload_len);
     if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
 
@@ -539,11 +526,9 @@ void KvNodeServer::Handle(int fd) {
     Status st = ProcessRequest(rq.op, rq.id, rq.index, rq.size, rq.offset,
                                rq.length, payload.data(), rq.payload_len, &data);
 
-    char rp[kRespPrefixV2];
-    size_t rlen;
-    if (ver == kProtoVersionV2) { EncodeRespV2(rp, st, data.size(), rq.seq); rlen = kRespPrefixV2; }
-    else { EncodeResp(rp, st, data.size()); rlen = kRespPrefix; }
-    if (!net::WriteAll(fd, rp, rlen)) return;
+    char rp[kRespPrefix];
+    EncodeResp(rp, st, data.size());
+    if (!net::WriteAll(fd, rp, kRespPrefix)) return;
     if (!data.empty() && !net::WriteAll(fd, data.data(), data.size())) return;
   }
 }

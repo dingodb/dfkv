@@ -36,7 +36,7 @@ TEST(Wire, RespRoundTrip) {
 TEST(Wire, ReqRejectsBadVersion) {
   char buf[kReqPrefix];
   EncodeReq(buf, WireOp::kCache, BlockKey{1, 2, 3}, 0, 0, 0);
-  buf[0] = static_cast<char>(kProtoVersionV2 + 1);  // unknown version (>v2)
+  buf[0] = static_cast<char>(kProtoVersion + 1);  // unknown version
   ReqFields rq;
   EXPECT_FALSE(DecodeReq(buf, &rq));
 }
@@ -44,7 +44,7 @@ TEST(Wire, ReqRejectsBadVersion) {
 TEST(Wire, RespRejectsBadVersion) {
   char buf[kRespPrefix];
   EncodeResp(buf, Status::kOk, 0);
-  buf[0] = static_cast<char>(kProtoVersionV2 + 1);  // unknown version (>v2)
+  buf[0] = static_cast<char>(kProtoVersion + 1);  // unknown version
   Status st = Status::kInvalid;
   uint64_t dlen = 0;
   EXPECT_FALSE(DecodeResp(buf, &st, &dlen));
@@ -86,50 +86,3 @@ TEST(Wire, RespRejectsOversizedData) {
   EXPECT_EQ(dlen, kMaxFrameLen + 1);
 }
 
-TEST(Wire, ReqV2RoundTripCarriesSeq) {
-  char buf[kReqPrefixV2];
-  BlockKey k{0x1122334455667788ull, 0xAABBCCDD, 0x12345678};
-  EncodeReqV2(buf, WireOp::kRange, k, 4096, 8192, 65536, 0xDEADBEEFCAFEull);
-  ReqFields rq;
-  EXPECT_EQ(DecodeReq(buf, &rq), kProtoVersionV2);
-  EXPECT_EQ(rq.op, static_cast<uint8_t>(WireOp::kRange));
-  EXPECT_EQ(rq.id, k.id);
-  EXPECT_EQ(rq.payload_len, 65536u);
-  EXPECT_EQ(rq.seq, 0xDEADBEEFCAFEull);
-}
-
-TEST(Wire, ReqV1DecodesWithZeroSeqAndVersionOne) {
-  char buf[kReqPrefix];
-  EncodeReq(buf, WireOp::kCache, BlockKey{1, 2, 3}, 0, 0, 0);
-  ReqFields rq;
-  EXPECT_EQ(DecodeReq(buf, &rq), kProtoVersion);
-  EXPECT_EQ(rq.seq, 0u) << "a v1 frame has no seq";
-}
-
-TEST(Wire, RespV2RoundTripEchoesSeq) {
-  char buf[kRespPrefixV2];
-  EncodeRespV2(buf, Status::kOk, 1u << 20, 0x0102030405060708ull);
-  Status st = Status::kInvalid;
-  uint64_t dlen = 0, seq = 0;
-  EXPECT_EQ(DecodeResp(buf, &st, &dlen, kMaxFrameLen, &seq), kProtoVersionV2);
-  EXPECT_EQ(st, Status::kOk);
-  EXPECT_EQ(dlen, 1u << 20);
-  EXPECT_EQ(seq, 0x0102030405060708ull);
-}
-
-TEST(Wire, RespV1DecodesWithVersionOneAndZeroSeq) {
-  char buf[kRespPrefix];
-  EncodeResp(buf, Status::kNotFound, 0);
-  Status st = Status::kInvalid;
-  uint64_t dlen = 0, seq = 0xff;
-  EXPECT_EQ(DecodeResp(buf, &st, &dlen, kMaxFrameLen, &seq), kProtoVersion);
-  EXPECT_EQ(st, Status::kNotFound);
-  EXPECT_EQ(seq, 0u);
-}
-
-TEST(Wire, V2OversizePayloadStillRejected) {
-  char buf[kReqPrefixV2];
-  EncodeReqV2(buf, WireOp::kCache, BlockKey{1, 2, 3}, 0, 0, kMaxFrameLen + 1, 7);
-  ReqFields rq;
-  EXPECT_EQ(DecodeReq(buf, &rq), 0u);  // oversize -> rejected even for v2
-}
