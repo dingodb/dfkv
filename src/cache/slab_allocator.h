@@ -91,8 +91,16 @@ class SlabAllocator {
   bool Restore(const std::string& key, uint32_t slot_size, uint32_t extent,
                uint32_t slot);
 
-  // Drop `key` (frees its slot). true if present. A pinned key is still removed
-  // from the index but its slot is not reused until Unpin brings refs to 0.
+  // Drop `key`. true if present. CONTRACT: the slot is freed for reuse
+  // IMMEDIATELY, even if the key is pinned -- pins only block EVICTION, not an
+  // explicit Remove. Callers that do I/O against a slot outside their own lock
+  // must therefore never Remove an in-flight key: DiskSlabStore defers such
+  // Removes to the last releaser (inflight_/deferred_remove_), and RamTier's
+  // Remove declines while a flush-pin or send-pin is held. (An earlier version
+  // of this comment promised deferred reuse; the implementation never did that,
+  // and the guards belong at the caller layer, where in-flight state lives.)
+  // A pinned Remove logs a WARN: in-tree callers make it unreachable, so one
+  // firing means a new caller is missing its guard.
   bool Remove(const std::string& key);
 
   // Pin/unpin a resident key: a pinned slot is never chosen for eviction (used

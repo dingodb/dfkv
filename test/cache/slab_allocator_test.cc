@@ -278,3 +278,20 @@ TEST(SlabAllocator, FullyFreeExtentReturnsToPool) {
   EXPECT_TRUE(ev.empty()) << "returned-pool bind must not evict";
   EXPECT_EQ(b.Steals(), 0u);
 }
+
+// The REAL Remove contract (an earlier doc promised deferred reuse; the
+// implementation never did that): a pinned key's slot is freed for reuse
+// immediately -- which is exactly why DiskSlabStore/RamTier must (and do)
+// guard in-flight keys at their own layer before calling Remove.
+TEST(SlabAllocator, RemoveFreesPinnedSlotImmediately) {
+  SlabAllocator a(Opts(4096, 1));  // one slot total
+  std::vector<std::string> ev;
+  SlotRef r1, r2;
+  ASSERT_TRUE(a.Put("k", 4096, &r1, &ev));
+  ASSERT_TRUE(a.Pin("k"));
+  ASSERT_TRUE(a.Remove("k"));  // logs a WARN; slot is free NOW
+  ASSERT_TRUE(a.Put("k2", 4096, &r2, &ev));
+  EXPECT_TRUE(ev.empty()) << "reused the freed slot, no eviction needed";
+  EXPECT_EQ(r2.extent, r1.extent);
+  EXPECT_EQ(r2.slot, r1.slot);
+}

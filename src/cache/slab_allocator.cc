@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "utils/log.h"  // WARN guard on Remove-while-pinned (see header contract)
+
 namespace dfkv {
 
 namespace {
@@ -326,6 +328,11 @@ bool SlabAllocator::Remove(const std::string& key) {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = index_.find(key);
   if (it == index_.end()) return false;
+  if (it->second.refs > 0)
+    DFKV_LOG_WARN("SlabAllocator::Remove on a PINNED key (refs=" +
+                  std::to_string(it->second.refs) +
+                  "): its slot is freed for reuse NOW -- the caller is missing "
+                  "an in-flight guard (see header contract)");
   FreeSlotLocked(key, it->second);
   return true;
 }
