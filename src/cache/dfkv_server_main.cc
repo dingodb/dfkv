@@ -227,6 +227,24 @@ int main(int argc, char** argv) {
     dfkv::MemberInfo self{node_id, aip, aport,
                           static_cast<uint32_t>(weight < 1 ? 1 : weight)};
     self.tcp_port = static_cast<uint32_t>(srv.port());  // TCP wire/stat port -> `dfkvctl stat`
+    // Self-description reported on register + every heartbeat, surfaced by
+    // `dfkvctl ring` (fleet-wide version/config audit without per-node ssh).
+    // Values are the RESOLVED runtime truth (what was actually constructed),
+    // not flag intent -- e.g. engine comes from DiskCacheGroup's choice.
+    {
+      std::string info = std::string("ver=") + dfkv::Version();
+      info += ",engine=" + srv.engine_name();
+      info += ",disks=" + std::to_string(srv.DiskCount());
+      info += ",cap=" + std::to_string(cap);
+      info += ",ram=" + (srv.ram_enabled()
+                             ? std::to_string(srv.ram_arena_bytes()) : std::string("0"));
+#ifdef DFKV_WITH_RDMA
+      info += ",rdma=" + std::string(rsrv ? (rdma_dev.empty() ? "on" : rdma_dev.c_str()) : "off");
+#else
+      info += ",rdma=nobuild";
+#endif
+      self.info = std::move(info);
+    }
     registrar = std::make_unique<dfkv::MdsRegistrar>(std::move(eps), group, self);
     registrar->Start();
     DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group + " id=" + node_id +

@@ -16,6 +16,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     engine = (e && *e) ? e : "file";
   }
   const bool use_slab = (engine == "slab");
+  engine_ = use_slab ? "slab" : "file";  // resolved truth, reported via EngineName
   for (const auto& dir : opt.cache_dirs) {
     std::unique_ptr<StoreEngine> store;
     if (use_slab) {

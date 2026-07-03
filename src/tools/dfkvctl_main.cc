@@ -66,12 +66,15 @@ static int CmdRing(const std::string& mds, const std::string& group) {
   auto pc = ring.NodePointCounts();
   size_t total = ring.RingSize();
   std::printf("group=%s members=%zu ring_points=%zu\n", group.c_str(), ms.size(), total);
-  std::printf("%-16s %-22s %6s %8s %7s\n", "ID", "ADDR", "WEIGHT", "VNODES", "SHARE");
+  std::printf("%-16s %-22s %6s %8s %7s  %s\n", "ID", "ADDR", "WEIGHT", "VNODES", "SHARE", "INFO");
   for (const auto& m : ms) {
     std::string addr = m.ip + ":" + std::to_string(m.port);
     size_t v = pc.count(m.id) ? pc[m.id] : 0;
     double share = total ? 100.0 * static_cast<double>(v) / static_cast<double>(total) : 0.0;
-    std::printf("%-16s %-22s %6u %8zu %6.1f%%\n", m.id.c_str(), addr.c_str(), m.weight, v, share);
+    // INFO = the node's self-description from register/heartbeat (version, engine,
+    // cap, ...). "-" = node predates info reporting (itself a version signal).
+    std::printf("%-16s %-22s %6u %8zu %6.1f%%  %s\n", m.id.c_str(), addr.c_str(), m.weight,
+                v, share, m.info.empty() ? "-" : m.info.c_str());
   }
   return 0;
 }

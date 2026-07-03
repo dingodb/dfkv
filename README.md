@@ -150,7 +150,9 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
   supported.
 - **CLI tools**: `dfkv_smoke` (roundtrip check), `dfkvctl` — per-node ops
   (`put/get/exist/stat`) plus cluster views: `dfkvctl ring` (membership + ring vnode
-  share) and `dfkvctl stat --all` (per-node metrics + cluster aggregate) via MDS.
+  share + each node's **self-reported version/config** — engine, capacity, RAM tier,
+  RDMA dev — carried on register/heartbeat, so fleet-wide version/config audit is one
+  command, no per-node ssh) and `dfkvctl stat --all` (per-node metrics + aggregate) via MDS.
 - **RDMA transport** (gated `-DDFKV_WITH_RDMA=ON`, native libibverbs RC): device
   selected **by name** (`DFKV_RDMA_DEV=ib7s400p0`, comma-list = multi-rail), QP
   bootstrapped over a tiny TCP channel so the 400G data fabric needs no IP and may
