@@ -22,7 +22,10 @@ three engines through thin adapters over one portable core:
   a clean NotFound; no object-store fallback), synchronous durable-visible writes.
   Supports **multiple NVMe SSDs per node** (`--dir d1,d2,d3`, intra-node Ketama).
   With `--mds`, `--group`, `--id`, `--advertise`, `--weight` it registers into the
-  MDS tier; the old static `--members` flag has been removed.
+  MDS tier; the old static `--members` flag has been removed. Pluggable storage
+  backend `--store-engine=file|slab` (default `file`) and an optional
+  write-through **RAM hot tier** (`DFKV_RAM_TIER=1`) — see
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **`dfkv_mds`** — stateless Membership Directory Service daemon. Flags:
   `--listen <port>` and `--etcd <host:port>` (default `127.0.0.1:2379`). The only
   etcd client in the system; holds each node's etcd lease on its behalf. Deploy as
@@ -36,9 +39,10 @@ three engines through thin adapters over one portable core:
 
 ## Design in one breath
 SGLang HiCache (zero-copy v1) → `dfkv_hicache.py` (ctypes) → `libdfkv` client
-(Ketama route + header wrap/verify) → TCP/RDMA → `dfkv_server` (DiskCacheGroup
-over N NVMe, LRU). Distributed = client-side consistent hashing; no replication
-(regenerable KV → node loss = miss → recompute).
+(Ketama route + header wrap/verify) → TCP/RDMA → `dfkv_server` → optional RAM hot
+tier → DiskCacheGroup over N NVMe (per-disk `StoreEngine`: `file` or `slab`), LRU.
+Distributed = client-side consistent hashing; no replication (regenerable KV →
+node loss = miss → recompute). Full architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 **Membership** is managed by the MDS tier (`dfkv_mds` + etcd). Nodes register
 with the MDS on startup and send periodic heartbeats; etcd leases (TTL 30 s)
@@ -83,14 +87,16 @@ Per-engine connect/config: `docs/hicache/DEPLOY.md` · `docs/vllm/DEPLOY.md` · 
 ## Layout
 ```
 src/        portable C++ core: common/ (shared types) · utils/ (generic helpers) ·
-            transport/ (TCP/RDMA + wire protocol) · cache/ (storage engine + dfkv_server) ·
+            transport/ (TCP/RDMA + v1/v2 wire protocol) · cache/ (StoreEngine: file
+            KVStore | slab SlabAllocator+DiskSlabStore · RamTier · dfkv_server) ·
             client/ (KV client + C ABI) · mds/ (membership service + dfkv_mds) · tools/ (CLIs)
 integration/hicache/  dfkv_hicache.py (SGLang dynamic backend plugin) + dfkv_telemetry/
                       (canonical shared telemetry pkg, vendored by the other connectors)
 integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libdfkv.so)
 integration/vllm/     dfkv_vllm       (vLLM KVConnectorBase_V1, GPUDirect RDMA, bypass LMCache)
 test/       gtest suites + test/python (unittest + no-torch sglang shim)
-docs/       DEPLOY.md (dfkv CLUSTER deploy: etcd + MDS + server + systemd) · INTEGRATION.md (fuse into dingo-cache)
+docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire protocol) ·
+            DEPLOY.md (dfkv CLUSTER deploy: etcd + MDS + server + systemd) · INTEGRATION.md (fuse into dingo-cache)
 docs/hicache/  SGLang HiCache connector docs (DEPLOY — connect/config/use)
 docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
 docs/vllm/     vLLM connector docs (DEPLOY — config reference + recommended settings)
@@ -110,6 +116,25 @@ docs/vllm/     vLLM connector docs (DEPLOY — config reference + recommended se
   reference + recommended settings) and `integration/vllm/README.md`.
 
 ## Operability & performance features
+- **Pluggable storage engine** (`--store-engine=file|slab`, default `file`): the
+  `file` engine is one file per block (battle-tested); the `slab` engine is a
+  fixed pool of pre-allocated **extent files** carved into slots by a media-agnostic
+  size-class allocator, with a compact `slots.tbl` so the index **rebuilds on
+  restart** (cache warmth across a rolling upgrade) — removing the one-file-per-block
+  hazards (tmp leak / ENOSPC dead-end / unbounded inodes / lock-held unlink /
+  open-per-GET). Crash-safe (CRC32 per slot record). Off by default.
+- **RAM hot tier** (`DFKV_RAM_TIER=1`, off by default): a pre-registered RAM arena
+  fronting the disk — PUT is **write-through** (synchronously visible, async-flushed
+  to disk) and a warm GET is served **straight from the arena over RDMA** (zero-copy
+  scatter-send from the arena MR, no open/pread/disk), removing the disk-bound COLD
+  load bottleneck. Send-in-flight slot pinning + flush backpressure keep it correct;
+  `dfkv_ram_*` metrics expose hit-rate + backpressure. See
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5–6.
+- **Versioned wire protocol** (v1/v2): v2 adds a request `seq` echoed in the reply;
+  servers **dual-accept** both versions (no flag-day rolling upgrade). Client opt-in
+  via `DFKV_WIRE_VERSION=2` (default v1). Block identity is **96-bit** (id + index
+  from MD5) to make same-model hash collisions — a silent cross-key read — vanishingly
+  unlikely. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3–4.
 - **Connection pooling + keep-alive** (TCP_NODELAY): ~250× lower latency vs dial-per-call.
 - **Batch APIs** with concurrent fan-out across nodes (`BatchPut/Get/Exist`, C ABI + plugin).
 - **Connect/IO timeouts + stale-connection retry**: a hung node fails fast, never hangs.
@@ -151,6 +176,7 @@ docs/vllm/     vLLM connector docs (DEPLOY — config reference + recommended se
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
 
 ## Status
-TDD; **88 C++ ctest entries + Python plugin & connector tests green**, 0 warnings, **ThreadSanitizer-clean**.
+TDD; **264 C++ ctest entries (default) / 288 (RDMA+io_uring) + Python plugin &
+connector tests green**, 0 warnings, **ThreadSanitizer-clean**.
 CI: gcc/clang build+test, TSan, RDMA datapath (Soft-RoCE loopback), RDMA compile-check, static-artifact build. License: Apache-2.0.
-See `docs/DEPLOY.md` (rollout) and the round report in the ai_david KB.
+Architecture & design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Rollout: `docs/DEPLOY.md`.

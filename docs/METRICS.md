@@ -51,6 +51,18 @@ RDMA 构建额外（折叠进同一 /metrics）：
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
 | `dfkv_rdma_idle_reclaims_total` | counter | 空闲超时回收的连接数 |
 
+RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后兼容）：
+| 指标 | 类型 | 含义 |
+|------|------|------|
+| `dfkv_ram_hit_total` / `dfkv_ram_miss_total` | counter | GET 命中 RAM / 未命中落盘（命中率 = hit/(hit+miss)） |
+| `dfkv_ram_put_total` | counter | 写直通进 RAM 的 PUT 数 |
+| `dfkv_ram_put_bypass_total` | counter | **背压**：arena 满（flush 落后）→ PUT 旁路直写盘，非零即 flush 跟不上 |
+| `dfkv_ram_flushed_total` / `dfkv_ram_flush_dropped_total` | counter | RAM slot 落盘转 DURABLE / flush 多次失败后丢弃 |
+| `dfkv_ram_evictions_total` | counter | RAM slot 容量压力淘汰数 |
+| `dfkv_ram_objects` / `dfkv_ram_flush_backlog` | gauge | 当前 RAM 常驻块 / 待 flush（未 DURABLE）队列深度 |
+
+> 关键运维信号：COLD `load_get_avg_ms` 骤降 + `dfkv_ram_hit_total` 上升 = RAM 热层生效；`dfkv_ram_put_bypass_total` 或 `dfkv_ram_flush_backlog` 持续升高 = flush 落盘带宽不足，需扩 flush 或降 PUT 速率（见 [docs/ARCHITECTURE.md](ARCHITECTURE.md) §6 背压）。
+
 ### 3.2 MDS（`dfkv_mds` /metrics）
 | 指标 | 类型 | 含义 |
 |---|---|---|
