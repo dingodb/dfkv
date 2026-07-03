@@ -82,8 +82,7 @@ dfkv_server --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
 #    dfkv_open("n1=10.0.0.10:12000,...", ...)
 ```
 Full dfkv CLUSTER deploy runbook (etcd + MDS + systemd units): `docs/DEPLOY.md`.
-Per-engine connect/config: `docs/hicache/DEPLOY.md` · `docs/vllm/DEPLOY.md` · `docs/lmcache/DEPLOY.md`.
-Client env/config reference (all connectors): `docs/CLIENT_CONFIG.md`.
+Per-engine connect/config + client env/config reference (all connectors): `docs/CONNECTORS.md`.
 
 ## Layout
 ```
@@ -97,24 +96,21 @@ integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libd
 integration/vllm/     dfkv_vllm       (vLLM KVConnectorBase_V1, GPUDirect RDMA, bypass LMCache)
 test/       gtest suites + test/python (unittest + no-torch sglang shim)
 docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire protocol) ·
-            CLIENT_CONFIG.md (client env/config reference, all connectors) ·
+            CONNECTORS.md (engine connectors: HiCache · vLLM · LMCache + client env/config reference) ·
             DEPLOY.md (dfkv CLUSTER deploy: etcd + MDS + server + systemd) · INTEGRATION.md (fuse into dingo-cache)
-docs/hicache/  SGLang HiCache connector docs (DEPLOY — connect/config/use)
-docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
-docs/vllm/     vLLM connector docs (DEPLOY — config reference + recommended settings)
 ```
 
 ## Engine integrations
-- **SGLang HiCache**: `integration/hicache/dfkv_hicache.py` — see `docs/hicache/DEPLOY.md` (connect/config/use;
-  cluster deploy is `docs/DEPLOY.md`).
-- **LMCache**: `integration/lmcache/` (`dfkv_connector`) — see `docs/lmcache/DESIGN.md`,
-  `docs/lmcache/IMPLEMENTATION.md`, `docs/lmcache/DEPLOY.md`.
+- **SGLang HiCache**: `integration/hicache/dfkv_hicache.py` — see `docs/CONNECTORS.md` §2
+  (connect/config/use; cluster deploy is `docs/DEPLOY.md`).
+- **LMCache**: `integration/lmcache/` (`dfkv_connector`) — see `docs/CONNECTORS.md` §4
+  (deploy + design + implementation).
 - **vLLM (direct)**: `integration/vllm/` (`dfkv_vllm`) — a `KVConnectorBase_V1`
   connector occupying the same `--kv-transfer-config` slot as `MooncakeStoreConnector`,
   storing/loading KV **directly over GPUDirect RDMA** (no LMCache, no host bounce).
   Pure-Python ctypes over `libdfkv.so`; uses the scatter-gather batch API to coalesce
   per-chunk keys. Validated on H100 + IB with DeepSeek-V4 (multi kv_cache_group / MLA +
-  SWA), full cross-restart and cross-DP prefix hit. See `docs/vllm/DEPLOY.md` (config
+  SWA), full cross-restart and cross-DP prefix hit. See `docs/CONNECTORS.md` §3 (config
   reference + recommended settings) and `integration/vllm/README.md`.
 
 ## Operability & performance features

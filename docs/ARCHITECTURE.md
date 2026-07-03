@@ -3,13 +3,13 @@
 A tour of how dfkv is put together: the layers a request flows through, the
 pluggable storage engines, the optional RAM hot tier, and the versioned wire
 protocol. For deployment see [DEPLOY.md](DEPLOY.md); for metrics see
-[METRICS.md](METRICS.md); for **client-side** env/config see
-[CLIENT_CONFIG.md](CLIENT_CONFIG.md); for engine connectors see `docs/{hicache,lmcache,vllm}/`.
+[METRICS.md](METRICS.md); for engine connectors and the **client-side**
+env/config reference see [CONNECTORS.md](CONNECTORS.md).
 
 > **Client vs server config:** the storage engine (§5) and RAM tier (§6) are
 > **server-side only** — a client needs no config for them and can't tell which a
 > node runs. The only client-facing knob added in v1.7.0 is `DFKV_WIRE_VERSION`
-> (§4). See [CLIENT_CONFIG.md](CLIENT_CONFIG.md).
+> (§4). See [CONNECTORS.md](CONNECTORS.md) §1.
 
 ---
 

@@ -14,7 +14,7 @@ memory with no host bounce. Per-chunk layer segments are coalesced into one dfkv
 key via the **scatter-gather** batch API (one multi-SGE RDMA per chunk instead of
 one per layer-segment), cutting key/disk-read count ~20x.
 
-> **Full deployment walkthrough + recommended settings: [`docs/vllm/DEPLOY.md`](../../docs/vllm/DEPLOY.md).**
+> **Full deployment walkthrough + recommended settings: [`docs/CONNECTORS.md`](../../docs/CONNECTORS.md) §3.**
 > This README is the quick reference.
 
 ## Enable

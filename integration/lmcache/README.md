@@ -16,8 +16,8 @@ Ported from the dingofs LMCache connector with two changes:
    releases the GIL during foreign calls, and one `dfkv_open` handle is
    thread-safe to share).
 
-See [docs/lmcache/](../../docs/lmcache/) for the design, implementation, and
-deployment guides.
+See [docs/CONNECTORS.md](../../docs/CONNECTORS.md) §4 for the design,
+implementation, and deployment guide.
 
 ## Build & install
 

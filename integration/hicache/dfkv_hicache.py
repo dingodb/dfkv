@@ -419,7 +419,7 @@ class DfkvHiCache(HiCacheStorage):
               f"(model={self.model!r}, e.g. GLM-5.2). The v1 anchor writes an "
               "empty 'kv' marker; real KV rides the v2 side-pool path. Verify L3 "
               "hit rate via metrics; if low, the LMCache MP connector "
-              "(docs/lmcache/) is the alternative path for GLM-5.x DSA.",
+              "(docs/CONNECTORS.md #4.5) is the alternative path for GLM-5.x DSA.",
               file=_sys.stderr, flush=True)
 
     def _write_anchor_markers(self, keys) -> List[bool]:

@@ -6,7 +6,7 @@
 > 前提：GLM-5.1 = MLA（每页 KV ≈ 2.74 MiB 单对象、跨 TP 复制、仅 tp_rank0 写）。
 > 已在 400G InfiniBand 上端到端验证（两端零拷贝，单口 GET ~93% 线速）。
 
-> **本文只讲 dfkv 集群自身的部署;各推理引擎如何对接/配置 dfkv 见 [docs/hicache/DEPLOY.md](hicache/DEPLOY.md)、[docs/vllm/DEPLOY.md](vllm/DEPLOY.md)、[docs/lmcache/DEPLOY.md](lmcache/DEPLOY.md)。**
+> **本文只讲 dfkv 集群自身的部署;各推理引擎如何对接/配置 dfkv(HiCache/vLLM/LMCache + 客户端配置总表)见 [docs/CONNECTORS.md](CONNECTORS.md)。**
 
 ---
 
@@ -133,7 +133,7 @@ journalctl -u dfkv -n 10 --no-pager
 #      + "dfkv_server registered with MDS group=default id=n57 advertise=192.168.1.57:28001"
 ```
 > server 的 bootstrap 监听 `0.0.0.0`，靠防火墙限制在内网。优雅关闭已修（`systemctl stop` 约 1s 退出）。
-> **多轨**：让客户端在多张 400G 口间分散即可（客户端 `DFKV_RDMA_DEV` 逗号列表，见各引擎对接文档如 [hicache/DEPLOY.md](hicache/DEPLOY.md)）；server 会按客户端请求的设备名在同轨开 QP，无需为多轨改 server 配置（保留 `--rdma-dev` 作默认）。
+> **多轨**：让客户端在多张 400G 口间分散即可（客户端 `DFKV_RDMA_DEV` 逗号列表，见 [CONNECTORS.md](CONNECTORS.md) §1.2）；server 会按客户端请求的设备名在同轨开 QP，无需为多轨改 server 配置（保留 `--rdma-dev` 作默认）。
 > ⚠️ 同机 8×400G 多轨受 NUMA 限制（NIC 跨双 socket，单内存域）；单口已近线速，多轨叠加需 NUMA 感知，暂不必配。
 
 ## 4. 集群成员管理
@@ -187,7 +187,7 @@ n57=192.168.1.57:28001,n58=192.168.1.58:28001,...
 - **Prometheus 抓取**（opt-in）：`dfkv_server`/`dfkv_mds` 加 `--metrics-port <p>` → `GET /metrics`、`/healthz`。`--id/--group` 成为 `{node,group}` 标签（不设=无标签，向后兼容）。**缺省不开端口 → 行为与旧版一致、对数据面零影响**。Prometheus 直接抓每节点 `:<p>/metrics`。
   - 服务端含：put/hit/miss、bytes、淘汰、错误分型、`open_connections`、per-disk、**采样延迟直方图 `dfkv_op_latency_seconds{op}`**、RDMA 完成/错误/活跃连接。
   - MDS 含：register/keepalive/list/lease/etcd-error + members gauge。
-  - 客户端（SGLang 插件 `/metrics`）：`dfkv_client_*{tp_rank}`，见 [hicache/DEPLOY.md](hicache/DEPLOY.md) / METRICS.md §3.3。
+  - 客户端（SGLang 插件 `/metrics`）：`dfkv_client_*{tp_rank}`，见 [CONNECTORS.md](CONNECTORS.md) §2.4 / METRICS.md §3.3。
 - **集群/环视图**（CLI，无需开端口）：
   - `dfkvctl ring --mds <eps> --group <g>` — 成员表 + 一致性哈希环每节点 vnode 占比。
   - `dfkvctl stat --all --mds <eps> --group <g>` — 逐节点指标 + 集群聚合（容量/对象/命中率）。
