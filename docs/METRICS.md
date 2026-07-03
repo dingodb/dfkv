@@ -57,6 +57,18 @@ RDMA 构建额外（折叠进同一 /metrics）：
 | `dfkv_rdma_active_conns` | gauge | 当前服务中的 RDMA 连接 |
 | `dfkv_rdma_idle_reclaims_total` | counter | 空闲超时回收的连接数 |
 
+slab 引擎内部（**仅 `--store-engine slab` 时输出**；file 引擎无此系列）：
+| 指标 | 类型 | 含义 |
+|------|------|------|
+| `dfkv_slab_dio_write_fallback_total` / `dfkv_slab_dio_read_fallback_total` | counter | direct 模式下回退 buffered 的写/读——**非零升高 = page cache 悄悄回来了**（对齐条件被破坏），direct 部署重点盯 |
+| `dfkv_slab_table_sync_total` | counter | slots.tbl fdatasync 周期数（`DFKV_SLAB_TABLE_SYNC_MS`，默认 100ms；限定崩溃复活毒化窗口） |
+| `dfkv_slab_extent_steals_total` / `dfkv_slab_extent_returns_total` | counter | 跨 class extent 抢占（伴随驱逐，容量失衡信号）/ 全空 extent 主动回池（无损再平衡） |
+| `dfkv_slab_deferred_removes_total` | counter | 被在飞 I/O 延迟执行的 Remove |
+| `dfkv_slab_inflight_keys` / `dfkv_slab_prep_holds` | gauge | 锁外 I/O 在飞 key 数 / 未释放的异步 prep 持有数（持续增长 = 泄漏） |
+
+PUT 准入门（**仅 `--put-inflight-limit > 0` 时输出**）：
+| `dfkv_put_busy_total` | counter | 被准入门以 kCacheFull 快速拒绝的 PUT（受控 miss，替代深队列尾延迟） |
+
 RAM 热层（**仅 `DFKV_RAM_TIER=1` 时输出**；关时无此系列，向后兼容）：
 | 指标 | 类型 | 含义 |
 |------|------|------|

@@ -25,10 +25,14 @@ if(DFKV_WITH_URING AND NOT DFKV_WITH_RDMA)
   message(FATAL_ERROR "DFKV_WITH_URING requires DFKV_WITH_RDMA=ON (the io_uring path lives in the RDMA server)")
 endif()
 if(DFKV_WITH_URING)
-  find_library(URING_LIB uring)
+  # Prefer the STATIC archive: the portable release must not add a liburing.so
+  # runtime dependency on deploy nodes (liburing is a thin syscall wrapper, so
+  # static linking costs ~50 KB and carries no glibc-floor risk).
+  find_library(URING_LIB NAMES liburing.a uring)
   if(NOT URING_LIB)
     message(FATAL_ERROR "DFKV_WITH_URING=ON but liburing not found (install liburing-dev)")
   endif()
+  message(STATUS "liburing: ${URING_LIB}")
 endif()
 
 # --- portable core library (everything in src/ except *_main.cc + gated rdma) ---

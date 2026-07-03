@@ -12,12 +12,12 @@
 # needs rdma-core / libibverbs installed.
 FROM ubuntu:22.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build g++ git ca-certificates libibverbs-dev && \
+    cmake ninja-build g++ git ca-certificates libibverbs-dev liburing-dev && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDFKV_BUILD_TESTS=OFF \
-    -DDFKV_WITH_RDMA=ON -DDFKV_STATIC_LIBSTDCXX=ON && \
+    -DDFKV_WITH_RDMA=ON -DDFKV_WITH_URING=ON -DDFKV_STATIC_LIBSTDCXX=ON && \
     cmake --build build -j && cmake --install build --prefix /out && \
     strip /out/bin/* /out/lib/*.so* 2>/dev/null || true
 # Artifacts (portable, glibc>=2.35): /out/bin/{dfkv_server,dfkv_mds,dfkv_bench,

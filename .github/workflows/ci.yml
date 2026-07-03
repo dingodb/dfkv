@@ -176,12 +176,14 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ binutils git ca-certificates libibverbs-dev xz-utils tar
+            cmake ninja-build g++ binutils git ca-certificates libibverbs-dev \
+            liburing-dev xz-utils tar
       - uses: actions/checkout@v6
       - name: Build portable RDMA artifacts (static libstdc++, no tests)
         run: |
           cmake -S . -B build-static -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DDFKV_BUILD_TESTS=OFF -DDFKV_WITH_RDMA=ON -DDFKV_STATIC_LIBSTDCXX=ON
+            -DDFKV_BUILD_TESTS=OFF -DDFKV_WITH_RDMA=ON -DDFKV_WITH_URING=ON \
+            -DDFKV_STATIC_LIBSTDCXX=ON
           cmake --build build-static -j
           strip build-static/dfkv_server build-static/dfkv_mds build-static/dfkv_bench \
                 build-static/dfkv_smoke build-static/dfkvctl build-static/libdfkv.so || true
