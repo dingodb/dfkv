@@ -17,10 +17,16 @@ struct MemberInfo {
   uint32_t port = 0;       // data-path port clients dial (the rdma-port in an RDMA deploy)
   uint32_t weight = 1;
   uint32_t tcp_port = 0;   // TCP wire/stat port that serves kStats; 0 = unknown / older peer.
-  // tcp_port rides an OPTIONAL trailing field in Encode/DecodeMembers, so peers that don't
-  // send it still interoperate. It is intentionally EXCLUDED from operator== and MembersEpoch:
-  // it is orthogonal metadata (not part of ring placement), and its only consumer (dfkvctl
-  // stat) re-fetches every run, so a change need not trigger a ring rebuild.
+  // Node self-description reported on register/heartbeat: "k=v,k=v,..." (version,
+  // storage engine, capacity, RAM tier, RDMA dev ...). Empty = unknown / older peer.
+  // Purely informational: surfaced by `dfkvctl ring` for fleet audit (version skew,
+  // silently-skipped upgrades, engine mismatch) without per-node ssh.
+  std::string info;
+  // tcp_port and info ride OPTIONAL trailing extensions in Encode/DecodeMembers, so peers
+  // that don't send them still interoperate. Both are intentionally EXCLUDED from
+  // operator== and MembersEpoch: they are orthogonal metadata (not part of ring
+  // placement), and their consumers (dfkvctl) re-fetch every run, so a change need not
+  // trigger a client ring rebuild.
   bool operator==(const MemberInfo& o) const {
     return id == o.id && ip == o.ip && port == o.port && weight == o.weight;
   }
@@ -42,15 +48,19 @@ inline bool IsValidGroupOrId(const std::string& s) {
   return true;
 }
 
-// Magic tag marking the OPTIONAL tcp_port extension appended after the member list.
-// Old encodings carry no trailing bytes, so this tag is unambiguous when present.
-constexpr uint32_t kMemberExtTcpPort = 0x54435031u;  // "TCP1"
+// Magic tags marking OPTIONAL extensions appended after the member list, in tag
+// order (TCP1 then NFO1). Old encodings carry no trailing bytes and old decoders
+// stop after the member list, so the tags are unambiguous when present and
+// invisible to peers that predate them.
+constexpr uint32_t kMemberExtTcpPort = 0x54435031u;  // "TCP1": one tcp_port u32 per member
+constexpr uint32_t kMemberExtInfo = 0x4E464F31u;     // "NFO1": one length-prefixed info string per member
 
 // Wire format for a membership view. Register payload = 1 member; ListMembers
 // response = N members + the epoch (etcd revision) clients compare to skip
 // rebuilding an unchanged ring. Layout (host-endian via net::):
 //   epoch u64 | count u32 | repeat{ idlen u32, id, iplen u32, ip, port u32, weight u32 }
-//   [ optional: kMemberExtTcpPort u32 | repeat count { tcp_port u32 } ]  <- old decoders ignore
+//   [ optional: kMemberExtTcpPort u32 | repeat count { tcp_port u32 } ]        <- old decoders ignore
+//   [ optional: kMemberExtInfo u32 | repeat count { infolen u32, info bytes } ] <- old decoders ignore
 // (host-endian via net::; correct between same-endianness peers — see net_util.h)
 inline std::string EncodeMembers(const std::vector<MemberInfo>& ms,
                                  uint64_t epoch) {
@@ -68,10 +78,15 @@ inline std::string EncodeMembers(const std::vector<MemberInfo>& ms,
     net::PutU32(num, m.port);   out.append(num, 4);
     net::PutU32(num, m.weight); out.append(num, 4);
   }
-  // Optional trailing extension: a magic tag + one tcp_port per member, same order.
+  // Optional trailing extensions: a magic tag + per-member payload, same order.
   // Older decoders stop after the N members above and never read these bytes.
   net::PutU32(num, kMemberExtTcpPort); out.append(num, 4);
   for (const auto& m : ms) { net::PutU32(num, m.tcp_port); out.append(num, 4); }
+  net::PutU32(num, kMemberExtInfo); out.append(num, 4);
+  for (const auto& m : ms) {
+    net::PutU32(num, static_cast<uint32_t>(m.info.size())); out.append(num, 4);
+    out += m.info;
+  }
   return out;
 }
 
@@ -98,12 +113,29 @@ inline bool DecodeMembers(const char* p, size_t n,
     m.weight = net::GetU32(p + off);  off += 4;
     out->push_back(std::move(m));
   }
-  // Optional tcp_port extension (see EncodeMembers). Present iff the magic tag plus
-  // `count` ports follow; absent from older peers' encodings -> tcp_port stays 0.
-  if (off + 4 <= n && net::GetU32(p + off) == kMemberExtTcpPort) {
-    off += 4;
-    if (off + static_cast<size_t>(count) * 4 <= n)
+  // Optional trailing extensions (see EncodeMembers): read tagged blocks in
+  // order; an unknown tag or a truncated block ends the (best-effort) ext scan
+  // without failing the decode -- exts absent from older peers' encodings just
+  // leave tcp_port==0 / info=="".
+  while (off + 4 <= n) {
+    const uint32_t tag = net::GetU32(p + off);
+    if (tag == kMemberExtTcpPort) {
+      off += 4;
+      if (off + static_cast<size_t>(count) * 4 > n) break;
       for (uint32_t i = 0; i < count; ++i) { (*out)[i].tcp_port = net::GetU32(p + off); off += 4; }
+    } else if (tag == kMemberExtInfo) {
+      off += 4;
+      bool ok = true;
+      for (uint32_t i = 0; i < count; ++i) {
+        if (off + 4 > n) { ok = false; break; }
+        uint32_t ilen = net::GetU32(p + off); off += 4;
+        if (off + ilen > n) { ok = false; break; }
+        (*out)[i].info.assign(p + off, ilen); off += ilen;
+      }
+      if (!ok) break;
+    } else {
+      break;  // unknown/future tag: ignore the rest (forward compatible)
+    }
   }
   return true;
 }

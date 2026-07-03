@@ -55,6 +55,9 @@ class DiskCacheGroup {
   size_t DiskCount() const { return disks_.size(); }
   uint64_t Evictions() const;     // summed across disks
   uint64_t EvictedBytes() const;  // summed across disks
+  // The storage backend actually constructed ("file" | "slab") -- the RESOLVED
+  // choice (Options.engine / DFKV_STORE_ENGINE / default), not the flag intent.
+  const std::string& EngineName() const { return engine_; }
   // Per-disk views for fine-grained metrics (i in [0, DiskCount)).
   const std::string& DiskPath(size_t i) const { return disks_[i]->Dir(); }
   uint64_t DiskUsedBytes(size_t i) const { return disks_[i]->UsedBytes(); }
@@ -63,6 +66,7 @@ class DiskCacheGroup {
  private:
   StoreEngine* Route(const BlockKey& key) const;
 
+  std::string engine_;  // resolved backend name (see EngineName)
   std::vector<std::unique_ptr<StoreEngine>> disks_;
   std::unordered_map<std::string, StoreEngine*> by_id_;  // disk id -> store
   ConHash ring_;

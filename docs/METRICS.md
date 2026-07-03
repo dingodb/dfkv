@@ -22,6 +22,12 @@ curl -s 127.0.0.1:9100/metrics
 
 ## 2. 集群 / 环视图（CLI）
 
+> **v1.8.0 起**：`dfkvctl ring` 多一列 `INFO` = 各节点在注册/心跳时自报的
+> `ver=…,engine=…,disks=…,cap=…,ram=…,rdma=…`（运行时真相，非 flag 意图）。
+> 全环版本/引擎审计一条命令完成（抓"静默跳升级/引擎不一致"）。`-` = 节点还是
+> 旧版未上报（本身就是版本信号）。信息不参与环 epoch（变更不会触发客户端重建环）。
+> 生效条件：server 与 MDS 都 ≥ v1.8.0（老 MDS 会丢弃该扩展字段）。
+
 ```bash
 dfkvctl ring     --mds <ep,...> --group <g>   # 成员表 + 一致性哈希环 vnode 分布/占比
 dfkvctl stat --all --mds <ep,...> --group <g> # 逐节点指标 + 集群聚合（容量/对象/命中率）

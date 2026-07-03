@@ -154,3 +154,45 @@ TEST(MdsServer, ProbeEtcdReflectsReachability) {
   MdsServer live(ep);
   EXPECT_TRUE(live.ProbeEtcd());
 }
+
+TEST(MdsServer, InfoFlowsRegisterThroughEtcdToList) {
+  // The node self-description (MemberInfo.info) must survive the FULL path:
+  // register payload -> MDS decode -> etcd member value -> ListMembers decode
+  // -> response encode. A heartbeat carrying updated info must also refresh it
+  // (the heartbeat fast path re-puts the value under the lease).
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  int port = mds.port();
+  std::string group = "itest-info-" + std::to_string(port);
+
+  MemberInfo m{"ni", "10.1.1.9", 28001, 2, 28100,
+               "ver=1.8.0,engine=slab,disks=3,cap=5497558138880,ram=0,rdma=ib7s400p0"};
+  Status st; std::string data;
+  ASSERT_TRUE(DoReq(port, WireOp::kRegister, EncodeMemberReq(group, m), &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+
+  ASSERT_TRUE(DoReq(port, WireOp::kListMembers, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  std::vector<MemberInfo> got; uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &got, &epoch));
+  ASSERT_EQ(got.size(), 1u);
+  EXPECT_EQ(got[0].info, m.info) << "info must round-trip through etcd";
+  EXPECT_EQ(got[0].tcp_port, 28100u);
+
+  // Heartbeat with CHANGED info (e.g. node restarted with a new version):
+  // the re-put must propagate it, and the epoch must NOT change (info is
+  // excluded from MembersEpoch -- no needless client ring rebuilds).
+  uint64_t epoch_before = epoch;
+  m.info = "ver=1.9.0,engine=slab,disks=3,cap=5497558138880,ram=0,rdma=ib7s400p0";
+  ASSERT_TRUE(DoReq(port, WireOp::kHeartbeat, EncodeMemberReq(group, m), &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DoReq(port, WireOp::kListMembers, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &got, &epoch));
+  ASSERT_EQ(got.size(), 1u);
+  EXPECT_EQ(got[0].info, m.info) << "heartbeat must refresh info";
+  EXPECT_EQ(epoch, epoch_before) << "info change must not bump the ring epoch";
+  mds.Stop();
+}

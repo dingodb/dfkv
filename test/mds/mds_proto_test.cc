@@ -27,3 +27,15 @@ TEST(MdsProto, RejectsTruncated) {
   ASSERT_TRUE(DecodeMemberReq(buf.data(), buf.size(), &group, &got));
   EXPECT_EQ(got.tcp_port, 28100u);
 }
+
+TEST(MdsProto, MemberReqCarriesInfo) {
+  MemberInfo m{"n7", "192.168.1.7", 28101, 2, 28100,
+               "ver=1.8.0,engine=slab,disks=3,cap=5497558138880,ram=0,rdma=ib7s400p0"};
+  std::string payload = EncodeMemberReq("glm", m);
+  std::string group;
+  MemberInfo got;
+  ASSERT_TRUE(DecodeMemberReq(payload.data(), payload.size(), &group, &got));
+  EXPECT_EQ(group, "glm");
+  EXPECT_EQ(got.info, m.info);
+  EXPECT_EQ(got.tcp_port, 28100u);
+}
