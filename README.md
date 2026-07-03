@@ -83,6 +83,7 @@ dfkv_server --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
 ```
 Full dfkv CLUSTER deploy runbook (etcd + MDS + systemd units): `docs/DEPLOY.md`.
 Per-engine connect/config: `docs/hicache/DEPLOY.md` · `docs/vllm/DEPLOY.md` · `docs/lmcache/DEPLOY.md`.
+Client env/config reference (all connectors): `docs/CLIENT_CONFIG.md`.
 
 ## Layout
 ```
@@ -96,6 +97,7 @@ integration/lmcache/  dfkv_connector  (LMCache RemoteConnector, ctypes over libd
 integration/vllm/     dfkv_vllm       (vLLM KVConnectorBase_V1, GPUDirect RDMA, bypass LMCache)
 test/       gtest suites + test/python (unittest + no-torch sglang shim)
 docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire protocol) ·
+            CLIENT_CONFIG.md (client env/config reference, all connectors) ·
             DEPLOY.md (dfkv CLUSTER deploy: etcd + MDS + server + systemd) · INTEGRATION.md (fuse into dingo-cache)
 docs/hicache/  SGLang HiCache connector docs (DEPLOY — connect/config/use)
 docs/lmcache/  LMCache connector docs (DESIGN · IMPLEMENTATION · DEPLOY)
