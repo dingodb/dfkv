@@ -200,31 +200,52 @@ bool DiskSlabStore::WritePayload(const SlabAllocator::SlotRef& r, const void* da
   return PwriteAll(extent_fds_[r.extent], data, len, r.offset);
 }
 
+// mu_ guards only the in-memory maps; the MB-scale payload I/O runs OUTSIDE it
+// (same discipline as KVStore::Cache and RamTier::Put), so concurrent ops to one
+// disk overlap in the kernel instead of serializing behind the store lock. The
+// slot bytes are protected across the unlocked window by a write-pin (a pinned
+// slot is never evicted/reused), and payload_len_ -- installed only after the
+// I/O lands -- is the commit point readers gate on, so an in-flight key reads
+// as a clean miss, never as torn bytes.
 Status DiskSlabStore::Cache(const BlockKey& key, const void* data, size_t len) {
   if (data == nullptr && len != 0) return Status::kInvalid;
   if (!ok_) return Status::kIOError;
   const std::string fn = key.Filename();
-  std::lock_guard<std::mutex> lk(mu_);
-  if (alloc_->Contains(fn)) return Status::kOk;  // idempotent
-
   SlabAllocator::SlotRef ref;
-  std::vector<std::string> evicted;
-  if (!alloc_->Put(fn, len, &ref, &evicted)) return Status::kIOError;  // too big / all pinned
-  // Drop evicted keys from the runtime payload map. Their table records are left
-  // as-is: a slot's record always reflects its LAST occupant, so this Put's
-  // WriteRecord overwrites the reused slot's record, and any other evicted slot
-  // that isn't reused before a crash simply "resurrects" its (still-valid,
-  // content-addressed) key on restart -- correct cache data, never corruption
-  // (design's resurrectable-remove semantics).
-  for (const auto& ev : evicted) {
-    auto pit = payload_len_.find(ev);
-    if (pit != payload_len_.end()) { evicted_bytes_ += pit->second; payload_len_.erase(pit); }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    // Idempotent: committed, or mid-write by another thread (which will commit).
+    if (alloc_->Contains(fn)) return Status::kOk;
+    std::vector<std::string> evicted;
+    if (!alloc_->Put(fn, len, &ref, &evicted)) return Status::kIOError;  // too big / all pinned
+    alloc_->Pin(fn);  // write-pin for the unlocked I/O below
+    inflight_[fn]++;  // guards the slot against a concurrent Remove (see ReleaseInflightLocked)
+    // Drop evicted keys from the runtime payload map. Their table records are left
+    // as-is: a slot's record always reflects its LAST occupant, so this Put's
+    // WriteRecord overwrites the reused slot's record, and any other evicted slot
+    // that isn't reused before a crash simply "resurrects" its (still-valid,
+    // content-addressed) key on restart -- correct cache data, never corruption
+    // (design's resurrectable-remove semantics).
+    for (const auto& ev : evicted) {
+      auto pit = payload_len_.find(ev);
+      if (pit != payload_len_.end()) { evicted_bytes_ += pit->second; payload_len_.erase(pit); }
+    }
   }
-  if (!WritePayload(ref, data, len) ||
-      !WriteRecord(ref, key, static_cast<uint32_t>(len), /*valid=*/true)) {
-    alloc_->Remove(fn);  // roll back the reservation on I/O failure
+
+  const bool io_ok = WritePayload(ref, data, len) &&
+                     WriteRecord(ref, key, static_cast<uint32_t>(len), /*valid=*/true);
+
+  std::lock_guard<std::mutex> lk(mu_);
+  // A Remove that arrived while we wrote was deferred to us (the sole in-flight
+  // holder of an uncommitted key): ReleaseInflightLocked executes it, so the key
+  // must not be committed afterwards.
+  const bool removed_while_writing = deferred_remove_.count(fn) > 0;
+  ReleaseInflightLocked(key, fn);
+  if (!io_ok) {
+    if (!removed_while_writing) alloc_->Remove(fn);  // roll back the reservation
     return Status::kIOError;
   }
+  if (removed_while_writing) return Status::kOk;  // acked put, then removed: a miss later is correct
   payload_len_[fn] = static_cast<uint32_t>(len);
   return Status::kOk;
 }
@@ -250,49 +271,91 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey&, uint64_t, uint64_t, size_
   return Status::kInvalid;      // no async prep -> RDMA server uses sync RangeDirect
 }
 
+// Reads take the lock only to resolve the slot + commit length and acquire the
+// key (pin + inflight count), then pread OUTSIDE the lock. The pin keeps the
+// slot away from eviction; the inflight count defers a concurrent Remove, whose
+// allocator-level free would hand the slot's bytes to a new writer mid-read.
+bool DiskSlabStore::AcquireForRead(const std::string& fn, SlabAllocator::SlotRef* ref,
+                                   uint32_t* plen) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!alloc_->Get(fn, ref)) return false;
+  auto it = payload_len_.find(fn);
+  if (it == payload_len_.end()) return false;  // in-flight write / removed: no commit
+  *plen = it->second;
+  alloc_->Pin(fn);
+  inflight_[fn]++;
+  return true;
+}
+
+void DiskSlabStore::ReleaseInflightLocked(const BlockKey& key, const std::string& fn) {
+  alloc_->Unpin(fn);
+  auto it = inflight_.find(fn);
+  if (it == inflight_.end()) return;  // defensive: unbalanced release
+  if (--it->second > 0) return;
+  inflight_.erase(it);
+  if (!deferred_remove_.erase(fn)) return;
+  // Last holder gone: perform the Remove that arrived mid-flight.
+  SlabAllocator::SlotRef ref;
+  if (alloc_->Get(fn, &ref)) {
+    WriteRecord(ref, key, 0, /*valid=*/false);
+    alloc_->Remove(fn);
+  }
+  payload_len_.erase(fn);
+}
+
 Status DiskSlabStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
                             std::string* out) {
   if (!ok_) return Status::kIOError;
   const std::string fn = key.Filename();
-  std::lock_guard<std::mutex> lk(mu_);
   SlabAllocator::SlotRef ref;
-  if (!alloc_->Get(fn, &ref)) return Status::kNotFound;
-  auto it = payload_len_.find(fn);
-  if (it == payload_len_.end()) return Status::kNotFound;
-  const uint32_t plen = it->second;
-  if (offset >= plen) { out->clear(); return Status::kOk; }
-  const uint64_t avail = plen - offset;
-  const uint64_t n = std::min(length ? length : avail, avail);
-  out->resize(static_cast<size_t>(n));
-  if (n && !PreadAll(extent_fds_[ref.extent], &(*out)[0], static_cast<size_t>(n),
-                     ref.offset + offset))
-    return Status::kIOError;
-  return Status::kOk;
+  uint32_t plen = 0;
+  if (!AcquireForRead(fn, &ref, &plen)) return Status::kNotFound;
+  Status st = Status::kOk;
+  if (offset >= plen) {
+    out->clear();
+  } else {
+    const uint64_t avail = plen - offset;
+    const uint64_t n = std::min(length ? length : avail, avail);
+    out->resize(static_cast<size_t>(n));
+    if (n && !PreadAll(extent_fds_[ref.extent], &(*out)[0], static_cast<size_t>(n),
+                       ref.offset + offset))
+      st = Status::kIOError;
+  }
+  std::lock_guard<std::mutex> lk(mu_);
+  ReleaseInflightLocked(key, fn);
+  return st;
 }
 
 Status DiskSlabStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
                                 char* dst, size_t dst_cap, size_t* out_len) {
   if (!ok_) return Status::kIOError;
   const std::string fn = key.Filename();
-  std::lock_guard<std::mutex> lk(mu_);
   SlabAllocator::SlotRef ref;
-  if (!alloc_->Get(fn, &ref)) return Status::kNotFound;
-  auto it = payload_len_.find(fn);
-  if (it == payload_len_.end()) return Status::kNotFound;
-  const uint32_t plen = it->second;
-  if (offset >= plen) { if (out_len) *out_len = 0; return Status::kOk; }
-  uint64_t n = std::min(length ? length : (plen - offset), static_cast<uint64_t>(plen - offset));
-  if (n > dst_cap) n = dst_cap;
-  if (n && !PreadAll(extent_fds_[ref.extent], dst, static_cast<size_t>(n), ref.offset + offset))
-    return Status::kIOError;
-  if (out_len) *out_len = static_cast<size_t>(n);
-  return Status::kOk;
+  uint32_t plen = 0;
+  if (!AcquireForRead(fn, &ref, &plen)) return Status::kNotFound;
+  Status st = Status::kOk;
+  size_t got = 0;
+  if (offset < plen) {
+    uint64_t n = std::min(length ? length : (plen - offset), static_cast<uint64_t>(plen - offset));
+    if (n > dst_cap) n = dst_cap;
+    if (n && !PreadAll(extent_fds_[ref.extent], dst, static_cast<size_t>(n), ref.offset + offset))
+      st = Status::kIOError;
+    else got = static_cast<size_t>(n);
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    ReleaseInflightLocked(key, fn);
+  }
+  if (st == Status::kOk && out_len) *out_len = got;
+  return st;
 }
 
 bool DiskSlabStore::IsCached(const BlockKey& key) const {
   if (!ok_) return false;
   std::lock_guard<std::mutex> lk(mu_);
-  return alloc_->Contains(key.Filename());
+  // Commit-gated (matches what a Range would hit): an in-flight write or a
+  // deferred-removed key reads as absent.
+  return payload_len_.count(key.Filename()) > 0;
 }
 
 Status DiskSlabStore::Remove(const BlockKey& key) {
@@ -301,6 +364,15 @@ Status DiskSlabStore::Remove(const BlockKey& key) {
   std::lock_guard<std::mutex> lk(mu_);
   SlabAllocator::SlotRef ref;
   if (!alloc_->Get(fn, &ref)) return Status::kNotFound;
+  if (inflight_.count(fn)) {
+    // An unlocked pread/pwrite holds this slot. Freeing it now would let the
+    // allocator hand its bytes to a new writer mid-I/O (allocator Remove frees
+    // even a pinned slot); defer the free to the last releaser. Readers gate
+    // off immediately via the payload_len_ erase.
+    deferred_remove_.insert(fn);
+    payload_len_.erase(fn);
+    return Status::kOk;
+  }
   WriteRecord(ref, key, 0, /*valid=*/false);  // free the durable record first
   alloc_->Remove(fn);
   payload_len_.erase(fn);

@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "cache/slab_allocator.h"
@@ -85,6 +86,17 @@ class DiskSlabStore : public StoreEngine {
   bool WriteRecord(const SlabAllocator::SlotRef& r, const BlockKey& key,
                    uint32_t payload_len, bool valid);
   bool WritePayload(const SlabAllocator::SlotRef& r, const void* data, size_t len);
+  // Resolve fn's slot + committed payload length and acquire it for an unlocked
+  // read (pin + inflight count, under mu_). False = miss (absent, or a write
+  // still in flight). Balanced by a Release{...}Locked call.
+  bool AcquireForRead(const std::string& fn, SlabAllocator::SlotRef* ref, uint32_t* plen);
+  // Drop one in-flight hold on fn (unpin + count). The LAST releaser executes a
+  // Remove that arrived while the key was in flight (deferred_remove_): freeing
+  // the slot mid-I/O would let the allocator hand its bytes to a new writer while
+  // our unlocked pread/pwrite still touches them (SlabAllocator::Remove frees a
+  // slot immediately even when pinned -- pins only block EVICTION).
+  // Call with mu_ held.
+  void ReleaseInflightLocked(const BlockKey& key, const std::string& fn);
   uint64_t TableOffset(uint32_t extent, uint32_t slot) const {
     return static_cast<uint64_t>(extent) * max_slots_per_extent_ * kRecBytes +
            static_cast<uint64_t>(slot) * kRecBytes;
@@ -99,6 +111,14 @@ class DiskSlabStore : public StoreEngine {
   // key.Filename() -> its true payload length (slot_size >= this). Rebuilt on
   // open from the table; the allocator only tracks slot size.
   std::unordered_map<std::string, uint32_t> payload_len_;
+  // Keys with an unlocked pread/pwrite in flight (value = op count), and keys
+  // whose Remove arrived during that window (executed by the last releaser).
+  std::unordered_map<std::string, uint32_t> inflight_;
+  std::unordered_set<std::string> deferred_remove_;
+  // Guards the in-memory maps and the allocate/lookup+pin step ONLY -- never
+  // held across payload I/O (a pin protects the slot from eviction in the
+  // unlocked window, inflight_/deferred_remove_ protect it from Remove;
+  // payload_len_ install after the write is the reader-visible commit).
   mutable std::mutex mu_;
   bool ok_ = false;
   uint64_t table_rebuilt_ = 0;

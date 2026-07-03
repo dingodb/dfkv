@@ -8,8 +8,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 using dfkv::BlockKey;
@@ -177,4 +179,81 @@ TEST_F(DiskSlabTest, OversizeValueRejected) {
   EXPECT_EQ(s.Cache(K(1), big.data(), big.size()), Status::kIOError);
   std::string okv(4096, 'o');
   EXPECT_EQ(s.Cache(K(2), okv.data(), okv.size()), Status::kOk);
+}
+
+// The data-path I/O runs OUTSIDE the store lock (pin + inflight-count protect
+// the slot in the unlocked window). These stress tests exercise the unlocked
+// windows under eviction pressure and concurrent Remove -- a read must return
+// either the key's FULL correct payload or a clean miss, never torn bytes.
+// (Run under the CI TSan job, they also pin down the lock discipline.)
+TEST_F(DiskSlabTest, ConcurrentPutGetNeverTorn) {
+  bool ok = false;
+  // Small pool (4 extents x 256KiB, 4KiB slots) => constant eviction pressure.
+  DiskSlabStore s(Opts(1 << 20, 1 << 18, 4096), &ok);
+  ASSERT_TRUE(ok);
+  constexpr int kThreads = 8, kKeys = 64, kIters = 200;
+  auto payload = [](uint64_t id) {
+    std::string v(4000, '\0');
+    for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>((id * 131 + i) & 0xFF);
+    return v;
+  };
+  std::atomic<int> torn{0};
+  std::vector<std::thread> ts;
+  for (int t = 0; t < kThreads; ++t) {
+    ts.emplace_back([&, t] {
+      for (int i = 0; i < kIters; ++i) {
+        const uint64_t id = (t * 7 + i) % kKeys + 1;
+        const std::string want = payload(id);
+        if (i % 3 == 0) s.Cache(K(id), want.data(), want.size());
+        std::string got;
+        Status st = s.Range(K(id), 0, 0, &got);
+        if (st == Status::kOk && !got.empty() && got != want) torn.fetch_add(1);
+        char buf[4096];
+        size_t n = 0;
+        st = s.RangeInto(K(id), 0, 0, buf, sizeof(buf), &n);
+        if (st == Status::kOk && n == want.size() &&
+            std::string(buf, n) != want) torn.fetch_add(1);
+      }
+    });
+  }
+  for (auto& th : ts) th.join();
+  EXPECT_EQ(torn.load(), 0) << "a read observed a torn/foreign payload";
+}
+
+TEST_F(DiskSlabTest, RemoveDuringConcurrentAccessStaysConsistent) {
+  bool ok = false;
+  DiskSlabStore s(Opts(1 << 20, 1 << 18, 4096), &ok);
+  ASSERT_TRUE(ok);
+  constexpr int kKeys = 16, kIters = 300;
+  auto payload = [](uint64_t id) { return std::string(3000, static_cast<char>('a' + id % 26)); };
+  std::atomic<int> bad{0};
+  std::vector<std::thread> ts;
+  for (int t = 0; t < 6; ++t) {
+    ts.emplace_back([&, t] {
+      for (int i = 0; i < kIters; ++i) {
+        const uint64_t id = (t + i) % kKeys + 1;
+        const std::string want = payload(id);
+        switch ((t + i) % 3) {
+          case 0: s.Cache(K(id), want.data(), want.size()); break;
+          case 1: {
+            std::string got;
+            if (s.Range(K(id), 0, 0, &got) == Status::kOk && !got.empty() && got != want)
+              bad.fetch_add(1);
+            break;
+          }
+          case 2: s.Remove(K(id)); break;
+        }
+      }
+    });
+  }
+  for (auto& th : ts) th.join();
+  EXPECT_EQ(bad.load(), 0) << "a read observed another key's bytes after Remove";
+  // Steady state: every key must round-trip again (no leaked slots / stuck state).
+  for (uint64_t id = 1; id <= kKeys; ++id) {
+    const std::string want = payload(id);
+    ASSERT_EQ(s.Cache(K(id), want.data(), want.size()), Status::kOk);
+    std::string got;
+    ASSERT_EQ(s.Range(K(id), 0, 0, &got), Status::kOk) << "key " << id;
+    EXPECT_EQ(got, want);
+  }
 }
