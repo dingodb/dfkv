@@ -51,10 +51,15 @@ void KvNodeServer::InitRamTier() {
     unsigned long long n = std::strtoull(b, nullptr, 10);
     if (n > 0) o.bytes = n;
   }
-  // Flusher persists a RAM slot to the disk group (same bytes GET returns).
-  auto tier = std::make_unique<RamTier>(o, [this](const BlockKey& k, const void* d, size_t l) {
-    return group_.Cache(k, d, l) == Status::kOk;
-  });
+  // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache): the
+  // arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab lands it
+  // via O_DIRECT -- a buffered flush would route the RAM tier's entire write
+  // volume back through the page cache, defeating the tier's purpose of keeping
+  // memory use bounded and explicit on GPU nodes.
+  auto tier = std::make_unique<RamTier>(
+      o, [this](const BlockKey& k, char* d, size_t l, size_t cap) {
+        return group_.CacheDirect(k, d, l, cap) == Status::kOk;
+      });
   if (tier->ok()) ram_ = std::move(tier);  // arena alloc failed => stay disk-only
 }
 

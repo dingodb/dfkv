@@ -17,10 +17,12 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   }
   const bool use_slab = (engine == "slab");
   engine_ = use_slab ? "slab" : "file";  // resolved truth, reported via EngineName
-  // Slab write mode: DFKV_SLAB_WRITE=direct switches the aligned CacheDirect
-  // path to O_DIRECT extent writes (see DiskSlabStore::Options::direct_writes).
+  // Slab I/O mode: DIRECT by default -- on GPU nodes the page-cache/dirty
+  // growth of buffered I/O competes with training/inference memory; burst
+  // absorption belongs to the explicit RAM tier (DFKV_RAM_TIER), not the page
+  // cache. DFKV_SLAB_WRITE=buffered opts out (benchmarks / non-GPU boxes).
   const char* wm = std::getenv("DFKV_SLAB_WRITE");
-  const bool slab_direct = wm && std::string(wm) == "direct";
+  const bool slab_direct = !(wm && std::string(wm) == "buffered");
   for (const auto& dir : opt.cache_dirs) {
     std::unique_ptr<StoreEngine> store;
     if (use_slab) {
@@ -28,7 +30,10 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       so.dir = dir;
       so.capacity_bytes = per_disk;
       so.direct_writes = slab_direct;
-      store = std::make_unique<DiskSlabStore>(so);
+      auto slab = std::make_unique<DiskSlabStore>(so);
+      // Resolved truth (an fs that rejects O_DIRECT demotes to buffered).
+      write_mode_ = slab->DirectWritesActive() ? "direct" : "buffered";
+      store = std::move(slab);
     } else {
       store = std::make_unique<KVStore>(KVStore::Options{dir, per_disk});
     }

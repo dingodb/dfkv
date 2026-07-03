@@ -56,8 +56,13 @@ class RamTier {
   };
 
   // Persists a slot to disk. Returns true on success (slot -> DURABLE). Called
-  // off the hot path by the background flusher; `data` points into the arena.
-  using FlushFn = std::function<bool(const BlockKey& key, const void* data, size_t len)>;
+  // off the hot path by the background flusher; `data` points into the arena
+  // (4 KiB-aligned) and `cap` is the slot's full size, so the sink may take the
+  // O_DIRECT CacheDirect path -- zeroing padding bytes inside [len, cap) is fine
+  // (the slot is this key's; readers only ever see [0, len)). A buffered sink
+  // can ignore cap.
+  using FlushFn =
+      std::function<bool(const BlockKey& key, char* data, size_t len, size_t cap)>;
 
   // A pinned arena location handed to the RDMA send path. `token` must be passed
   // back to Release() once the send completes (releases the send-pin).
@@ -110,6 +115,7 @@ class RamTier {
   struct Entry {
     uint64_t offset = 0;   // byte offset into arena_
     uint32_t len = 0;      // payload length
+    uint32_t cap = 0;      // slot size (>= len, 4 KiB multiple) -- flusher's DIO cap
     bool durable = false;  // flushed to disk (metrics; eviction uses alloc pin)
   };
   struct QItem { std::string fn; BlockKey key; uint32_t tries = 0; };

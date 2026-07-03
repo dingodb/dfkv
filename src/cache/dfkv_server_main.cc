@@ -239,11 +239,10 @@ int main(int argc, char** argv) {
     {
       std::string info = std::string("ver=") + dfkv::Version();
       info += ",engine=" + srv.engine_name();
-      // Only worth a field when it deviates from the default buffered mode.
-      if (srv.engine_name() == "slab") {
-        const char* wm = std::getenv("DFKV_SLAB_WRITE");
-        if (wm && std::string(wm) == "direct") info += ",wr=direct";
-      }
+      // Resolved I/O mode (not env intent): tmpfs-style O_DIRECT rejection
+      // demotes to buffered, and the fleet audit must see that.
+      if (srv.engine_name() == "slab" && !srv.write_mode().empty())
+        info += ",wr=" + srv.write_mode();
       info += ",disks=" + std::to_string(srv.DiskCount());
       info += ",cap=" + std::to_string(cap);
       info += ",ram=" + (srv.ram_enabled()

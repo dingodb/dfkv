@@ -152,17 +152,24 @@ bool DiskSlabStore::OpenOrInit() {
     // Materialize the extent (idempotent): DIO OVERWRITES of allocated/unwritten
     // ranges parallelize on XFS; allocating writes into ftruncate holes would
     // serialize on the exclusive iolock (measured 4.2 vs 2.0 GB/s at 8 writers).
-    if (opt_.direct_writes &&
+    if (opt_.direct_writes && !extent_dio_fds_.empty() &&
         ::fallocate(fd, 0, 0, static_cast<off_t>(opt_.extent_bytes)) != 0 &&
         errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL) {
       ::close(fd);
       return false;
     }
     extent_fds_[e] = fd;
-    if (opt_.direct_writes) {
-      int dfd = ::open(ep.c_str(), O_WRONLY | O_DIRECT);
-      if (dfd < 0) return false;  // fds opened so far are reclaimed by ~DiskSlabStore
-      extent_dio_fds_[e] = dfd;
+    if (opt_.direct_writes && !extent_dio_fds_.empty()) {
+      // O_RDWR: the twin serves DIO writes AND the aligned RangeDirect/prep
+      // reads. A filesystem that rejects O_DIRECT (tmpfs) demotes the whole
+      // store to buffered -- resolved truth via DirectWritesActive().
+      int dfd = ::open(ep.c_str(), O_RDWR | O_DIRECT);
+      if (dfd < 0) {
+        for (int d : extent_dio_fds_) if (d >= 0) ::close(d);
+        extent_dio_fds_.clear();
+      } else {
+        extent_dio_fds_[e] = dfd;
+      }
     }
   }
   return true;
@@ -301,6 +308,47 @@ Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
 Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
                                   uint64_t length, char* io_buf, size_t io_cap,
                                   const char** out_data, size_t* out_len) {
+  // Direct mode + aligned io_buf (the RDMA path's contract): O_DIRECT read of
+  // the slot-absolute aligned window, payload pointer trimmed by head -- the
+  // GET path stays page-cache-free. Anything else: buffered RangeInto.
+  if (!extent_dio_fds_.empty() && ok_ &&
+      (reinterpret_cast<uintptr_t>(io_buf) & 4095) == 0) {
+    const std::string fn = key.Filename();
+    SlabAllocator::SlotRef ref;
+    uint32_t plen = 0;
+    if (!AcquireForRead(fn, &ref, &plen)) return Status::kNotFound;
+    Status st = Status::kOk;
+    size_t got = 0, head = 0;
+    if (offset < plen) {
+      const uint64_t n = std::min(length ? length : (plen - offset),
+                                  static_cast<uint64_t>(plen - offset));
+      const uint64_t abs = ref.offset + offset;
+      const uint64_t aoff = abs & ~static_cast<uint64_t>(4095);
+      head = static_cast<size_t>(abs - aoff);
+      const size_t alen =
+          (head + static_cast<size_t>(n) + 4095) & ~static_cast<size_t>(4095);
+      if (alen <= io_cap) {
+        if (PreadAll(extent_dio_fds_[ref.extent], io_buf, alen, aoff))
+          got = static_cast<size_t>(n);
+        else
+          st = Status::kIOError;
+      } else {  // window larger than the caller's buffer: buffered exact read
+        if (!PreadAll(extent_fds_[ref.extent], io_buf,
+                      static_cast<size_t>(std::min<uint64_t>(n, io_cap)),
+                      ref.offset + offset))
+          st = Status::kIOError;
+        else { got = static_cast<size_t>(std::min<uint64_t>(n, io_cap)); head = 0; }
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ReleaseInflightLocked(key, fn);
+    }
+    if (st != Status::kOk) return st;
+    if (out_data) *out_data = io_buf + head;
+    if (out_len) *out_len = got;
+    return Status::kOk;
+  }
   size_t got = 0;
   Status st = RangeInto(key, offset, length, io_buf, io_cap, &got);
   if (st == Status::kOk) { if (out_data) *out_data = io_buf; if (out_len) *out_len = got; }
@@ -329,10 +377,12 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
   const size_t head = static_cast<size_t>(abs - aoff);
   const size_t alen = (head + static_cast<size_t>(n) + 4095) & ~static_cast<size_t>(4095);
   if (alen > io_cap) return bail(Status::kInvalid);  // caller uses sync RangeDirect
-  // Buffered dup: a page-cache-hot slot completes the caller's read in memory.
-  // The dup is the caller's to close; the PIN (not the fd) is what keeps the
-  // slot's bytes intact -- extents are shared files, so an open fd pins nothing.
-  int fd = ::dup(extent_fds_[ref.extent]);
+  // Direct mode dups the DIO twin (page-cache-free); buffered mode dups the
+  // buffered fd so a page-cache-hot slot completes the read in memory. The dup
+  // is the caller's to close; the PIN (not the fd) is what keeps the slot's
+  // bytes intact -- extents are shared files, so an open fd pins nothing.
+  int fd = ::dup(extent_dio_fds_.empty() ? extent_fds_[ref.extent]
+                                         : extent_dio_fds_[ref.extent]);
   if (fd < 0) return bail(Status::kIOError);
   uint64_t tok;
   {

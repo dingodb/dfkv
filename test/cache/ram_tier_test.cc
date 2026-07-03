@@ -34,7 +34,7 @@ struct FlushSink {
   int calls = 0;
 
   RamTier::FlushFn fn() {
-    return [this](const BlockKey& k, const void*, size_t) {
+    return [this](const BlockKey& k, char*, size_t, size_t) {
       std::unique_lock<std::mutex> lk(m);
       ++calls;
       cv.wait(lk, [this] { return gate_open; });

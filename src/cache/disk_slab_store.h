@@ -40,12 +40,15 @@ class DiskSlabStore : public StoreEngine {
     // per-extent slot count (and thus slots.tbl size) is bounded. Real KV blocks
     // are MiB-scale, so 1 MiB is a fine default; tests use small values.
     uint64_t slot_granularity = (1ull << 20);
-    // O_DIRECT payload writes on the aligned CacheDirect path (DFKV_SLAB_WRITE=
-    // direct). Trades the page cache's burst absorption (~15 GB/s/disk measured)
-    // for device-rate writes (~4.2 GB/s/disk) with bounded tail latency, zero
-    // dirty-page pressure, and payload-durable-before-record crash ordering.
-    // Extents are fallocate'd either way; DIO OVERWRITES parallelize on XFS
-    // (allocating writes into holes would serialize on the exclusive iolock).
+    // O_DIRECT on the aligned data paths (CacheDirect writes, RangeDirect reads,
+    // async prep): zero page-cache footprint -- on GPU nodes the cache/dirty
+    // growth of buffered I/O competes with training/inference memory, so the
+    // DEPLOYMENT default is direct (DiskCacheGroup: DFKV_SLAB_WRITE=buffered
+    // opts out); burst absorption comes from the explicit RAM tier instead.
+    // Extents are fallocate'd in this mode: DIO OVERWRITES parallelize on XFS,
+    // allocating writes into holes would serialize on the exclusive iolock.
+    // If the filesystem rejects O_DIRECT (tmpfs in tests/CI), the store falls
+    // back to buffered -- DirectWritesActive() reports the resolved truth.
     bool direct_writes = false;
   };
 
@@ -87,6 +90,8 @@ class DiskSlabStore : public StoreEngine {
   uint64_t EvictedBytes() const override;
   const std::string& Dir() const override { return opt_.dir; }
   uint64_t TableRebuilt() const { return table_rebuilt_; }  // records restored at open
+  // Resolved I/O mode: direct_writes requested AND the filesystem took O_DIRECT.
+  bool DirectWritesActive() const { return !extent_dio_fds_.empty(); }
 
  private:
   static constexpr size_t kRecBytes = 64;

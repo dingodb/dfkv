@@ -61,6 +61,10 @@ class DiskCacheGroup {
   // The storage backend actually constructed ("file" | "slab") -- the RESOLVED
   // choice (Options.engine / DFKV_STORE_ENGINE / default), not the flag intent.
   const std::string& EngineName() const { return engine_; }
+  // Slab I/O mode actually in effect ("direct" | "buffered"; empty for file
+  // engine). Direct is the deployment default; a filesystem that rejects
+  // O_DIRECT (tmpfs) resolves to buffered regardless of the env.
+  const std::string& WriteMode() const { return write_mode_; }
   // Per-disk views for fine-grained metrics (i in [0, DiskCount)).
   const std::string& DiskPath(size_t i) const { return disks_[i]->Dir(); }
   uint64_t DiskUsedBytes(size_t i) const { return disks_[i]->UsedBytes(); }
@@ -71,7 +75,8 @@ class DiskCacheGroup {
 
   StoreEngine* Route(const BlockKey& key) const;
 
-  std::string engine_;  // resolved backend name (see EngineName)
+  std::string engine_;      // resolved backend name (see EngineName)
+  std::string write_mode_;  // resolved slab I/O mode (see WriteMode)
   std::vector<std::unique_ptr<StoreEngine>> disks_;
   std::unordered_map<std::string, StoreEngine*> by_id_;  // disk id -> store
   ConHash ring_;

@@ -46,6 +46,7 @@ bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
   const std::string fn = key.Filename();
 
   uint64_t offset = 0;
+  uint32_t cap = 0;
   {
     std::lock_guard<std::mutex> lk(mu_);
     // Resident, or another thread is mid-copy on this same (content-addressed)
@@ -65,6 +66,7 @@ bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
     alloc_->Pin(fn);
     writing_.insert(fn);  // reserve the key so a concurrent same-key Put dedups
     offset = ref.offset;
+    cap = ref.slot_size;
     // NOT visible yet: index_ install is deferred until after the copy, so a
     // concurrent GetPrep can't read the slot mid-copy.
   }
@@ -76,6 +78,7 @@ bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
     Entry e;
     e.offset = offset;
     e.len = static_cast<uint32_t>(len);
+    e.cap = cap;
     e.durable = false;
     index_[fn] = e;
     writing_.erase(fn);  // copy done -> now visible to GetPrep
@@ -160,17 +163,18 @@ void RamTier::FlushLoop() {
 
     // Snapshot the slot (guaranteed present: a queued item is flush-pinned, so
     // it can't be evicted or Removed).
-    const void* data = nullptr;
-    size_t len = 0;
+    char* data = nullptr;
+    size_t len = 0, cap = 0;
     {
       std::lock_guard<std::mutex> lk(mu_);
       auto it = index_.find(item.fn);
       if (it == index_.end() || it->second.durable) continue;  // gone/already done
       data = arena_ + it->second.offset;
       len = it->second.len;
+      cap = it->second.cap;
     }
 
-    const bool ok = flush_ ? flush_(item.key, data, len) : true;
+    const bool ok = flush_ ? flush_(item.key, data, len, cap) : true;
 
     {
       std::lock_guard<std::mutex> lk(mu_);

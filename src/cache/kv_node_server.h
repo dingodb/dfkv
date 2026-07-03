@@ -108,6 +108,7 @@ class KvNodeServer {
   bool ram_enabled() const { return ram_ != nullptr; }
   // Resolved storage backend name ("file"|"slab"), for self-description reporting.
   const std::string& engine_name() const { return group_.EngineName(); }
+  const std::string& write_mode() const { return group_.WriteMode(); }
   char* ram_arena() const { return ram_ ? ram_->arena() : nullptr; }
   uint64_t ram_arena_bytes() const { return ram_ ? ram_->arena_bytes() : 0; }
   // On a RAM hit, pins the slot and returns its arena pointer + length + a token;

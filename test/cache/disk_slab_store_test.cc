@@ -320,3 +320,34 @@ TEST_F(DiskSlabTest, RangeDirectPrepHoldsSlotUntilRelease) {
   // Miss and zero-length behave like the sync path.
   EXPECT_EQ(s.RangeDirectPrep(K(9), 0, 0, 1 << 20, &p), Status::kNotFound);
 }
+
+// Direct-mode RangeDirect: O_DIRECT aligned-window read with head trim -- the
+// returned pointer must land exactly on the requested offset's bytes, including
+// a non-4KiB-aligned client offset (head != 0).
+TEST_F(DiskSlabTest, DirectModeRangeDirectAlignedWindowRead) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.direct_writes = true;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  std::string v(9000, '\0');
+  for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<char>(i * 13);
+  ASSERT_EQ(s.Cache(K(1), v.data(), v.size()), Status::kOk);
+
+  void* mem = nullptr;
+  ASSERT_EQ(posix_memalign(&mem, 4096, 1 << 20), 0);
+  char* io_buf = static_cast<char*>(mem);
+  const char* out = nullptr;
+  size_t out_len = 0;
+  // Full read.
+  ASSERT_EQ(s.RangeDirect(K(1), 0, 0, io_buf, 1 << 20, &out, &out_len), Status::kOk);
+  EXPECT_EQ(std::string(out, out_len), v);
+  // Unaligned offset (head != 0): bytes [100, 5100).
+  ASSERT_EQ(s.RangeDirect(K(1), 100, 5000, io_buf, 1 << 20, &out, &out_len), Status::kOk);
+  EXPECT_EQ(out_len, 5000u);
+  EXPECT_EQ(std::string(out, out_len), v.substr(100, 5000));
+  // Miss stays a miss.
+  EXPECT_EQ(s.RangeDirect(K(9), 0, 0, io_buf, 1 << 20, &out, &out_len),
+            Status::kNotFound);
+  free(mem);
+}
