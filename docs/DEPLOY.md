@@ -122,10 +122,11 @@ LimitMEMLOCK=infinity        # RDMA 需要锁页内存
 WantedBy=multi-user.target
 ```
 
-> **可选存储/加速开关（均默认关，向后兼容；见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）**
-> - `--store-engine=file|slab`（默认 `file`）：`slab` = extent 池 + slots.tbl 重启保温，消除"每块一文件"隐患。**切 slab 需清盘冷启**（旧 blocks/ 布局不复用），属独立迁移动作。
-> - `Environment=DFKV_RAM_TIER=1`（默认关）：开写直通 RAM 热层；`DFKV_RAM_TIER_BYTES=<bytes>` 定 arena 大小（预注册即 pin 内存，须核 `MemoryMax` 有余量）。开后观测 `dfkv_ram_hit_total` / `dfkv_ram_put_bypass_total`（见 METRICS.md §3.1）。RDMA 构建下 RAM 命中走 arena MR 零拷贝直发。
-> 滚动升级 v1.7.0 建议：**先全默认滚一遍**（等价现网）；RAM 热层、slab 引擎再各自单节点灰度评估。
+> **可选存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。行为开关均为「门面 flag + `DFKV_*` env 双生」，flag 覆盖预设 env；运行时真值经 `dfkvctl ring` INFO 列审计（`engine=`/`wr=`/`ram=`）。**
+> - `--store-engine file|slab`（默认 `file`）：`slab` = extent 池 + slots.tbl 重启保温，消除"每块一文件"隐患。**切 slab 需清盘冷启**（旧 blocks/ 布局不复用），属独立迁移动作。
+> - `--slab-write direct|buffered`（**默认 `direct`**）：slab 数据面全程 O_DIRECT（写+对齐读+异步 prep），零 page cache/脏页占用——GPU 节点上突发吸收交给显式 RAM 热层而非内核缓存；extent 在 direct 模式下 fallocate 实体化（升级后 df 显示预分配为预期行为）。文件系统拒绝 O_DIRECT（如 tmpfs）时整店回退 buffered，以 `wr=` 上报真值。
+> - `--ram-tier on`（默认关）：写直通 RAM 热层 + RDMA arena 零拷贝 GET；`--ram-tier-bytes <bytes>` 定 arena 大小（预注册即 pin 内存，须核 `MemoryMax` 有余量）。开后观测 `dfkv_ram_hit_total` / `dfkv_ram_put_bypass_total`（见 METRICS.md §3.1）。**direct 模式下 flusher 经 CacheDirect DIO 落盘，RAM 池写入量不过 page cache。**
+> GPU 节点推荐组合：`--store-engine slab`（direct 已默认）+ `--ram-tier on` + 按节点突发画像定 `--ram-tier-bytes`。
 ```bash
 systemctl daemon-reload && systemctl enable --now dfkv
 journalctl -u dfkv -n 10 --no-pager

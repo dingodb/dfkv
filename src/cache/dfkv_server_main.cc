@@ -49,8 +49,14 @@ int main(int argc, char** argv) {
       "  --id <id>            node id; --advertise <ip:port>  address peers reach (rdma-port)\n"
       "  --weight <n>         consistent-hash weight (default 1)\n"
       "  --metrics-port <p>   enable Prometheus /metrics (omit = off); --metrics-bind <addr>\n"
+      "  --store-engine <e>   storage backend: file | slab (default file)\n"
+      "  --slab-write <m>     slab I/O mode: direct | buffered (default direct)\n"
+      "  --ram-tier <on|off>  RAM hot tier: write-through arena + RDMA zero-copy GET (default off)\n"
+      "  --ram-tier-bytes <n> RAM arena size in bytes (default 4 GiB; pinned once registered)\n"
       "  --version, -V        print version and exit\n"
-      "  --help, -h           print this help and exit\n",
+      "  --help, -h           print this help and exit\n"
+      "Behavior flags are facades over their DFKV_* env twins (STORE_ENGINE, SLAB_WRITE,\n"
+      "RAM_TIER, RAM_TIER_BYTES); a flag always overrides a pre-set env value.\n",
       dfkv::Version());
     return help ? 0 : 1;
   }
@@ -58,7 +64,7 @@ int main(int argc, char** argv) {
                   {"--dir", "--port", "--cap", "--rdma-port", "--rdma-dev",
                    "--mds", "--group", "--id", "--advertise", "--weight",
                    "--metrics-port", "--metrics-bind", "--store-engine",
-                   "--slab-write"});
+                   "--slab-write", "--ram-tier", "--ram-tier-bytes"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -76,10 +82,17 @@ int main(int argc, char** argv) {
   // wins over a pre-set DFKV_STORE_ENGINE.
   std::string store_engine = args.Get("--store-engine", "");
   if (!store_engine.empty()) ::setenv("DFKV_STORE_ENGINE", store_engine.c_str(), 1);
-  // Slab write mode: "direct" = O_DIRECT extent writes (device-rate, bounded
-  // tail, no page-cache pressure); default buffered (burst absorption).
+  // Slab write mode: "direct" (default; page-cache-free) | "buffered" opt-out.
   std::string slab_write = args.Get("--slab-write", "");
   if (!slab_write.empty()) ::setenv("DFKV_SLAB_WRITE", slab_write.c_str(), 1);
+  // RAM hot tier facade flags. Same layering trick as --store-engine: the tier
+  // is constructed deep inside KvNodeServer, so the flag rides the env twin --
+  // and setenv(overwrite=1) is what makes a flag beat a pre-set env value.
+  std::string ram_tier = args.Get("--ram-tier", "");
+  if (!ram_tier.empty()) ::setenv("DFKV_RAM_TIER", ram_tier.c_str(), 1);
+  std::string ram_tier_bytes = args.Get("--ram-tier-bytes", "");
+  if (!ram_tier_bytes.empty())
+    ::setenv("DFKV_RAM_TIER_BYTES", ram_tier_bytes.c_str(), 1);
   if (!args.ok()) {
     std::fprintf(stderr, "dfkv_server: %s\n(run with --help for usage)\n",
                  args.error().c_str());
