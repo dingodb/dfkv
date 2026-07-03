@@ -15,10 +15,13 @@
 #ifndef DFKV_DISK_SLAB_STORE_H_
 #define DFKV_DISK_SLAB_STORE_H_
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -50,6 +53,25 @@ class DiskSlabStore : public StoreEngine {
     // If the filesystem rejects O_DIRECT (tmpfs in tests/CI), the store falls
     // back to buffered -- DirectWritesActive() reports the resolved truth.
     bool direct_writes = false;
+    // slots.tbl fdatasync cadence (ms; 0 = off). Bounds the crash window in
+    // which a REUSED slot's new payload is on disk while the reused record is
+    // still page-cache-only -- rebuild would then resurrect the PREVIOUS
+    // occupant's key pointing at the new occupant's bytes. Payload writes give
+    // no such window in direct mode (DIO is durable at return); this closes
+    // the record side to <= the cadence instead of the ~30s dirty expiry.
+    uint32_t table_sync_ms = 100;
+  };
+
+  // One store's runtime counters (see KvNodeServer's dfkv_slab_* metrics).
+  struct Stats {
+    uint64_t dio_write_fallbacks = 0;  // direct mode: writes that fell back buffered
+    uint64_t dio_read_fallbacks = 0;   // direct mode: aligned reads that fell back
+    uint64_t table_syncs = 0;          // fdatasync cycles actually performed
+    uint64_t steals = 0;               // allocator cross-class extent steals
+    uint64_t extent_returns = 0;       // fully-free extents returned to the pool
+    uint64_t deferred_removes = 0;     // Removes deferred behind in-flight I/O
+    uint64_t inflight = 0;             // keys with an unlocked read/write in flight
+    uint64_t prep_holds = 0;           // outstanding async-prep slot holds
   };
 
   // Opens (or creates) the store under Options::dir, pre-allocating extents and
@@ -92,6 +114,7 @@ class DiskSlabStore : public StoreEngine {
   uint64_t TableRebuilt() const { return table_rebuilt_; }  // records restored at open
   // Resolved I/O mode: direct_writes requested AND the filesystem took O_DIRECT.
   bool DirectWritesActive() const { return !extent_dio_fds_.empty(); }
+  Stats GetStats() const;
 
  private:
   static constexpr size_t kRecBytes = 64;
@@ -151,6 +174,18 @@ class DiskSlabStore : public StoreEngine {
   bool ok_ = false;
   uint64_t table_rebuilt_ = 0;
   uint64_t evicted_bytes_ = 0;
+  uint64_t deferred_remove_total_ = 0;  // under mu_
+  std::atomic<uint64_t> dio_write_fallbacks_{0};
+  std::atomic<uint64_t> dio_read_fallbacks_{0};
+  std::atomic<uint64_t> table_syncs_{0};
+  // slots.tbl sync thread (see Options::table_sync_ms): fdatasync only when
+  // records were written since the last cycle.
+  std::atomic<uint64_t> record_writes_{0};
+  uint64_t synced_marker_ = 0;  // sync-thread-local snapshot of record_writes_
+  std::thread sync_thread_;
+  std::condition_variable sync_cv_;
+  std::mutex sync_mu_;
+  bool sync_stop_ = false;
 };
 
 }  // namespace dfkv

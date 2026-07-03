@@ -247,3 +247,34 @@ TEST(SlabAllocator, ConsecutivePutsStripeAcrossExtents) {
   ASSERT_TRUE(a.Put("k5", 4096, &r, &ev));
   EXPECT_NE(r.extent, e4) << "back-to-back puts hit the same extent";
 }
+
+// A fully-freed extent flows back to the shared pool (unbound) once its class
+// keeps more than kStripeWays extents in rotation -- a later class of a new
+// size can then bind it instead of stealing (which evicts residents).
+TEST(SlabAllocator, FullyFreeExtentReturnsToPool) {
+  // 12 extents of one 4096-slot each: 12 puts bind all 12 (stripe top-up), and
+  // the rotation holds 12 > kStripeWays=8 entries only while slots are free --
+  // after the puts every extent is FULL, so frees make extents fully-free again.
+  SlabAllocator a(Opts(4096, 12));
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 12; ++i)
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  EXPECT_EQ(a.BoundExtents(), 12u);
+  EXPECT_EQ(a.ExtentReturns(), 0u);
+  // Free them all: each Remove makes that extent fully free; once the rotation
+  // exceeds 8, the surplus fully-free extents unbind back to the pool.
+  for (int i = 0; i < 12; ++i) a.Remove("k" + std::to_string(i));
+  EXPECT_GT(a.ExtentReturns(), 0u);
+  EXPECT_LT(a.BoundExtents(), 12u);
+  // A NEW size class (smaller slot => different class) binds a returned pool
+  // extent without stealing/evicting.
+  SlabAllocator b(Opts(8 * 1024, 12, 1024));
+  for (int i = 0; i < 12; ++i)
+    ASSERT_TRUE(b.Put("k" + std::to_string(i), 8 * 1024, &r, &ev));  // fill: 1 slot/extent
+  for (int i = 0; i < 12; ++i) b.Remove("k" + std::to_string(i));
+  EXPECT_GT(b.ExtentReturns(), 0u);
+  ASSERT_TRUE(b.Put("small", 1024, &r, &ev));  // new class, binds from pool
+  EXPECT_TRUE(ev.empty()) << "returned-pool bind must not evict";
+  EXPECT_EQ(b.Steals(), 0u);
+}

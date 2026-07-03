@@ -123,6 +123,7 @@ class KvNodeServer {
   void AcceptLoop();
   void Handle(int fd);
   void InitRamTier();     // construct ram_ if DFKV_RAM_TIER is enabled (env)
+  void InitAdmission();   // read DFKV_PUT_INFLIGHT_LIMIT (0 = gate off)
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
@@ -130,6 +131,11 @@ class KvNodeServer {
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
   // depth metrics: errors by op, live connections, sampled op latency
   std::atomic<size_t> put_io_err_{0}, get_io_err_{0}, invalid_ops_{0};
+  // PUT admission gate (I6): reject with kCacheFull once this many disk writes
+  // are in flight (0 = unlimited/off). See --put-inflight-limit.
+  size_t put_busy_limit_ = 0;
+  std::atomic<size_t> disk_put_inflight_{0};
+  std::atomic<size_t> put_busy_{0};
   std::atomic<size_t> open_connections_{0};
   Sampler lat_sampler_{64};        // 1-in-64 latency sampling (near-zero hot-path cost)
   LatencyHist get_lat_, put_lat_;  // server-side op latency (sampled)

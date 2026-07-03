@@ -159,6 +159,21 @@ void SlabAllocator::FreeSlotLocked(const std::string& key, Entry& e) {
   if (e.refs > 0 && extents_[ext].pinned > 0) extents_[ext].pinned--;
   used_bytes_ -= e.ref.slot_size;
   index_.erase(key);
+  // Capacity flows back between classes: once an extent is ENTIRELY free and
+  // the class keeps at least kStripeWays other extents in rotation (write
+  // parallelism preserved), unbind it to the shared pool -- a workload shift
+  // (new value size => new class) then re-binds it instead of stealing, which
+  // would evict another class's residents.
+  ExtentMeta& m = extents_[ext];
+  if (m.free_slots == m.total_slots && C.ext_rr.size() > kStripeWays) {
+    DropExtentFreeLocked(C, ext);
+    m.cls = kUnbound;
+    m.total_slots = 0;
+    m.free_slots = 0;
+    m.pinned = 0;
+    ++unbound_;
+    ++extent_returns_;
+  }
 }
 
 bool SlabAllocator::EvictOneFrom(size_t cls, std::vector<std::string>* evicted) {
@@ -230,6 +245,7 @@ bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted
   extents_[E].free_slots = 0;
   extents_[E].pinned = 0;
   ++unbound_;
+  ++steals_;
   return BindFreeExtent(cls);  // now picks the freshly-unbound E
 }
 
@@ -344,6 +360,14 @@ uint64_t SlabAllocator::Capacity() const {
 uint64_t SlabAllocator::Evictions() const {
   std::lock_guard<std::mutex> lk(mu_);
   return evictions_;
+}
+uint64_t SlabAllocator::Steals() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return steals_;
+}
+uint64_t SlabAllocator::ExtentReturns() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return extent_returns_;
 }
 size_t SlabAllocator::ClassCount() const {
   std::lock_guard<std::mutex> lk(mu_);

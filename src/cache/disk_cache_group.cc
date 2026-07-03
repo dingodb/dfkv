@@ -23,6 +23,19 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   // cache. DFKV_SLAB_WRITE=buffered opts out (benchmarks / non-GPU boxes).
   const char* wm = std::getenv("DFKV_SLAB_WRITE");
   const bool slab_direct = !(wm && std::string(wm) == "buffered");
+  // Slot quantum (DFKV_SLAB_GRANULARITY, bytes): tune DOWN for small-value
+  // workloads (default 1 MiB wastes ~94% on 64 KiB values). Changing it is a
+  // layout change -> meta mismatch -> the store re-inits EMPTY (cold cache):
+  // treat as a migration step, not a routine restart.
+  uint64_t slab_gran = 0;
+  if (const char* g = std::getenv("DFKV_SLAB_GRANULARITY")) {
+    unsigned long long v = std::strtoull(g, nullptr, 10);
+    if (v > 0) slab_gran = v;
+  }
+  // slots.tbl fdatasync cadence override (ms; 0 disables). Default 100.
+  uint32_t sync_ms = 100;
+  if (const char* t = std::getenv("DFKV_SLAB_TABLE_SYNC_MS"))
+    sync_ms = static_cast<uint32_t>(std::strtoul(t, nullptr, 10));
   for (const auto& dir : opt.cache_dirs) {
     std::unique_ptr<StoreEngine> store;
     if (use_slab) {
@@ -30,7 +43,10 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       so.dir = dir;
       so.capacity_bytes = per_disk;
       so.direct_writes = slab_direct;
+      if (slab_gran) so.slot_granularity = slab_gran;
+      so.table_sync_ms = sync_ms;
       auto slab = std::make_unique<DiskSlabStore>(so);
+      slabs_.push_back(slab.get());
       // Resolved truth (an fs that rejects O_DIRECT demotes to buffered).
       write_mode_ = slab->DirectWritesActive() ? "direct" : "buffered";
       store = std::move(slab);
@@ -110,6 +126,22 @@ Status DiskCacheGroup::RangeDirectPrep(const BlockKey& key, uint64_t offset,
     }
   }
   return st;
+}
+
+DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
+  DiskSlabStore::Stats sum;
+  for (const auto* d : slabs_) {
+    const auto st = d->GetStats();
+    sum.dio_write_fallbacks += st.dio_write_fallbacks;
+    sum.dio_read_fallbacks += st.dio_read_fallbacks;
+    sum.table_syncs += st.table_syncs;
+    sum.steals += st.steals;
+    sum.extent_returns += st.extent_returns;
+    sum.deferred_removes += st.deferred_removes;
+    sum.inflight += st.inflight;
+    sum.prep_holds += st.prep_holds;
+  }
+  return sum;
 }
 
 void DiskCacheGroup::RangeRelease(uint64_t token) {

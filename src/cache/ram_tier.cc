@@ -15,6 +15,10 @@ RamTier::RamTier(Options opt, FlushFn flush)
   // a granularity multiple) are O_DIRECT-aligned for the flusher (gap 10.4).
   if (posix_memalign(&p, 4096, opt_.bytes) != 0 || p == nullptr) return;
   arena_ = static_cast<char*>(p);
+  // Pre-fault the arena now (one bounded cost at startup) instead of paying
+  // first-touch page faults on the PUT hot path. With RDMA the MR registration
+  // pins pages anyway; this covers TCP-only runs and makes startup cost explicit.
+  std::memset(arena_, 0, opt_.bytes);
 
   SlabAllocator::Options ao;
   ao.extent_bytes = opt_.bytes;   // the whole arena is one extent
@@ -22,7 +26,10 @@ RamTier::RamTier(Options opt, FlushFn flush)
   ao.align = opt_.slot_granularity;
   ao.max_waste = 0.25;
   alloc_ = std::make_unique<SlabAllocator>(ao);
-  flusher_ = std::thread([this] { FlushLoop(); });
+  const uint32_t nf = opt_.flush_threads ? opt_.flush_threads : 1;
+  flushers_.reserve(nf);
+  for (uint32_t i = 0; i < nf; ++i)
+    flushers_.emplace_back([this] { FlushLoop(); });
 }
 
 RamTier::~RamTier() {
@@ -31,7 +38,7 @@ RamTier::~RamTier() {
     stop_ = true;
   }
   flush_cv_.notify_all();
-  if (flusher_.joinable()) flusher_.join();
+  for (auto& f : flushers_) if (f.joinable()) f.join();
   if (arena_) std::free(arena_);
 }
 

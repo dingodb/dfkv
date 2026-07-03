@@ -53,6 +53,13 @@ class RamTier {
     uint64_t bytes = (4ull << 30);       // arena size (DFKV_RAM_TIER_BYTES)
     uint32_t slot_granularity = 4096;    // slot quantum (>= O_DIRECT align)
     uint32_t flush_retries = 3;          // per-item flush attempts before drop
+    // Flush worker threads draining the shared queue. One DIO stream sustains
+    // only ~1.6-3 GB/s -- far below the arena's ingest -- so the drain rate,
+    // not the arena size, decides when Put backpressure kicks in. The server
+    // defaults this to the disk count (keys hash-spread across disks, so K
+    // workers keep ~K devices busy). Same-key flushes can't run concurrently
+    // (one queued item per key at a time), so workers need no extra ordering.
+    uint32_t flush_threads = 1;
   };
 
   // Persists a slot to disk. Returns true on success (slot -> DURABLE). Called
@@ -140,7 +147,7 @@ class RamTier {
   std::deque<QItem> flushq_;
   std::condition_variable flush_cv_;
   bool stop_ = false;
-  std::thread flusher_;
+  std::vector<std::thread> flushers_;
 
   std::atomic<uint64_t> hits_{0}, misses_{0}, puts_{0}, put_bypass_{0};
   std::atomic<uint64_t> flushed_{0}, flush_dropped_{0};

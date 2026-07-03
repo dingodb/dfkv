@@ -96,6 +96,8 @@ class SlabAllocator {
   uint64_t UsedBytes() const;       // sum of slot_size over resident keys
   uint64_t Capacity() const;        // num_extents * extent_bytes
   uint64_t Evictions() const;
+  uint64_t Steals() const;          // cross-class extent steals (capacity churn signal)
+  uint64_t ExtentReturns() const;   // fully-free extents unbound back to the pool
   size_t ClassCount() const;
   uint32_t BoundExtents() const;    // extents currently carved to a class
 
@@ -159,6 +161,8 @@ class SlabAllocator {
   uint32_t unbound_ = 0;   // pool extents not bound to any class (skip bind scans at 0)
   uint64_t used_bytes_ = 0;
   uint64_t evictions_ = 0;
+  uint64_t steals_ = 0;
+  uint64_t extent_returns_ = 0;
 };
 
 }  // namespace dfkv

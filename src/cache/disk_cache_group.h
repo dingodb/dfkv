@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "utils/con_hash.h"
+#include "cache/disk_slab_store.h"
 #include "cache/kv_store.h"
 #include "cache/store_engine.h"
 #include "common/kv_types.h"
@@ -65,6 +66,8 @@ class DiskCacheGroup {
   // engine). Direct is the deployment default; a filesystem that rejects
   // O_DIRECT (tmpfs) resolves to buffered regardless of the env.
   const std::string& WriteMode() const { return write_mode_; }
+  // Summed slab runtime counters across disks (all-zero for the file engine).
+  DiskSlabStore::Stats SlabStats() const;
   // Per-disk views for fine-grained metrics (i in [0, DiskCount)).
   const std::string& DiskPath(size_t i) const { return disks_[i]->Dir(); }
   uint64_t DiskUsedBytes(size_t i) const { return disks_[i]->UsedBytes(); }
@@ -78,6 +81,7 @@ class DiskCacheGroup {
   std::string engine_;      // resolved backend name (see EngineName)
   std::string write_mode_;  // resolved slab I/O mode (see WriteMode)
   std::vector<std::unique_ptr<StoreEngine>> disks_;
+  std::vector<const DiskSlabStore*> slabs_;  // typed view of disks_ (slab engine only)
   std::unordered_map<std::string, StoreEngine*> by_id_;  // disk id -> store
   ConHash ring_;
 };

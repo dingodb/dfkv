@@ -24,11 +24,11 @@ inline double NowSec() {
 }  // namespace
 
 KvNodeServer::KvNodeServer(const std::string& cache_dir, uint64_t capacity_bytes)
-    : group_(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) { InitRamTier(); }
+    : group_(DiskCacheGroup::Options{{cache_dir}, capacity_bytes}) { InitRamTier(); InitAdmission(); }
 
 KvNodeServer::KvNodeServer(const std::vector<std::string>& cache_dirs,
                            uint64_t capacity_bytes)
-    : group_(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) { InitRamTier(); }
+    : group_(DiskCacheGroup::Options{cache_dirs, capacity_bytes}) { InitRamTier(); InitAdmission(); }
 
 KvNodeServer::~KvNodeServer() {
   // Order matters: Stop() first joins the accept + handler threads so no request
@@ -37,6 +37,13 @@ KvNodeServer::~KvNodeServer() {
   // is destroyed last, after this body.
   Stop();
   ram_.reset();
+}
+
+void KvNodeServer::InitAdmission() {
+  if (const char* v = std::getenv("DFKV_PUT_INFLIGHT_LIMIT")) {
+    unsigned long long n = std::strtoull(v, nullptr, 10);
+    put_busy_limit_ = static_cast<size_t>(n);
+  }
 }
 
 void KvNodeServer::InitRamTier() {
@@ -50,6 +57,14 @@ void KvNodeServer::InitRamTier() {
   if (const char* b = std::getenv("DFKV_RAM_TIER_BYTES")) {
     unsigned long long n = std::strtoull(b, nullptr, 10);
     if (n > 0) o.bytes = n;
+  }
+  // Flush workers default to the disk count (keys hash-spread, so K workers
+  // keep ~K devices busy); DFKV_RAM_FLUSH_THREADS overrides for tuning.
+  o.flush_threads = static_cast<uint32_t>(
+      std::min<size_t>(group_.DiskCount() ? group_.DiskCount() : 1, 8));
+  if (const char* f = std::getenv("DFKV_RAM_FLUSH_THREADS")) {
+    unsigned long long n = std::strtoull(f, nullptr, 10);
+    if (n > 0 && n <= 64) o.flush_threads = static_cast<uint32_t>(n);
   }
   // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache): the
   // arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab lands it
@@ -220,6 +235,32 @@ std::string KvNodeServer::MetricsText() const {
     s += get_lat_.RenderBody("dfkv_op_latency_seconds", get_lbl);
     s += put_lat_.RenderBody("dfkv_op_latency_seconds", put_lbl);
   }
+  // Slab engine internals, emitted only for slab so a file-engine scrape is
+  // unchanged. The dio_*_fallback counters are the "page cache silently crept
+  // back in" alarm for direct-mode deployments.
+  if (group_.EngineName() == "slab") {
+    const auto ss = group_.SlabStats();
+    metric("dfkv_slab_dio_write_fallback_total", "counter",
+           "Direct-mode PUTs that fell back to a buffered write", ss.dio_write_fallbacks);
+    metric("dfkv_slab_dio_read_fallback_total", "counter",
+           "Direct-mode aligned GETs that fell back to a buffered read", ss.dio_read_fallbacks);
+    metric("dfkv_slab_table_sync_total", "counter",
+           "slots.tbl fdatasync cycles performed", ss.table_syncs);
+    metric("dfkv_slab_extent_steals_total", "counter",
+           "Cross-class extent steals (class capacity churn)", ss.steals);
+    metric("dfkv_slab_extent_returns_total", "counter",
+           "Fully-free extents returned to the shared pool", ss.extent_returns);
+    metric("dfkv_slab_deferred_removes_total", "counter",
+           "Removes deferred behind in-flight slot I/O", ss.deferred_removes);
+    metric("dfkv_slab_inflight_keys", "gauge",
+           "Keys with an unlocked read/write in flight", ss.inflight);
+    metric("dfkv_slab_prep_holds", "gauge",
+           "Outstanding async-prep slot holds", ss.prep_holds);
+  }
+  if (put_busy_limit_ > 0)
+    metric("dfkv_put_busy_total", "counter",
+           "PUTs rejected by the disk-write admission gate (kCacheFull)",
+           put_busy_.load(std::memory_order_relaxed));
   // RAM hot tier (P3), emitted only when enabled so a disk-only node's scrape is
   // unchanged. ram_hit/ram_miss let you compute the RAM hit rate; ram_put_bypass
   // is the flush-backpressure signal from the design's gap 10.3.
@@ -408,8 +449,20 @@ Status KvNodeServer::CacheDirect(uint64_t id, uint32_t index, uint32_t ksize,
     st = Status::kOk;
     cache_put_.fetch_add(1, std::memory_order_relaxed);
     bytes_written_.fetch_add(len, std::memory_order_relaxed);
+  } else if (put_busy_limit_ > 0 &&
+             disk_put_inflight_.load(std::memory_order_relaxed) >=
+                 put_busy_limit_) {
+    // Admission gate (opt-in, --put-inflight-limit): the disk write queue is
+    // already `limit` deep -- fast-fail with kCacheFull instead of joining a
+    // 100ms+ device queue. Clients treat kCacheFull as a plain put-failure
+    // WITHOUT a peer cooldown (unlike kIOError), so the block is simply
+    // recomputed later: a controlled miss instead of a latency tail.
+    st = Status::kCacheFull;
+    put_busy_.fetch_add(1, std::memory_order_relaxed);
   } else {
+    disk_put_inflight_.fetch_add(1, std::memory_order_relaxed);
     st = group_.CacheDirect(key, data, len, cap);
+    disk_put_inflight_.fetch_sub(1, std::memory_order_relaxed);
     if (st == Status::kOk) {
       cache_put_.fetch_add(1, std::memory_order_relaxed);
       bytes_written_.fetch_add(len, std::memory_order_relaxed);

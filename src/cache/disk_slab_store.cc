@@ -75,10 +75,32 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
 
   ok_ = OpenOrInit();
   if (ok_) Rebuild();
+  if (ok_ && opt_.table_sync_ms > 0) {
+    sync_thread_ = std::thread([this] {
+      std::unique_lock<std::mutex> lk(sync_mu_);
+      for (;;) {
+        sync_cv_.wait_for(lk, std::chrono::milliseconds(opt_.table_sync_ms),
+                          [this] { return sync_stop_; });
+        if (sync_stop_) return;
+        const uint64_t seen = record_writes_.load(std::memory_order_relaxed);
+        if (seen == synced_marker_) continue;  // no new records: skip the syscall
+        lk.unlock();
+        ::fdatasync(table_fd_);
+        lk.lock();
+        synced_marker_ = seen;
+        table_syncs_.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
   if (ok) *ok = ok_;
 }
 
 DiskSlabStore::~DiskSlabStore() {
+  if (sync_thread_.joinable()) {
+    { std::lock_guard<std::mutex> lk(sync_mu_); sync_stop_ = true; }
+    sync_cv_.notify_all();
+    sync_thread_.join();
+  }
   for (int fd : extent_fds_) if (fd >= 0) ::close(fd);
   for (int fd : extent_dio_fds_) if (fd >= 0) ::close(fd);
   if (table_fd_ >= 0) ::close(table_fd_);
@@ -214,7 +236,9 @@ bool DiskSlabStore::WriteRecord(const SlabAllocator::SlotRef& r, const BlockKey&
   net::PutU32(reinterpret_cast<char*>(rec) + 32, payload_len);
   const uint32_t crc = Crc32(rec + 8, kRecBytes - 8);
   net::PutU32(reinterpret_cast<char*>(rec) + 4, crc);
-  return PwriteAll(table_fd_, rec, kRecBytes, TableOffset(r.extent, r.slot));
+  const bool ok = PwriteAll(table_fd_, rec, kRecBytes, TableOffset(r.extent, r.slot));
+  if (ok) record_writes_.fetch_add(1, std::memory_order_relaxed);
+  return ok;
 }
 
 bool DiskSlabStore::WritePayload(const SlabAllocator::SlotRef& r, const void* data,
@@ -301,6 +325,8 @@ Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
         (reinterpret_cast<uintptr_t>(data) & 4095) == 0 &&
         alen <= cap && alen <= r.slot_size)
       return WritePayloadDirect(r, data, len);
+    if (!extent_dio_fds_.empty() && len != 0)
+      dio_write_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     return WritePayload(r, data, len);
   });
 }
@@ -333,6 +359,7 @@ Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
         else
           st = Status::kIOError;
       } else {  // window larger than the caller's buffer: buffered exact read
+        dio_read_fallbacks_.fetch_add(1, std::memory_order_relaxed);
         if (!PreadAll(extent_fds_[ref.extent], io_buf,
                       static_cast<size_t>(std::min<uint64_t>(n, io_cap)),
                       ref.offset + offset))
@@ -349,6 +376,8 @@ Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
     if (out_len) *out_len = got;
     return Status::kOk;
   }
+  if (!extent_dio_fds_.empty() && ok_)
+    dio_read_fallbacks_.fetch_add(1, std::memory_order_relaxed);  // unaligned io_buf
   size_t got = 0;
   Status st = RangeInto(key, offset, length, io_buf, io_cap, &got);
   if (st == Status::kOk) { if (out_data) *out_data = io_buf; if (out_len) *out_len = got; }
@@ -505,6 +534,7 @@ Status DiskSlabStore::Remove(const BlockKey& key) {
     // even a pinned slot); defer the free to the last releaser. Readers gate
     // off immediately via the payload_len_ erase.
     deferred_remove_.insert(fn);
+    ++deferred_remove_total_;
     payload_len_.erase(fn);
     return Status::kOk;
   }
@@ -521,6 +551,20 @@ uint64_t DiskSlabStore::Evictions() const { return alloc_->Evictions(); }
 uint64_t DiskSlabStore::EvictedBytes() const {
   std::lock_guard<std::mutex> lk(mu_);
   return evicted_bytes_;
+}
+
+DiskSlabStore::Stats DiskSlabStore::GetStats() const {
+  Stats st;
+  st.dio_write_fallbacks = dio_write_fallbacks_.load(std::memory_order_relaxed);
+  st.dio_read_fallbacks = dio_read_fallbacks_.load(std::memory_order_relaxed);
+  st.table_syncs = table_syncs_.load(std::memory_order_relaxed);
+  st.steals = alloc_->Steals();
+  st.extent_returns = alloc_->ExtentReturns();
+  std::lock_guard<std::mutex> lk(mu_);
+  st.deferred_removes = deferred_remove_total_;
+  st.inflight = inflight_.size();
+  st.prep_holds = prep_holds_.size();
+  return st;
 }
 
 }  // namespace dfkv

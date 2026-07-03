@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <atomic>
 #include <thread>
 
 namespace fs = std::filesystem;
@@ -157,6 +158,49 @@ TEST(RamTierWiring, DisabledByDefaultNoRamMetrics) {
   EXPECT_EQ(MetricVal(m, "dfkv_ram_put_total"), -1);
   EXPECT_EQ(s->m_cache_put(), 1u);   // normal disk accounting intact
   EXPECT_EQ(s->m_cache_hit(), 1u);
+  s.reset();
+  fs::remove_all(dir);
+}
+
+// I6: the PUT admission gate (DFKV_PUT_INFLIGHT_LIMIT) fast-fails concurrent
+// disk writes past the limit with kCacheFull -- a controlled miss, not a queue
+// tail -- and counts them. limit=1 with 8 racing 4 MiB writers makes at least
+// one rejection all but certain.
+TEST(RamTierWiring, PutAdmissionGateRejectsWithCacheFull) {
+  ::setenv("DFKV_PUT_INFLIGHT_LIMIT", "1", 1);
+  auto dir = fs::temp_directory_path() / "dfkv_admission";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  auto s = std::make_unique<KvNodeServer>(dir.string(), 1ull << 30);
+  ::unsetenv("DFKV_PUT_INFLIGHT_LIMIT");
+
+  constexpr int T = 8, N = 20;
+  std::atomic<int> ok{0}, busy{0}, other{0};
+  std::vector<std::thread> ts;
+  for (int t = 0; t < T; ++t) {
+    ts.emplace_back([&, t] {
+      // KVStore::CacheDirect demands a 4 KiB-aligned buffer (O_DIRECT, no
+      // buffered fallback in the file engine).
+      void* mem = nullptr;
+      ASSERT_EQ(posix_memalign(&mem, 4096, 4 << 20), 0);
+      char* buf = static_cast<char*>(mem);
+      std::memset(buf, 'a' + t, 4 << 20);
+      for (int i = 0; i < N; ++i) {
+        Status st = s->CacheDirect(1000 + t * N + i, 0, 1, buf,
+                                   4 << 20, 4 << 20);
+        if (st == Status::kOk) ok.fetch_add(1);
+        else if (st == Status::kCacheFull) busy.fetch_add(1);
+        else other.fetch_add(1);
+      }
+      free(mem);
+    });
+  }
+  for (auto& th : ts) th.join();
+  EXPECT_GT(ok.load(), 0);
+  EXPECT_GT(busy.load(), 0) << "8 writers vs limit=1: gate never fired?";
+  EXPECT_EQ(other.load(), 0);
+  const std::string m = s->MetricsText();
+  EXPECT_EQ(MetricVal(m, "dfkv_put_busy_total"), busy.load());
   s.reset();
   fs::remove_all(dir);
 }

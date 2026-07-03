@@ -351,3 +351,38 @@ TEST_F(DiskSlabTest, DirectModeRangeDirectAlignedWindowRead) {
             Status::kNotFound);
   free(mem);
 }
+
+// R1-B: the table-sync thread fdatasyncs slots.tbl on a cadence, but only in
+// cycles where records were actually written.
+TEST_F(DiskSlabTest, TableSyncCadenceCountsCycles) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.table_sync_ms = 20;  // fast cadence for the test
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  std::string v(3000, 's');
+  ASSERT_EQ(s.Cache(K(1), v.data(), v.size()), Status::kOk);
+  // Within a few cadences the sync thread must have flushed the new record.
+  for (int i = 0; i < 100 && s.GetStats().table_syncs == 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_GE(s.GetStats().table_syncs, 1u);
+  // Idle cadences don't burn syscalls: the counter stays put with no writes.
+  const uint64_t after = s.GetStats().table_syncs;
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  EXPECT_EQ(s.GetStats().table_syncs, after);
+}
+
+// R2: in direct mode an UNALIGNED CacheDirect payload falls back to the
+// buffered path -- and the fallback is counted (the "page cache crept back
+// in" signal for direct deployments).
+TEST_F(DiskSlabTest, DioFallbackIsCounted) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.direct_writes = true;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  if (!s.DirectWritesActive()) GTEST_SKIP() << "fs rejected O_DIRECT (tmpfs)";
+  std::string v(3000, 'u');  // std::string data: not 4 KiB-aligned
+  ASSERT_EQ(s.CacheDirect(K(1), &v[0], v.size(), v.size()), Status::kOk);
+  EXPECT_EQ(s.GetStats().dio_write_fallbacks, 1u);
+}

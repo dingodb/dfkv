@@ -53,10 +53,13 @@ int main(int argc, char** argv) {
       "  --slab-write <m>     slab I/O mode: direct | buffered (default direct)\n"
       "  --ram-tier <on|off>  RAM hot tier: write-through arena + RDMA zero-copy GET (default off)\n"
       "  --ram-tier-bytes <n> RAM arena size in bytes (default 4 GiB; pinned once registered)\n"
+      "  --slab-granularity <n>  slab slot quantum bytes (default 1 MiB; CHANGING IT COLD-STARTS the store)\n"
+      "  --put-inflight-limit <n>  cap concurrent disk PUTs; excess fast-fail kCacheFull (0 = off)\n"
       "  --version, -V        print version and exit\n"
       "  --help, -h           print this help and exit\n"
       "Behavior flags are facades over their DFKV_* env twins (STORE_ENGINE, SLAB_WRITE,\n"
-      "RAM_TIER, RAM_TIER_BYTES); a flag always overrides a pre-set env value.\n",
+      "RAM_TIER, RAM_TIER_BYTES, SLAB_GRANULARITY, PUT_INFLIGHT_LIMIT); a flag always\n"
+      "overrides a pre-set env value.\n",
       dfkv::Version());
     return help ? 0 : 1;
   }
@@ -64,7 +67,8 @@ int main(int argc, char** argv) {
                   {"--dir", "--port", "--cap", "--rdma-port", "--rdma-dev",
                    "--mds", "--group", "--id", "--advertise", "--weight",
                    "--metrics-port", "--metrics-bind", "--store-engine",
-                   "--slab-write", "--ram-tier", "--ram-tier-bytes"});
+                   "--slab-write", "--ram-tier", "--ram-tier-bytes",
+                   "--slab-granularity", "--put-inflight-limit"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -93,6 +97,15 @@ int main(int argc, char** argv) {
   std::string ram_tier_bytes = args.Get("--ram-tier-bytes", "");
   if (!ram_tier_bytes.empty())
     ::setenv("DFKV_RAM_TIER_BYTES", ram_tier_bytes.c_str(), 1);
+  // Slot quantum: a LAYOUT parameter -- changing it re-inits the store EMPTY
+  // (meta mismatch). Facade for small-value deployments (default 1 MiB).
+  std::string slab_gran = args.Get("--slab-granularity", "");
+  if (!slab_gran.empty()) ::setenv("DFKV_SLAB_GRANULARITY", slab_gran.c_str(), 1);
+  // PUT admission gate: cap concurrent disk writes; excess PUTs fast-fail with
+  // kCacheFull (client: plain put-failure, no peer cooldown) instead of joining
+  // a deep device queue. 0 = off (default).
+  std::string put_limit = args.Get("--put-inflight-limit", "");
+  if (!put_limit.empty()) ::setenv("DFKV_PUT_INFLIGHT_LIMIT", put_limit.c_str(), 1);
   if (!args.ok()) {
     std::fprintf(stderr, "dfkv_server: %s\n(run with --help for usage)\n",
                  args.error().c_str());
