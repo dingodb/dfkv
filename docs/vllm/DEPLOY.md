@@ -96,6 +96,7 @@ vllm serve <model> \
 | **`PYTHONHASHSEED`** | 未设 | **`0`(全 rank/实例一致)** | 跨进程/跨重启 key 确定性,**不设=不命中** |
 | `DFKV_RDMA_DEPTH` | `1` | **保持 1** | 每连接在途请求数;延迟隐藏、**非吞吐旋钮**(GET/PUT 都 depth-flat,server 单连接串行) |
 | `DFKV_RDMA_NUMA` | `0` | 多 NUMA 大机可设 `1` | 绑 buffer/线程到轨的 NUMA 节点 + 选 NUMA-local 轨 |
+| `DFKV_WIRE_VERSION` | `1` | **保持默认 `1`** | wire 协议版本;`2`=请求带 seq+回显校验(仅 TCP,RDMA 恒 v1 忽略此项);服务端 dual-accept 双版本→客户端可独立切换。默认 v1=等价 v1.6.x |
 | `DFKV_LIB` / `DFKV_BUILD` | — | `libdfkv.so` 路径 | 被 extra_config.lib 覆盖 |
 | `DFKV_ACCESS_LOG_ENABLED` | `0` | 排查时设 `1` | 逐 op 访问日志(`batch_get_auto_sg`/`batch_put_sg`/`batch_exist`/`register_memory`);关=约 100ns 空操作,开=异步落盘、热路径约 µs |
 | `DFKV_ACCESS_LOG_PATH` | stderr | `/var/log/dfkv/vllm-access.log` | 日志路径;空=写 stderr |
