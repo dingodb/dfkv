@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "utils/log.h"          // DFKV_LOG_WARN (uring init fallback)
 #include "utils/net_util.h"     // ReadAll / WriteAll / Get*/Put*
 #include "utils/numa_util.h"    // pin serve thread to the device's NUMA node
 #include "utils/wire_limits.h"  // ResolveMaxPayload (shared with the TCP path)
@@ -429,7 +430,13 @@ void RdmaServer::Serve(int boot_fd) {
     const size_t uring_depth = std::max(UringDepth(K), K);
     UringReader ring(static_cast<unsigned>(uring_depth));
     if (!ring.ok()) {
-      // Ring init failed: fall through to the sync loop below (correctness-first).
+      // Ring init failed: fall through to the sync loop below (correctness-first)
+      // -- but say so, and count it: an operator who set DFKV_SERVER_URING=1
+      // must be able to tell "active" from "silently degraded".
+      uring_init_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      DFKV_LOG_WARN("io_uring ring init failed (depth=" +
+                    std::to_string(uring_depth) +
+                    "); this connection serves on the SYNC path");
       goto sync_serve_loop;
     }
     {
@@ -535,6 +542,7 @@ void RdmaServer::Serve(int boot_fd) {
         // deferred request in the emit pass below (correctness-first).
         bool batch_ok = true;
         if (!descs.empty()) {
+          uring_reads_.fetch_add(descs.size(), std::memory_order_relaxed);
           batch_ok = ring.BatchRead(descs.data(), static_cast<int>(descs.size()));
           // A failed batch may have left async reads in flight against the
           // recv-slot dbufs. Drain (reap-and-discard) until the kernel is done
@@ -691,6 +699,12 @@ std::string RdmaServer::MetricsText() const {
     ActiveConns());
   m(s, "dfkv_rdma_idle_reclaims_total", "counter", "RDMA connections reclaimed on idle timeout",
     IdleReclaims());
+  m(s, "dfkv_uring_reads_total", "counter",
+    "GET disk reads submitted through the io_uring path (>0 = path active)",
+    UringReads());
+  m(s, "dfkv_uring_init_fallbacks_total", "counter",
+    "Connections that wanted io_uring but fell back to the sync path (ring init failed)",
+    UringInitFallbacks());
   return s;
 }
 

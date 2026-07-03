@@ -132,6 +132,13 @@ class RdmaServer {
   uint64_t CompletionErrors() const { return completion_errors_.load(std::memory_order_relaxed); }
   uint64_t ActiveConns() const { return active_conns_.load(std::memory_order_relaxed); }
   uint64_t IdleReclaims() const { return idle_reclaims_.load(std::memory_order_relaxed); }
+  // io_uring async-GET path observability: reads actually submitted through a
+  // ring, and connections that WANTED the path but fell back to sync (ring init
+  // failed). Both zero when the path is off -- uring_reads_total > 0 is the
+  // external proof the env-gated path is really active (the fallback is
+  // otherwise silent by design, correctness-first).
+  uint64_t UringReads() const { return uring_reads_.load(std::memory_order_relaxed); }
+  uint64_t UringInitFallbacks() const { return uring_init_fallbacks_.load(std::memory_order_relaxed); }
   std::string MetricsText() const;  // Prometheus text (dfkv_rdma_*)
 
  private:
@@ -174,6 +181,7 @@ class RdmaServer {
   std::mutex conn_mu_;
   std::vector<Conn> conns_;
   std::unordered_set<rdma::RcEndpoint*> live_eps_;
+  std::atomic<uint64_t> uring_reads_{0}, uring_init_fallbacks_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},
       idle_reclaims_{0};
 };
