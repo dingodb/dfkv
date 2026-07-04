@@ -174,16 +174,20 @@ class DingoFSHiCacheTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
 
-    def test_rdma_depth_extra_config_sets_env(self):
-        # extra_config rdma_depth must propagate to DFKV_RDMA_DEPTH so the C client
-        # builds its transport with write pipelining (#1). Set before dfkv_open.
+    def test_rdma_depth_extra_config_does_not_leak_env(self):
+        # v2 (PR#122): extra_config rdma_depth goes through the dfkv_open_v2
+        # config struct → scoped env inside the C layer → restored on return.
+        # The process env must NOT be permanently polluted (the old behavior
+        # clobbered other connector instances in the same process).
         members, _, _ = self._node("rdepth")
         os.environ.pop("DFKV_RDMA_DEPTH", None)
         try:
             cfg = self._cfg(members)
             cfg.extra_config["rdma_depth"] = 8
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
-            self.assertEqual(os.environ.get("DFKV_RDMA_DEPTH"), "8")
+            # Construction succeeded (rdma_depth applied via v2 scoped env) AND
+            # the process env is unchanged — no leak.
+            self.assertIsNone(os.environ.get("DFKV_RDMA_DEPTH"))
         finally:
             os.environ.pop("DFKV_RDMA_DEPTH", None)
 
@@ -221,16 +225,17 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(self._rail_for(members, rails, tp_rank=5, tp_size=8)[0], rails)
         self.assertEqual(self._rail_for(members, rails, tp_rank=7, tp_size=8)[0], rails)
 
-    def test_rdma_numa_extra_config_sets_env(self):
-        # The new rdma_numa knob opts into client-side NUMA-aware rail selection
-        # by setting DFKV_RDMA_NUMA=1 (replaces rail_affinity's old side effect).
+    def test_rdma_numa_extra_config_does_not_leak_env(self):
+        # v2 (PR#122): extra_config rdma_numa goes through dfkv_open_v2's config
+        # struct → scoped env → restored. The process env must NOT be permanently
+        # set (old behavior set DFKV_RDMA_NUMA=1 globally via setdefault).
         members, _, _ = self._node("rnuma")
         os.environ.pop("DFKV_RDMA_NUMA", None)
         try:
             cfg = self._cfg(members)
             cfg.extra_config["rdma_numa"] = True
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
-            self.assertEqual(os.environ.get("DFKV_RDMA_NUMA"), "1")
+            self.assertIsNone(os.environ.get("DFKV_RDMA_NUMA"))
         finally:
             os.environ.pop("DFKV_RDMA_NUMA", None)
 

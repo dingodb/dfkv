@@ -43,6 +43,11 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_open.restype = c_void_p
     lib.dfkv_open.argtypes = [c_char_p, c_uint64] + [c_uint32] * 8
 
+    # v2 structured config (PR#121): transport/tuning knobs via config struct,
+    # scoped env inside the C layer — no process-wide os.environ[...] side-effect.
+    lib.dfkv_open_v2.restype = c_void_p
+    lib.dfkv_open_v2.argtypes = [c_void_p]  # const dfkv_client_config_t*
+
     # int = dfkv_start_mds_discovery(c, mds_endpoints, group, poll_ms)
     # Background MDS-based membership discovery (production path): the ring is
     # built/refreshed from the MDS tier instead of a static --members list.

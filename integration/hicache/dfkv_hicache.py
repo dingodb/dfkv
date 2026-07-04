@@ -36,6 +36,26 @@ from dfkv_telemetry import tracing as _tracing
 _FLAG_IS_MLA = 0x1
 
 
+class _DfkvClientConfig(ctypes.Structure):
+    """Mirrors dfkv_client_config_t in src/client/dfkv_c_api.h. Field order and
+    types MUST match the C struct (ctypes lays them out in declaration order).
+    Used by dfkv_open_v2 so transport/tuning knobs go per-client via a scoped
+    env inside the C layer, not via process-wide os.environ[...]."""
+    _fields_ = [
+        ("members", ctypes.c_char_p),
+        ("model_hash", ctypes.c_uint64),
+        ("page_size", ctypes.c_uint32), ("dtype_tag", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("tp_size", ctypes.c_uint32), ("tp_rank", ctypes.c_uint32),
+        ("layer_num", ctypes.c_uint32), ("head_num", ctypes.c_uint32),
+        ("head_dim", ctypes.c_uint32),
+        ("rdma_depth", ctypes.c_uint32), ("rdma_numa", ctypes.c_uint32),
+        ("rdma_dev", ctypes.c_char_p),
+        ("require_rdma", ctypes.c_uint32),
+        ("batch_concurrency", ctypes.c_uint32),
+    ]
+
+
 def _truthy(v) -> bool:
     if isinstance(v, str):
         return v.strip().lower() not in ("", "0", "false", "no", "off")
@@ -52,6 +72,10 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
                               ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
                               ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
                               ctypes.c_uint32]
+    # v2 structured config (PR#121): transport/tuning knobs via config struct,
+    # scoped env inside the C layer — no process-wide os.environ[...] side-effect.
+    lib.dfkv_open_v2.restype = ctypes.c_void_p
+    lib.dfkv_open_v2.argtypes = [ctypes.c_void_p]  # const dfkv_client_config_t*
     lib.dfkv_put.restype = ctypes.c_int
     lib.dfkv_put.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_get.restype = ctypes.c_int
@@ -202,18 +226,13 @@ class DfkvHiCache(HiCacheStorage):
             members = cfg.get("members", "")
             if not mds and not members:
                 raise ValueError("dingofs hicache: extra_config needs 'mds_endpoints' (MDS discovery) or 'members' (static)")
-            # RDMA write pipelining: depth>1 keeps multiple PUTs in flight on one
-            # connection, hiding per-op latency (single-rank MLA writes are
-            # latency-bound). The C client reads DFKV_RDMA_DEPTH when it builds the
-            # transport inside dfkv_open below, so set it from extra_config first.
-            # NOTE: the dfkv_server must set the SAME (or larger) DFKV_RDMA_DEPTH in
-            # its own env -- client depth must be <= server depth.
-            if cfg.get("rdma_depth"):
-                os.environ["DFKV_RDMA_DEPTH"] = str(int(cfg["rdma_depth"]))
-            if _truthy(cfg.get("require_rdma")):
-                os.environ["DFKV_REQUIRE_RDMA"] = "1"
-                if not _truthy(os.environ.get("DFKV_RDMA")):
-                    os.environ["DFKV_RDMA"] = "1"
+            # RDMA transport/tuning knobs go through the v2 config struct → scoped
+            # env inside dfkv_open_v2 (no process-wide os.environ[...] leak). The
+            # C client reads DFKV_RDMA_* during transport construction inside the
+            # scoped window; on return the process env is restored, so two
+            # connector instances in one process no longer clobber each other.
+            # NOTE: the dfkv_server must set the SAME (or larger) DFKV_RDMA_DEPTH
+            # in its own env -- client depth must be <= server depth.
             # rail_affinity (per-tp_rank narrowing) is DEPRECATED and now a no-op:
             # it keyed off tp_rank, which is always 0 under DP-attention (every rank
             # is its own attention TP group of size 1), so it collapsed all ranks to
@@ -225,26 +244,33 @@ class DfkvHiCache(HiCacheStorage):
                 print("[dfkv] WARNING: 'rail_affinity' is deprecated and ignored; "
                       "set DFKV_RDMA_NUMA=1 + multi-rail DFKV_RDMA_DEV for NUMA-aware "
                       "rail selection in the client.", file=_sys.stderr, flush=True)
-            if cfg.get("rdma_numa"):
-                os.environ.setdefault("DFKV_RDMA_NUMA", "1")
-            # self._lib was loaded above (before configure) so the native version
-            # could be reported; dfkv_open uses that same handle here.
             flags = _FLAG_IS_MLA if self.is_mla else 0
             model_hash = int(cfg.get("model_hash", 0)) & 0xFFFFFFFFFFFFFFFF
-            self._h = self._lib.dfkv_open(
-                members.encode(), model_hash,
-                int(cfg.get("page_size", 64)), int(cfg.get("dtype_tag", 0)), flags,
-                self.tp_size, self.tp_rank,
-                int(cfg.get("layer_num", 0)), int(cfg.get("head_num", 0)),
-                int(cfg.get("head_dim", 0)))
+            rdma_dev = cfg.get("rdma_dev", "") or os.environ.get("DFKV_RDMA_DEV", "")
+            ccfg = _DfkvClientConfig(
+                members=members.encode() if members else b"",
+                model_hash=model_hash,
+                page_size=int(cfg.get("page_size", 64)),
+                dtype_tag=int(cfg.get("dtype_tag", 0)),
+                flags=flags,
+                tp_size=self.tp_size, tp_rank=self.tp_rank,
+                layer_num=int(cfg.get("layer_num", 0)),
+                head_num=int(cfg.get("head_num", 0)),
+                head_dim=int(cfg.get("head_dim", 0)),
+                rdma_depth=int(cfg.get("rdma_depth", 0)) or 0,
+                rdma_numa=1 if _truthy(cfg.get("rdma_numa")) else 0,
+                rdma_dev=rdma_dev.encode() if rdma_dev else None,
+                require_rdma=1 if _truthy(cfg.get("require_rdma")) else 0,
+                batch_concurrency=int(cfg.get("batch_concurrency", 0)) or 0,
+            )
+            self._h = self._lib.dfkv_open_v2(ctypes.byref(ccfg))
             if not self._h:
-                raise RuntimeError("dfkv_open failed")
+                raise RuntimeError("dfkv_open_v2 failed")
             mode_b = self._lib.dfkv_transport_mode(self._h)
             self.transport_mode = (
                 mode_b.decode("utf-8", errors="replace") if mode_b else "unknown"
             )
-            if (_truthy(cfg.get("require_rdma")) or
-                    _truthy(os.environ.get("DFKV_REQUIRE_RDMA"))):
+            if _truthy(cfg.get("require_rdma")):
                 if self.transport_mode != "rdma":
                     self._lib.dfkv_close(self._h)
                     self._h = None
@@ -252,9 +278,6 @@ class DfkvHiCache(HiCacheStorage):
                         "dfkv requires RDMA zero-copy transport, "
                         f"got {self.transport_mode}"
                     )
-            if cfg.get("batch_concurrency"):
-                self._lib.dfkv_set_batch_concurrency(
-                    self._h, ctypes.c_uint64(int(cfg["batch_concurrency"])))
             if mds:
                 group = cfg.get("mds_group", "default")
                 poll_ms = int(cfg.get("mds_poll_ms", 3000))

@@ -56,6 +56,10 @@ def load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_open.restype = c_void_p
     lib.dfkv_open.argtypes = [c_char_p, c_uint64, c_uint32, c_uint32, c_uint32,
                               c_uint32, c_uint32, c_uint32, c_uint32, c_uint32]
+    # v2 structured config (PR#121): transport/tuning knobs via config struct,
+    # scoped env inside the C layer — no process-wide os.environ[...] side-effect.
+    lib.dfkv_open_v2.restype = c_void_p
+    lib.dfkv_open_v2.argtypes = [c_void_p]  # const dfkv_client_config_t*
     lib.dfkv_put.restype = c_int
     lib.dfkv_put.argtypes = [c_void_p, c_char_p, c_void_p, c_uint64]
     lib.dfkv_get.restype = c_int
@@ -129,6 +133,22 @@ def _total_size(bufs: Sequence[memoryview]) -> int:
     return sum(mv.nbytes for mv in bufs)
 
 
+class _DfkvClientConfig(ctypes.Structure):
+    """Mirrors dfkv_client_config_t (src/client/dfkv_c_api.h). Field order/types
+    MUST match the C struct. Used by dfkv_open_v2 so transport/tuning knobs go
+    per-client via a scoped env inside the C layer."""
+    _fields_ = [
+        ("members", c_char_p),
+        ("model_hash", c_uint64),
+        ("page_size", c_uint32), ("dtype_tag", c_uint32), ("flags", c_uint32),
+        ("tp_size", c_uint32), ("tp_rank", c_uint32),
+        ("layer_num", c_uint32), ("head_num", c_uint32), ("head_dim", c_uint32),
+        ("rdma_depth", c_uint32), ("rdma_numa", c_uint32),
+        ("rdma_dev", c_char_p),
+        ("require_rdma", c_uint32), ("batch_concurrency", c_uint32),
+    ]
+
+
 class DfkvNativeClient:
     """Awaitable interface over libdfkv.so (ctypes + thread-pool executor)."""
 
@@ -158,20 +178,26 @@ class DfkvNativeClient:
             g = geometry
 
             members = raw_endpoint if membership == "static" else ""
-            self._h = self._lib.dfkv_open(
-                members.encode(),
-                c_uint64(int(g["model_hash"]) & 0xFFFFFFFFFFFFFFFF),
-                int(g["page_size"]) & 0xFFFFFFFF,
-                int(g["dtype_tag"]) & 0xFFFFFFFF,
-                int(g["flags"]) & 0xFFFFFFFF,
-                int(g["tp_size"]) & 0xFFFFFFFF,
-                int(g["tp_rank"]) & 0xFFFFFFFF,
-                int(g["layer_num"]) & 0xFFFFFFFF,
-                int(g["head_num"]) & 0xFFFFFFFF,
-                int(g["head_dim"]) & 0xFFFFFFFF,
+            # v2 config: transport/tuning fields 0/NULL => env fallback (LMCache
+            # connector doesn't tune RDMA via extra_config; DFKV_RDMA_* env still
+            # works as before). batch_concurrency 0 => client default.
+            ccfg = _DfkvClientConfig(
+                members=members.encode() if members else b"",
+                model_hash=c_uint64(int(g["model_hash"]) & 0xFFFFFFFFFFFFFFFF),
+                page_size=c_uint32(int(g["page_size"]) & 0xFFFFFFFF),
+                dtype_tag=c_uint32(int(g["dtype_tag"]) & 0xFFFFFFFF),
+                flags=c_uint32(int(g["flags"]) & 0xFFFFFFFF),
+                tp_size=c_uint32(int(g["tp_size"]) & 0xFFFFFFFF),
+                tp_rank=c_uint32(int(g["tp_rank"]) & 0xFFFFFFFF),
+                layer_num=c_uint32(int(g["layer_num"]) & 0xFFFFFFFF),
+                head_num=c_uint32(int(g["head_num"]) & 0xFFFFFFFF),
+                head_dim=c_uint32(int(g["head_dim"]) & 0xFFFFFFFF),
+                rdma_depth=0, rdma_numa=0, rdma_dev=None,
+                require_rdma=0, batch_concurrency=0,
             )
+            self._h = self._lib.dfkv_open_v2(ctypes.byref(ccfg))
             if not self._h:
-                raise RuntimeError("dfkv_open failed")
+                raise RuntimeError("dfkv_open_v2 failed")
             mode_b = self._lib.dfkv_transport_mode(self._h)
             self.transport_mode = (
                 mode_b.decode("utf-8", errors="replace") if mode_b else "unknown"
