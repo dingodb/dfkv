@@ -1,6 +1,13 @@
 # dfkv — standalone distributed KV cache for SGLang HiCache (no brpc/MDS/S3 deps).
 cmake_minimum_required(VERSION 3.20)
-project(dfkv VERSION 1.12.1 LANGUAGES CXX)
+# Single source of truth for the version is the VERSION file (also shipped in
+# the release tarball). CMake reads it here so `project(dfkv VERSION ...)`
+# stays in sync with VERSION without a bump-both-files step (which bit v1.12.0:
+# the VERSION file was bumped but project() wasn't, so the binary's --version
+# reported 1.11.0). Strip trailing whitespace/newline.
+file(READ "${CMAKE_SOURCE_DIR}/VERSION" _dfkv_ver_raw)
+string(STRIP "${_dfkv_ver_raw}" _dfkv_ver)
+project(dfkv VERSION "${_dfkv_ver}" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
