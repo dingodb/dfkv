@@ -142,10 +142,12 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.procs.append(p)
         return f"{tag}=127.0.0.1:{port}", port, d
 
-    def _cfg(self, members, tp_rank=0, tp_size=8, page_size=64, model="glm-5.1"):
+    def _cfg(self, members, tp_rank=0, tp_size=8, page_size=64, model="glm-5.1",
+             pp_rank=0, pp_size=1, is_mla_model=True):
         return HiCacheStorageConfig(
-            tp_rank=tp_rank, tp_size=tp_size, is_mla_model=True,
+            tp_rank=tp_rank, tp_size=tp_size, is_mla_model=is_mla_model,
             is_page_first_layout=False, model_name=model,
+            pp_rank=pp_rank, pp_size=pp_size,
             extra_config={
                 "members": members, "model_hash": 0x51,
                 "dtype_tag": 0x46384534, "page_size": page_size,
@@ -314,6 +316,74 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(m["set_observations"], 1)
         self.assertEqual(m["get_observations"], 1)
 
+    # --- PP key-isolation tests (pure logic, no server/lib needed) ---
+    # _keys()/_pool_keys() are pure functions of self.{model,tp_rank,tp_size,
+    # is_mla,pp_rank,pp_size,enable_pp}. Bypass __init__ (which needs libdfkv.so
+    # + a live server) via __new__ and set those attrs directly.
+    def _keyonly(self, **kw):
+        st = dfkv_hicache.DfkvHiCache.__new__(dfkv_hicache.DfkvHiCache)
+        st.model = kw.get("model", "glm-5.1")
+        st.tp_rank = kw.get("tp_rank", 0)
+        st.tp_size = kw.get("tp_size", 8)
+        st.is_mla = kw.get("is_mla", True)
+        st.pp_rank = kw.get("pp_rank", 0)
+        st.pp_size = kw.get("pp_size", 1)
+        st.enable_pp = st.pp_size > 1
+        return st
+
+    def test_keys_pp_off_matches_legacy_format(self):
+        # PP disabled: key format must be unchanged (back-compat with existing
+        # clusters running pp_size=1).
+        mla = self._keyonly(is_mla=True)
+        self.assertEqual(mla._keys("abc"), ["glm-5.1/abc_k"])
+        mha = self._keyonly(is_mla=False, tp_rank=2, tp_size=8)
+        self.assertEqual(mha._keys("abc"),
+                         ["glm-5.1/abc_8_2_k", "glm-5.1/abc_8_2_v"])
+
+    def test_keys_mha_pp_on_appends_pp_rank(self):
+        # PP on: MHA keys carry _pp{rank}; different pp_rank -> different keys.
+        pp0 = self._keyonly(is_mla=False, tp_rank=0, tp_size=8, pp_rank=0, pp_size=4)
+        pp1 = self._keyonly(is_mla=False, tp_rank=0, tp_size=8, pp_rank=1, pp_size=4)
+        self.assertEqual(pp0._keys("xyz"),
+                         ["glm-5.1/xyz_8_0_pp0_k", "glm-5.1/xyz_8_0_pp0_v"])
+        self.assertEqual(pp1._keys("xyz"),
+                         ["glm-5.1/xyz_8_0_pp1_k", "glm-5.1/xyz_8_0_pp1_v"])
+        # The whole point: PP0 and PP1 must not share a key.
+        self.assertNotEqual(set(pp0._keys("xyz")), set(pp1._keys("xyz")))
+
+    def test_keys_mla_pp_on_appends_pp_rank(self):
+        # PP on: MLA keys ALSO carry _pp{rank}. PP splits by layer, the MLA
+        # latent is NOT replicated across PP stages (only across TP), so PP0
+        # and PP1 must not collide on the same MLA object.
+        pp0 = self._keyonly(is_mla=True, pp_rank=0, pp_size=2)
+        pp1 = self._keyonly(is_mla=True, pp_rank=1, pp_size=2)
+        self.assertEqual(pp0._keys("h"), ["glm-5.1/h_k_pp0"])
+        self.assertEqual(pp1._keys("h"), ["glm-5.1/h_k_pp1"])
+        self.assertNotEqual(pp0._keys("h"), pp1._keys("h"))
+
+    def test_pool_keys_aux_pool_carries_pp_suffix(self):
+        # Auxiliary pools (e.g. SWA/INDEXER side-pools) must also isolate by PP.
+        pp0 = self._keyonly(is_mla=True, pp_rank=0, pp_size=2)
+        pp1 = self._keyonly(is_mla=True, pp_rank=1, pp_size=2)
+        self.assertEqual(pp0._pool_keys("extra", "p"),
+                         ["glm-5.1/p_extra_pp0_k"])
+        self.assertEqual(pp1._pool_keys("extra", "p"),
+                         ["glm-5.1/p_extra_pp1_k"])
+        # primary "kv" pool routes through _keys (already covered above).
+        self.assertEqual(pp0._pool_keys("kv", "p"), ["glm-5.1/p_k_pp0"])
+
+    def test_keys_pp_isolates_across_full_tp_pp_matrix(self):
+        # Exhaustive: no two (tp_rank, pp_rank) pairs may produce the same key
+        # set on the same page_hash for MHA.
+        seen = set()
+        for tp_r in range(4):
+            for pp_r in range(3):
+                st = self._keyonly(is_mla=False, tp_rank=tp_r, tp_size=4,
+                                   pp_rank=pp_r, pp_size=3)
+                k = tuple(sorted(st._keys("page")))
+                self.assertNotIn(k, seen, f"key collision at tp{tp_r}/pp{pp_r}: {k}")
+                seen.add(k)
+
     def test_mla_writes_single_object_per_page(self):
         members, port, ndir = self._node("mla")
         pool = FakeMlaPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
@@ -352,6 +422,30 @@ class DingoFSHiCacheTest(unittest.TestCase):
         reader = self._plugin(self._cfg(members, page_size=32), pool_r)
         self.assertEqual(reader.batch_get_v1(["h0"], list(range(self.PAGE_SIZE))),
                          [False])
+
+    def test_pp_stages_isolate_on_same_page_hash(self):
+        # Two PP stages (pp_rank 0 and 1) writing the SAME page_hash must land
+        # in separate storage objects — PP splits the model by layer, so each
+        # stage holds a different KV slice for the same prefix. Before the fix,
+        # _keys() ignored pp_rank and the stages overwrote each other.
+        members, _, _ = self._node("pp")
+        pool0 = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
+        pool0.fill_page(0, 0xAA)
+        st0 = self._plugin(self._cfg(members, pp_rank=0, pp_size=2), pool0)
+        st0.batch_set_v1(["shared"], list(range(self.PAGE_SIZE)))
+        # pp_rank=1 writes a different payload for the same page_hash; with the
+        # fix it must NOT clobber pp_rank=0's object.
+        pool1 = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
+        pool1.fill_page(0, 0xBB)
+        st1 = self._plugin(self._cfg(members, pp_rank=1, pp_size=2), pool1)
+        st1.batch_set_v1(["shared"], list(range(self.PAGE_SIZE)))
+        # pp_rank=0 reads back its OWN bytes, not pp_rank=1's.
+        pool0_r = FakeMlaPool(1, self.PAGE_BYTES, self.PAGE_SIZE)
+        st0_r = self._plugin(self._cfg(members, pp_rank=0, pp_size=2), pool0_r)
+        self.assertEqual(st0_r.batch_get_v1(["shared"], list(range(self.PAGE_SIZE))),
+                         [True])
+        self.assertTrue((pool0_r.buf[0:self.PAGE_BYTES] == 0xAA).all(),
+                        "pp_rank=0 payload clobbered by pp_rank=1")
 
     def test_batch_v2_multi_pool_roundtrip(self):
         from sglang.srt.mem_cache.hicache_storage import PoolTransfer

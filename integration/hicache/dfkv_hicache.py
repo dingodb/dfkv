@@ -2,8 +2,17 @@
 dynamic). Zero-copy v1 path: hands raw host-buffer pointers from
 mem_pool_host.get_page_buffer_meta() straight to the DingoFS KV client (C ABI).
 
-MLA (GLM-5.1): one packed-latent object per page, key has NO tp_rank suffix, and
-only tp_rank 0 writes (backup_skip) since the latent is replicated across TP.
+Key scheme:
+- MLA (GLM-5.1): one packed-latent object per page. The latent is replicated
+  across *TP*, so the key has NO tp_rank suffix and only tp_rank 0 writes
+  (backup_skip). PP splits the model by *layer*, so the latent is NOT replicated
+  across PP stages — when pp_size > 1 every key carries _pp{pp_rank} (including
+  MLA) so stages holding different layer-slices do not collide.
+- MHA: two objects (_k/_v) per page, suffixed by tp_size/tp_rank (+ _pp{pp_rank}
+  when PP is on).
+
+This mirrors SGLang's reference HiCacheFile suffix (hicache_storage.py), where
+`enable_pp` appends `_{pp_size}_{pp_rank}` unconditionally — including MLA.
 
 This file is the production plugin. On a GPU host it imports the real SGLang
 HiCacheStorage; the test harness supplies a no-torch shim with the same surface.
@@ -140,6 +149,16 @@ class DfkvHiCache(HiCacheStorage):
         self.tp_rank = int(storage_config.tp_rank)
         self.tp_size = int(storage_config.tp_size)
         self.is_mla = bool(storage_config.is_mla_model)
+        # Pipeline-parallel rank/size. PP splits the model across stages by
+        # layer, so each pp_rank holds a *different* slice of KV (unlike TP,
+        # where MLA latent is replicated). Storage keys MUST therefore carry
+        # pp_rank when pp_size > 1, or PP stages overwrite each other's pages.
+        # Mirrors SGLang's reference HiCacheFile suffix (hicache_storage.py:
+        # `if enable_pp: config_suffix += f"_{pp_size}_{pp_rank}"`, applied
+        # unconditionally — including MLA models).
+        self.pp_rank = int(getattr(storage_config, "pp_rank", 0))
+        self.pp_size = int(getattr(storage_config, "pp_size", 1))
+        self.enable_pp = self.pp_size > 1
         # One-shot guard for the logical-anchor notice (V4/DSA models whose
         # primary "kv" pool holds no host buffer — see _note_logical_anchor_once).
         self._anchor_noop_warned = False
@@ -364,11 +383,18 @@ class DfkvHiCache(HiCacheStorage):
         Returns True on success."""
         return self._lib.dfkv_start_mds_discovery(self._h, mds_endpoints.encode(), group.encode(), poll_ms) == 0
 
-    # --- key scheme: MLA single object (no rank suffix); MHA two objects ---
+    # --- key scheme: MLA single object (no tp_rank suffix); MHA two objects ---
+    # PP note: when pp_size > 1, every path appends _pp{pp_rank} so stages
+    # holding different layer-slices of KV do not collide on the same key.
+    # This applies to MLA too — PP splits by layer, the latent is NOT
+    # replicated across PP stages (only across TP). See __init__.
+    def _pp_suffix(self) -> str:
+        return f"_pp{self.pp_rank}" if self.enable_pp else ""
+
     def _keys(self, page_hash: str) -> List[str]:
         if self.is_mla:
-            return [f"{self.model}/{page_hash}_k"]
-        base = f"{self.model}/{page_hash}_{self.tp_size}_{self.tp_rank}"
+            return [f"{self.model}/{page_hash}_k{self._pp_suffix()}"]
+        base = f"{self.model}/{page_hash}_{self.tp_size}_{self.tp_rank}{self._pp_suffix()}"
         return [base + "_k", base + "_v"]
 
     def _sub(self) -> int:
@@ -543,9 +569,11 @@ class DfkvHiCache(HiCacheStorage):
     # --- v2 pool-aware interface (multi-pool models: Mamba/SWA/DeepSeek-V4) ---
     def _pool_keys(self, pool_name: str, page_hash: str) -> List[str]:
         # primary KV pool keeps the MLA/MHA split; auxiliary pools are single-object.
+        # Both carry the PP suffix for the same layer-slice reason as _keys().
+        pps = self._pp_suffix()
         if pool_name in ("kv", "__default__"):
             return self._keys(page_hash)
-        base = f"{self.model}/{page_hash}_{pool_name}"
+        base = f"{self.model}/{page_hash}_{pool_name}{pps}"
         return [base + "_k"] if self.is_mla else [base + "_k", base + "_v"]
 
     def _pool_sub(self, pool_name: str) -> int:
