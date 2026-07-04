@@ -147,12 +147,12 @@
 | `model_hash` / `page_size` / `dtype_tag` / `flags` | ✅ | ✅（geometry） | ✅（geometry） | ✅ |
 | `tp_size` / `tp_rank` / `layer_num` / `head_num` / `head_dim` | ✅ | ✅（geometry） | ✅（geometry） | ✅ |
 | `lib` / `lib_path` | `lib_path` | `lib` | `lib_path` | 否（loader） |
-| `rdma_depth` / `rdma_numa` / `rdma_dev` / `require_rdma` | ✅ | ✅（v1.13.1+） | — | ✅（v2 scoped env） |
-| `batch_concurrency` | ✅ | ✅ | — | ✅（v2 直接设 KVClient） |
+| `rdma_depth` / `rdma_numa` / `rdma_dev` / `require_rdma` | ✅ | ✅（v1.13.1+） | ✅（v1.13.1+） | ✅（v2 scoped env） |
+| `batch_concurrency` | ✅ | ✅ | ✅（v1.13.1+） | ✅（v2 直接设 KVClient） |
 
 SGLang 专属：`probe_interval_ms`、`rail_affinity`（deprecated，no-op）、`interface_v1`（必填=1，零拷贝契约）。
 vLLM 专属：见 `DFKV_CONNECTOR_CLIENT_RANKS`。
-LMCache 专属：URL `dfkv://<endpoint>/<group>`；`membership` = `mds`（默认） \| `static`。
+LMCache 专属：URL `dfkv://<endpoint>/<group>`；`membership` = `mds`（默认） \| `static`；`rdma_*` / `batch_concurrency` 走 `remote_storage_plugin.dfkv.*` extra_config（v1.13.1+，填进 v2 struct，无 env fallback）。
 
 **unknown-key 警告**：当前 connector 不校验 unknown 键（拼错静默忽略）。计划在统一 `dfkv_config.py` 里加（B2 收尾，待 PR）。
 

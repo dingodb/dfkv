@@ -98,6 +98,11 @@ class DfkvConnector(RemoteConnector):
         lib_path: Optional[str] = None,
         membership: str = "mds",
         mds_poll_ms: int = 3000,
+        rdma_depth: int = 0,
+        rdma_numa: int = 0,
+        rdma_dev: Optional[str] = None,
+        require_rdma: bool = False,
+        batch_concurrency: int = 0,
     ) -> None:
         with access_log("__init__", lambda: f"url={url}") as r:
             super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
@@ -126,6 +131,11 @@ class DfkvConnector(RemoteConnector):
                 rdma_pools=rdma_pools,
                 loop=loop,
                 get_parallelism=self._get_parallelism,
+                rdma_depth=rdma_depth,
+                rdma_numa=rdma_numa,
+                rdma_dev=rdma_dev or "",
+                require_rdma=require_rdma,
+                batch_concurrency=batch_concurrency,
             )
 
             total_pool_mib = sum(length for _, length in rdma_pools) / (1024 * 1024)

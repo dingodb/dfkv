@@ -13,6 +13,14 @@ Wire-up in LMCache config (plugin mode, recommended):
       remote_storage_plugin.dfkv.membership:  mds      # "mds" (default) | "static"
       remote_storage_plugin.dfkv.lib:         /path/to/libdfkv.so   # overrides $DFKV_LIB
       remote_storage_plugin.dfkv.mds_poll_ms: 3000
+      # RDMA transport/tuning (v1.13.1+; go through the v2 config struct → scoped
+      # env inside dfkv_open_v2, no process-wide os.environ leak; 0/None/false =
+      # binary default, no env fallback on the Python side):
+      remote_storage_plugin.dfkv.rdma_dev:        ib7s400p0,ib7s400p1  # comma-separated multi-rail list
+      remote_storage_plugin.dfkv.rdma_depth:      4
+      remote_storage_plugin.dfkv.rdma_numa:       0    # 1 = NUMA-local rail selection
+      remote_storage_plugin.dfkv.require_rdma:    1    # fail if transport fell back to TCP
+      remote_storage_plugin.dfkv.batch_concurrency: 8
 
 For static membership the URL carries the member string directly, e.g.
     remote_storage_plugin.dfkv.url:        dfkv://n1=10.0.0.1:12000,n2=10.0.0.2:12000/x
@@ -50,6 +58,39 @@ _DEFAULT_MEMBERSHIP = "mds"
 _DEFAULT_MDS_POLL_MS = 3000
 
 
+def _truthy(v) -> bool:
+    """Interpret an extra_config value as a boolean (mirrors the SGLang/vLLM
+    connectors). Strings: ""/"0"/"false"/"no"/"off" → False; everything else
+    True. Numbers/bools: plain bool()."""
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(v)
+
+
+def _resolve_nonneg_int(extra_config: dict, prefix: str, key: str) -> int:
+    """Parse extra_config['<prefix>.<key>'] as a non-negative int. Missing → 0
+    (binary default). Raises ValueError on non-int or negative."""
+    raw = extra_config.get(f"{prefix}.{key}")
+    if raw is None:
+        return 0
+    try:
+        val = int(raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"extra_config['{prefix}.{key}']={raw!r} must be an integer"
+        ) from e
+    if val < 0:
+        raise ValueError(
+            f"extra_config['{prefix}.{key}']={val} must be non-negative"
+        )
+    return val
+
+
+def _resolve_bool(extra_config: dict, prefix: str, key: str) -> bool:
+    """Parse extra_config['<prefix>.<key>'] as a bool. Missing → False."""
+    return _truthy(extra_config.get(f"{prefix}.{key}"))
+
+
 def _extract_plugin_type(plugin_name: str) -> str:
     return plugin_name.split(".", 1)[0]
 
@@ -60,6 +101,11 @@ class _PluginOverrides:
     membership: str
     lib_path: Optional[str]
     mds_poll_ms: int
+    rdma_depth: int = 0
+    rdma_numa: int = 0
+    rdma_dev: Optional[str] = None
+    require_rdma: bool = False
+    batch_concurrency: int = 0
 
 
 class DfkvConnectorAdapter(ConnectorAdapter):
@@ -98,6 +144,11 @@ class DfkvConnectorAdapter(ConnectorAdapter):
                 lib_path=ov.lib_path,
                 membership=ov.membership,
                 mds_poll_ms=ov.mds_poll_ms,
+                rdma_depth=ov.rdma_depth,
+                rdma_numa=ov.rdma_numa,
+                rdma_dev=ov.rdma_dev,
+                require_rdma=ov.require_rdma,
+                batch_concurrency=ov.batch_concurrency,
             )
 
     @staticmethod
@@ -164,9 +215,30 @@ class DfkvConnectorAdapter(ConnectorAdapter):
                     "positive"
                 )
 
+        # RDMA transport/tuning knobs (v2 config struct → scoped env inside
+        # dfkv_open_v2; no process-wide os.environ leak). 0/NULL/False = binary
+        # default, no env fallback on the Python side — extra_config is the
+        # single source. rdma_dev is a comma-separated multi-rail list.
+        rdma_depth = _resolve_nonneg_int(extra_config, prefix, "rdma_depth")
+        rdma_numa = _resolve_bool(extra_config, prefix, "rdma_numa")
+        rdma_dev = extra_config.get(f"{prefix}.rdma_dev")
+        if rdma_dev is not None and not isinstance(rdma_dev, str):
+            raise ValueError(
+                f"extra_config['{prefix}.rdma_dev']={rdma_dev!r} must be a "
+                "comma-separated device list string"
+            )
+        require_rdma = _resolve_bool(extra_config, prefix, "require_rdma")
+        batch_concurrency = _resolve_nonneg_int(
+            extra_config, prefix, "batch_concurrency")
+
         return _PluginOverrides(
             target_url=target_url,
             membership=membership,
             lib_path=lib_path or None,
             mds_poll_ms=mds_poll_ms,
+            rdma_depth=rdma_depth,
+            rdma_numa=1 if rdma_numa else 0,
+            rdma_dev=rdma_dev or None,
+            require_rdma=require_rdma,
+            batch_concurrency=batch_concurrency,
         )

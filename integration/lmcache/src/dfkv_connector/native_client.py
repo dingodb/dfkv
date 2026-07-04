@@ -163,6 +163,11 @@ class DfkvNativeClient:
         rdma_pools: Optional[Sequence[Tuple[int, int]]] = None,
         loop=None,
         get_parallelism: int = 1,
+        rdma_depth: int = 0,
+        rdma_numa: int = 0,
+        rdma_dev: str = "",
+        require_rdma: bool = False,
+        batch_concurrency: int = 0,
     ) -> None:
         import asyncio
 
@@ -178,9 +183,13 @@ class DfkvNativeClient:
             g = geometry
 
             members = raw_endpoint if membership == "static" else ""
-            # v2 config: transport/tuning fields 0/NULL => env fallback (LMCache
-            # connector doesn't tune RDMA via extra_config; DFKV_RDMA_* env still
-            # works as before). batch_concurrency 0 => client default.
+            # v2 config: transport/tuning knobs come from extra_config (see
+            # adapter.py) and go per-client through the v2 struct → scoped env
+            # inside dfkv_open_v2 (no process-wide os.environ[...] leak; two
+            # connector instances in one process no longer clobber each other).
+            # 0/NULL/False => leave env untouched (binary default); no env
+            # fallback on the Python side — extra_config is the single source.
+            # rdma_dev is a comma-separated multi-rail list.
             ccfg = _DfkvClientConfig(
                 members=members.encode() if members else b"",
                 model_hash=c_uint64(int(g["model_hash"]) & 0xFFFFFFFFFFFFFFFF),
@@ -192,8 +201,11 @@ class DfkvNativeClient:
                 layer_num=c_uint32(int(g["layer_num"]) & 0xFFFFFFFF),
                 head_num=c_uint32(int(g["head_num"]) & 0xFFFFFFFF),
                 head_dim=c_uint32(int(g["head_dim"]) & 0xFFFFFFFF),
-                rdma_depth=0, rdma_numa=0, rdma_dev=None,
-                require_rdma=0, batch_concurrency=0,
+                rdma_depth=c_uint32(int(rdma_depth) & 0xFFFFFFFF),
+                rdma_numa=c_uint32(int(rdma_numa) & 0xFFFFFFFF),
+                rdma_dev=rdma_dev.encode() if rdma_dev else None,
+                require_rdma=c_uint32(1 if require_rdma else 0),
+                batch_concurrency=c_uint32(int(batch_concurrency) & 0xFFFFFFFF),
             )
             self._h = self._lib.dfkv_open_v2(ctypes.byref(ccfg))
             if not self._h:
@@ -202,6 +214,16 @@ class DfkvNativeClient:
             self.transport_mode = (
                 mode_b.decode("utf-8", errors="replace") if mode_b else "unknown"
             )
+            # Fail fast if RDMA zero-copy was required but the transport fell
+            # back to TCP (e.g. no IB device / wrong rdma_dev). Mirrors the
+            # SGLang/vLLM connectors.
+            if require_rdma and self.transport_mode != "rdma":
+                self._lib.dfkv_close(self._h)
+                self._h = None
+                raise RuntimeError(
+                    f"dfkv requires RDMA zero-copy transport, "
+                    f"got {self.transport_mode}"
+                )
 
             if membership == "mds":
                 rc = self._lib.dfkv_start_mds_discovery(
