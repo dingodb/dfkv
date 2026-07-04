@@ -36,6 +36,22 @@ c_int = ctypes.c_int
 _GEOMETRY_ZEROS = (0,) * 8
 
 
+class _DfkvClientConfig(ctypes.Structure):
+    """Mirrors dfkv_client_config_t (src/client/dfkv_c_api.h). Field order/types
+    MUST match the C struct. Used by dfkv_open_v2 so transport/tuning knobs go
+    per-client via a scoped env inside the C layer."""
+    _fields_ = [
+        ("members", c_char_p),
+        ("model_hash", c_uint64),
+        ("page_size", c_uint32), ("dtype_tag", c_uint32), ("flags", c_uint32),
+        ("tp_size", c_uint32), ("tp_rank", c_uint32),
+        ("layer_num", c_uint32), ("head_num", c_uint32), ("head_dim", c_uint32),
+        ("rdma_depth", c_uint32), ("rdma_numa", c_uint32),
+        ("rdma_dev", c_char_p),
+        ("require_rdma", c_uint32), ("batch_concurrency", c_uint32),
+    ]
+
+
 def _env_rank() -> int:
     """Best-effort TP/worker rank for the connector_id label (each rank is its own
     process, so host:pid is already unique; this just adds readable detail)."""
@@ -73,16 +89,29 @@ class DfkvDeviceClient:
         self._lib = load_lib(lib_path)
         # MDS path opens with an empty/seed member list and lets discovery build
         # the ring; the static path opens directly with the given members.
-        self._h = self._lib.dfkv_open(
-            members.encode(),
-            c_uint64(model_hash & 0xFFFFFFFFFFFFFFFF),
-            *(c_uint32(int(g) & 0xFFFFFFFF) for g in geometry),
+        # v2 config: batch_concurrency is set per-client (no env), and transport
+        # fields (rdma_*) are left 0/NULL => env fallback (vLLM connector doesn't
+        # tune RDMA via extra_config; DFKV_RDMA_* env still works as before).
+        ccfg = _DfkvClientConfig(
+            members=members.encode() if members else b"",
+            model_hash=c_uint64(model_hash & 0xFFFFFFFFFFFFFFFF),
+            page_size=c_uint32(int(geometry[0]) & 0xFFFFFFFF),
+            dtype_tag=c_uint32(int(geometry[1]) & 0xFFFFFFFF),
+            flags=c_uint32(int(geometry[2]) & 0xFFFFFFFF),
+            tp_size=c_uint32(int(geometry[3]) & 0xFFFFFFFF),
+            tp_rank=c_uint32(int(geometry[4]) & 0xFFFFFFFF),
+            layer_num=c_uint32(int(geometry[5]) & 0xFFFFFFFF),
+            head_num=c_uint32(int(geometry[6]) & 0xFFFFFFFF),
+            head_dim=c_uint32(int(geometry[7]) & 0xFFFFFFFF),
+            rdma_depth=0, rdma_numa=0, rdma_dev=None,
+            require_rdma=0,
+            batch_concurrency=c_uint32(int(batch_concurrency) & 0xFFFFFFFF),
         )
+        self._h = self._lib.dfkv_open_v2(ctypes.byref(ccfg))
         if not self._h:
             raise RuntimeError(
-                f"dfkv_open failed (members={members!r}, mds={mds_endpoints!r})"
+                f"dfkv_open_v2 failed (members={members!r}, mds={mds_endpoints!r})"
             )
-        self._lib.dfkv_set_batch_concurrency(self._h, c_uint64(batch_concurrency))
         if mds_endpoints:
             rc = self._lib.dfkv_start_mds_discovery(
                 self._h, mds_endpoints.encode(), mds_group.encode(), int(mds_poll_ms)
