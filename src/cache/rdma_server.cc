@@ -203,16 +203,32 @@ void RdmaServer::Serve(int boot_fd) {
   // multi-rail); fall back to our configured default if it sends an empty name.
   char devbuf[rdma::kDevNameBytes];
   if (!net::ReadAll(boot_fd, devbuf, rdma::kDevNameBytes)) { ::close(boot_fd); return; }
+  // DCP1 (issue #110): the frame's zero tail may carry the client's declared
+  // max block size; size THIS connection's per-slot buffers to it instead of
+  // the global worst case. Undeclared (old client / no room) = max_msg_, the
+  // exact old behavior. Never below the control floor so metadata ops and
+  // small values always fit.
+  const uint64_t declared = rdma::ParseDevFrameCaps(devbuf);
+  const size_t conn_max =
+      declared ? std::max<size_t>(wire_limits::kIoAlign,
+                                  std::min<size_t>(declared, max_msg_))
+               : max_msg_;
   devbuf[rdma::kDevNameBytes - 1] = '\0';
   std::string dev = devbuf[0] ? std::string(devbuf) : dev_name_;
 
   rdma::RcEndpoint ep;
   const size_t K = ServerDepth();
-  const size_t direct_cap = ValueHeader::kSize + max_msg_;
-  if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), control_cap_, K,
+  const size_t conn_control = ControlCapFor(conn_max);
+  const size_t direct_cap = ValueHeader::kSize + conn_max;
+  if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), conn_control, K,
                /*ib_port=*/1, /*direct_io_buffers=*/true, direct_cap)) {
     ::close(boot_fd); return;
   }
+  if (declared)
+    DFKV_LOG_INFO("rdma conn caps: declared=" + std::to_string(declared) +
+                  " -> per-slot dbuf=" + std::to_string(direct_cap) +
+                  " control=" + std::to_string(conn_control) +
+                  " (qd=" + std::to_string(K) + ")");
   numa::PinThreadToNode(ep.numa_node());  // keep this conn's serve thread NUMA-local to its NIC
   // QP bootstrap: read client's info, send ours (symmetric to the client).
   char peer[rdma::kQpInfoBytes], mine[rdma::kQpInfoBytes];
@@ -284,7 +300,7 @@ void RdmaServer::Serve(int boot_fd) {
     payload->clear();
     if (rq.payload_len == 0) return true;
     if (recv_bytes < kReqPrefix + rq.payload_len) return false;
-    if (rq.payload_len > static_cast<uint64_t>(ValueHeader::kSize + max_msg_))
+    if (rq.payload_len > static_cast<uint64_t>(ValueHeader::kSize + conn_max))
       return false;
     payload->resize(static_cast<size_t>(rq.payload_len));
     const size_t head = static_cast<size_t>(
@@ -309,7 +325,7 @@ void RdmaServer::Serve(int boot_fd) {
     };
     if (rq.op == static_cast<uint8_t>(WireOp::kRange) && range_handler_) {
       if (!ep.dbuf(recv_slot) || !ep.dmr(recv_slot)) return false;
-      if (rq.length > static_cast<uint64_t>(ValueHeader::kSize + max_msg_))
+      if (rq.length > static_cast<uint64_t>(ValueHeader::kSize + conn_max))
         return invalid_reply();
       // RAM hot tier (B5-3): if the block is resident in the arena, scatter-send
       // it STRAIGHT from the arena MR -- no copy into dbuf, no disk. The slot is
@@ -361,7 +377,7 @@ void RdmaServer::Serve(int boot_fd) {
     if (rq.op == static_cast<uint8_t>(WireOp::kCache) && cache_direct_handler_) {
       if (!ep.dbuf(recv_slot) || !ep.dmr(recv_slot)) return false;
       if (rq.payload_len < ValueHeader::kSize ||
-          rq.payload_len > static_cast<uint64_t>(ValueHeader::kSize + max_msg_) ||
+          rq.payload_len > static_cast<uint64_t>(ValueHeader::kSize + conn_max) ||
           recv_bytes < kReqPrefix + rq.payload_len) {
         return invalid_reply();
       }
@@ -506,7 +522,7 @@ void RdmaServer::Serve(int boot_fd) {
           bool deferred = false;
           if (rq.op == static_cast<uint8_t>(WireOp::kRange) &&
               ep.dbuf(r) && ep.dmr(r) &&
-              rq.length <= static_cast<uint64_t>(ValueHeader::kSize + max_msg_)) {
+              rq.length <= static_cast<uint64_t>(ValueHeader::kSize + conn_max)) {
             RangePrepResult pr;
             Status pst = range_prep_handler_(rq.id, rq.index, rq.size, rq.offset,
                                              rq.length, ep.dbuf_cap(), &pr);

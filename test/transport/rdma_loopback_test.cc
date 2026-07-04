@@ -934,3 +934,44 @@ TEST(RdmaLoopback, RamTierZeroCopyServe) {
   ASSERT_TRUE(c.Get("z0", &out2[0], out2.size()));
   EXPECT_EQ(out2, vals[0]);
 }
+
+// DCP1 declared caps (issue #110): a client that declares its max block size
+// gets right-sized server buffers and must still complete every op within the
+// declaration; oversized ops must fail CLIENT-side with kInvalid (never
+// reaching the wire, where the under-sized recv would hard-break the QP).
+TEST(RdmaLoopback, DeclaredCapsRoundTripAndClientSideBound) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("caps");
+  setenv("DFKV_RDMA_MAX_BLOCK_BYTES", "65536", 1);  // declare 64 KiB
+  RdmaTransport rt(kMaxMsg);
+  unsetenv("DFKV_RDMA_MAX_BLOCK_BYTES");            // don't leak into other tests
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+
+  // Within the declaration: normal round-trip on the right-sized connection.
+  std::string v(60 * 1024, 'a');
+  ASSERT_TRUE(c.Put("caps-ok", v.data(), v.size()));
+  std::string got(v.size(), '\0');
+  ASSERT_TRUE(c.Get("caps-ok", got.data(), got.size()));
+  EXPECT_EQ(got, v);
+
+  // Over the declaration (but under the transport max): the client bound must
+  // reject before sending -- Put returns false, connection stays healthy.
+  std::string big(128 * 1024, 'b');
+  EXPECT_FALSE(c.Put("caps-over", big.data(), big.size()));
+  ASSERT_TRUE(c.Get("caps-ok", got.data(), got.size())) << "conn must survive the rejected op";
+  EXPECT_EQ(got, v);
+}
+
+// Undeclared client (legacy frame) against the same server keeps worst-case
+// sizing: blocks right up to the transport max still round-trip.
+TEST(RdmaLoopback, UndeclaredClientKeepsWorstCase) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("nocaps");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::string v(kMaxMsg - ValueHeader::kSize, 'c');  // near the global cap
+  ASSERT_TRUE(c.Put("full-size", v.data(), v.size()));
+  std::string got(v.size(), '\0');
+  ASSERT_TRUE(c.Get("full-size", got.data(), got.size()));
+  EXPECT_EQ(got, v);
+}

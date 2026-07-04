@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -61,6 +62,27 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]);
 // Fixed-size device-name field the client sends first in the bootstrap so the
 // server opens its QP on the matching device (same rail) for multi-rail setups.
 constexpr size_t kDevNameBytes = 32;
+
+// DCP1 ("Declared Caps") -- a capacity declaration hidden in the bootstrap
+// device-name frame, using the same deterministic-zero-pad trick as DPQ1:
+// the client has always memset the 32-byte frame before writing the NUL-
+// terminated device name, and the server has always stopped reading at the
+// first NUL. So the tail is a compatible extension area:
+//   [ name bytes | \0 | magic "DCP1" u32 | max_block_bytes u64 | zeros... ]
+// max_block_bytes is the largest value payload the client will ever PUT or
+// GET on this connection (connectors know their block geometry exactly).
+// The server sizes this connection's per-slot buffers to it instead of the
+// global worst case (issue #110: 0.5% jumbo tail was forcing 16x memory on
+// every connection). 0 / absent / no room after a long name = undeclared =
+// worst-case sizing (exactly the old behavior). Old pairings: old client
+// sends zeros -> parse returns 0; old server never reads past the NUL.
+constexpr uint32_t kDevCapsMagic = 0x31504344u;  // ASCII "DCP1" (LE)
+// Writes name + optional DCP1 tail. max_block_bytes==0 or a name too long to
+// leave 12 tail bytes -> plain legacy frame.
+void EncodeDevFrame(const std::string& dev, uint64_t max_block_bytes,
+                    char out[kDevNameBytes]);
+// Returns the declared max block bytes, or 0 when absent/legacy/garbled.
+uint64_t ParseDevFrameCaps(const char in[kDevNameBytes]);
 // Target QP scatter-gather entries. SGE0 is the header (req/resp prefix + value
 // header); the remaining kMaxSge-1 carry payload segments, so a scatter-gather
 // key may hold up to kMaxSge-1 (=29) non-contiguous buffers. Open() clamps this

@@ -98,7 +98,10 @@ bool RdmaTransport::Available() {
 
 RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     : max_payload_(ResolveMaxPayload(max_msg)),
-      control_cap_(ControlCapFor(max_payload_)),
+      declared_(std::min<uint64_t>(EnvBytes("DFKV_RDMA_MAX_BLOCK_BYTES", 0),
+                                   ResolveMaxPayload(max_msg))),
+      control_cap_(ControlCapFor(declared_ ? static_cast<size_t>(declared_)
+                                           : ResolveMaxPayload(max_msg))),
       depth_(1) {
   std::string list = dev_name;
   if (list.empty()) { const char* e = std::getenv("DFKV_RDMA_DEV"); if (e) list = e; }
@@ -178,8 +181,10 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   }
   // Bootstrap: tell the server which device to open (same rail), then exchange QP.
   char devbuf[rdma::kDevNameBytes];
-  std::memset(devbuf, 0, sizeof(devbuf));
-  std::memcpy(devbuf, dev.data(), std::min(dev.size(), sizeof(devbuf) - 1));
+  // DCP1: declare this process's max block size in the frame's zero tail so
+  // the server sizes this connection's buffers to it (issue #110). declared_
+  // == 0 -> legacy frame -> server keeps worst-case sizing.
+  rdma::EncodeDevFrame(dev, declared_, devbuf);
   char mine[rdma::kQpInfoBytes], peer[rdma::kQpInfoBytes];
   rdma::QpInfo my = c->ep.Local();
   my.depth = static_cast<uint16_t>(std::min<size_t>(depth_, 256));  // DPQ1 advertisement
@@ -492,7 +497,7 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
     return res;
   }
   for (const auto& dst : dsts) {
-    if (dst.n > max_payload_) {
+    if (dst.n > OpBound()) {
       std::fill(res.begin(), res.end(), Status::kInvalid);
       return res;
     }
@@ -576,7 +581,7 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
   // Do not silently fall back to the base copy path: RDMA CacheFrom is the
   // connector's zero-copy PUT route, so oversize/reg failures are explicit.
   for (const auto& s : srcs) {
-    if (s.header_len > control_cap_ - kReqPrefix || s.payload_len > max_payload_) {
+    if (s.header_len > control_cap_ - kReqPrefix || s.payload_len > OpBound()) {
       std::fill(res.begin(), res.end(), Status::kInvalid);
       return res;
     }
@@ -676,7 +681,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       const auto& s = srcs[i];
       size_t total = 0;
       for (const auto& p : s.payloads) total += p.second;
-      if (s.header_len > control_cap_ - kReqPrefix || total > max_payload_ ||
+      if (s.header_len > control_cap_ - kReqPrefix || total > OpBound() ||
           s.payloads.size() > max_payload_segs) {
         bad[i] = 1;
         res[i] = Status::kInvalid;
@@ -787,7 +792,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     for (size_t i = 0; i < n; ++i) {
       size_t cap = 0;
       for (const auto& p : dsts[i].payloads) cap += p.second;
-      if (cap > max_payload_ || dsts[i].payloads.size() > max_payload_segs) {
+      if (cap > OpBound() || dsts[i].payloads.size() > max_payload_segs) {
         bad[i] = 1;
         res[i] = Status::kInvalid;
       }

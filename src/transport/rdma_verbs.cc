@@ -140,6 +140,29 @@ void SerializeQpInfo(const QpInfo& in, char out[kQpInfoBytes]) {
   }
 }
 
+void EncodeDevFrame(const std::string& dev, uint64_t max_block_bytes,
+                    char out[kDevNameBytes]) {
+  std::memset(out, 0, kDevNameBytes);
+  const size_t n = std::min(dev.size(), kDevNameBytes - 1);
+  std::memcpy(out, dev.data(), n);
+  // Tail needs NUL + u32 magic + u64 bytes = 13 bytes after the name.
+  if (max_block_bytes == 0 || n + 1 + 4 + 8 > kDevNameBytes) return;
+  std::memcpy(out + n + 1, &kDevCapsMagic, 4);
+  std::memcpy(out + n + 5, &max_block_bytes, 8);
+}
+
+uint64_t ParseDevFrameCaps(const char in[kDevNameBytes]) {
+  size_t nul = 0;
+  while (nul < kDevNameBytes && in[nul] != '\0') ++nul;
+  if (nul + 1 + 4 + 8 > kDevNameBytes) return 0;  // no room for a tail
+  uint32_t magic = 0;
+  std::memcpy(&magic, in + nul + 1, 4);
+  if (magic != kDevCapsMagic) return 0;  // legacy zeros or unknown extension
+  uint64_t v = 0;
+  std::memcpy(&v, in + nul + 5, 8);
+  return v;
+}
+
 QpInfo ParseQpInfo(const char in[kQpInfoBytes]) {
   QpInfo q;
   q.qpn = net::GetU32(in + 0);

@@ -91,6 +91,16 @@ class RdmaTransport : public Transport {
   // Guarded by mu_; snapshotted in Acquire and registered on the connection.
   std::vector<std::pair<void*, size_t>> pools_;
   size_t max_payload_;
+  // DCP1 declared max block bytes (DFKV_RDMA_MAX_BLOCK_BYTES, clamped to
+  // max_payload_). 0 = undeclared: worst-case buffers both sides, old wire
+  // behavior. When set it also shrinks OUR control buffers and bounds ops
+  // client-side (oversize -> kInvalid before touching the wire, because the
+  // server sized this conn's recv buffers to the declaration and a bigger
+  // send would hard-break the QP).
+  uint64_t declared_ = 0;
+  size_t OpBound() const {  // per-op payload bound honoring the declaration
+    return declared_ ? static_cast<size_t>(declared_) : max_payload_;
+  }
   size_t control_cap_;
   size_t depth_;
   int connect_ms_ = 3000;             // bootstrap TCP connect timeout (DFKV_RDMA_CONNECT_MS)
