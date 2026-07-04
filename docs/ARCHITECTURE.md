@@ -211,14 +211,16 @@ enabled) — see [METRICS.md](METRICS.md).
 ## 7. Configuration matrix (feature defaults)
 
 Every subsystem added by the storage/protocol rework is **off by default** —
-a stock `v1.7.0` node behaves exactly like `v1.6.x`.
+a stock `v1.7.0` node behaves exactly like `v1.6.x`. Full parameter reference
+(flags + env + client config struct + connector extra_config) is in
+[CONFIG.md](CONFIG.md); this matrix is the per-feature quick view.
 
 | Feature | Enable with | Default | Notes |
 |---------|-------------|---------|-------|
 | slab storage engine | `--store-engine=slab` / `DFKV_STORE_ENGINE=slab` | `file` | needs clean-disk cold start |
-| RAM hot tier | `DFKV_RAM_TIER=1` (+ `DFKV_RAM_TIER_BYTES`) | off | write-through + RDMA zero-copy GET |
-| RDMA transport | build `-DDFKV_WITH_RDMA=ON`, `DFKV_RDMA=1` | TCP | device by name `DFKV_RDMA_DEV` |
-| io_uring async GET | build `-DDFKV_WITH_URING`, `DFKV_SERVER_URING=1` | off | disk-read path only |
+| RAM hot tier | `--ram-tier on` / `DFKV_RAM_TIER=1` (+ `--ram-tier-bytes` / `DFKV_RAM_TIER_BYTES`) | off | write-through + RDMA zero-copy GET |
+| RDMA transport | build `-DDFKV_WITH_RDMA=ON`, `DFKV_RDMA=1` | TCP | device by name `DFKV_RDMA_DEV` / `--rdma-dev` |
+| io_uring async GET | build `-DDFKV_WITH_URING`, `--server-uring 1` / `DFKV_SERVER_URING=1` | off | disk-read path only |
 
 ---
 
