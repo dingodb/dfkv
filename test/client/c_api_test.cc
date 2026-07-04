@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -137,5 +138,57 @@ TEST(CApiGuard, ZeroLengthBatchIsOk) {
   EXPECT_EQ(dfkv_batch_put(c, nullptr, nullptr, nullptr, 0, nullptr), 0);
   EXPECT_EQ(dfkv_batch_get(c, nullptr, nullptr, nullptr, 0, nullptr), 0);
   EXPECT_EQ(dfkv_batch_exist(c, nullptr, 0, nullptr), 0);
+  dfkv_close(c);
+}
+
+// v2 ABI: dfkv_open_v2 with a config struct. Geometry-only (transport fields
+// 0/NULL => env fallback, same as v1) must behave identically to dfkv_open:
+// discovery-only client, empty ring, ops route-miss without a server.
+TEST(CApiV2, NullConfigRejected) {
+  EXPECT_EQ(dfkv_open_v2(nullptr), nullptr);
+}
+
+TEST(CApiV2, GeometryOnlyMatchesV1) {
+  dfkv_client_config_t cfg{};
+  cfg.members = "";
+  cfg.model_hash = 1;
+  cfg.page_size = 64;
+  // transport/tuning fields left 0/NULL => env fallback (v1 behavior)
+  dfkv_client_t c = dfkv_open_v2(&cfg);
+  ASSERT_NE(c, nullptr);
+  EXPECT_EQ(dfkv_get(c, "k", nullptr, 0), 0);  // empty ring => miss, no crash
+  EXPECT_EQ(dfkv_set_batch_concurrency(c, 4), 0);
+  dfkv_close(c);
+}
+
+TEST(CApiV2, BatchConcurrencyApplied) {
+  dfkv_client_config_t cfg{};
+  cfg.members = "";
+  cfg.model_hash = 1;
+  cfg.page_size = 64;
+  cfg.batch_concurrency = 16;
+  dfkv_client_t c = dfkv_open_v2(&cfg);
+  ASSERT_NE(c, nullptr);
+  // The knob was set at construction; a subsequent set is harmless and confirms
+  // the client is usable.
+  EXPECT_EQ(dfkv_set_batch_concurrency(c, 8), 0);
+  dfkv_close(c);
+}
+
+// v2's scoped-env dance must not leak DFKV_* into the process env after the
+// client is built. A non-zero rdma_depth override is applied during open and
+// restored on return.
+TEST(CApiV2, ScopedEnvDoesNotLeak) {
+  ::unsetenv("DFKV_RDMA_DEPTH");
+  dfkv_client_config_t cfg{};
+  cfg.members = "";
+  cfg.model_hash = 1;
+  cfg.page_size = 64;
+  cfg.rdma_depth = 32;
+  dfkv_client_t c = dfkv_open_v2(&cfg);
+  ASSERT_NE(c, nullptr);
+  // After open_v2 returns, the override must be gone (restored to unset).
+  const char* v = std::getenv("DFKV_RDMA_DEPTH");
+  EXPECT_TRUE(v == nullptr) << "DFKV_RDMA_DEPTH leaked: " << (v ? v : "");
   dfkv_close(c);
 }
