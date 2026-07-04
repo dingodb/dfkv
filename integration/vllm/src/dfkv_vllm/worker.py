@@ -48,6 +48,8 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 # dfkv: get_dp_engine_index replaces mooncake_utils.get_mooncake_dp_engine_index;
 # dfkv handles its own RDMA bootstrap so the transfer-engine helpers are dropped.
 from ._determinism import ensure_deterministic_block_hashing
+from .client_ranks import ENV_NAME as CLIENT_RANKS_ENV
+from .client_ranks import participant, resolve_client_ranks
 from .coordinator import (
     ExternalCachedBlockPool,
     DfkvStoreCoordinator,
@@ -221,6 +223,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
             record_operation=record_operation,
         )
         self.put_step = put_step
+        # CLIENT_RANKS store convergence (issue #111): stripe index/step over
+        # the participating ranks. stripe_idx None = this rank stores nothing
+        # (a converged peer stores on its behalf; KV is TP-replicated).
+        # Defaults reproduce the legacy tp_rank % put_step striping exactly.
+        self.stripe_idx: int | None = tp_rank % put_step
+        self.stripe_step: int = put_step
         self.coord = coord
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
@@ -314,8 +322,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
                     group_indices.append(g_idx)
 
-            # Apply put_step striding for TP
-            sl = slice(self.tp_rank % self.put_step, None, self.put_step)
+            # Apply store striding: legacy = tp_rank % put_step over put_step;
+            # under CLIENT_RANKS convergence = index over the participant set,
+            # and non-participants select nothing (empty slice keeps the
+            # request lifecycle -- bookkeeping/finish -- identical).
+            if self.stripe_idx is None:
+                sl = slice(0, 0)
+            else:
+                sl = slice(self.stripe_idx % self.stripe_step, None, self.stripe_step)
             starts = starts[sl]
             ends = ends[sl]
             keys = keys[sl]
@@ -774,6 +788,28 @@ class DfkvStoreWorker:
         if self.dcp_size > 1 and self.put_step > 1:
             self.put_step = max(1, self.put_step // self.dcp_size)
 
+        # CLIENT_RANKS (issue #111): converge store-side dfkv clients onto a
+        # subset of ranks when the KV object is TP-replicated. Layout-clamped,
+        # never rejects (one fleet-wide env template must be safe everywhere).
+        replicated = (
+            self.use_mla
+            and self.put_step == self.tp_size
+            and self.dcp_size <= 1
+            and getattr(self, "pcp_size", 1) <= 1
+        )
+        requested = os.environ.get(CLIENT_RANKS_ENV)
+        self.client_ranks, cr_reason = resolve_client_ranks(
+            requested, self.tp_size, replicated
+        )
+        logger.info(
+            "client_ranks: requested=%s effective=%d/%d reason=%s%s",
+            requested or "<unset>",
+            self.client_ranks,
+            self.tp_size,
+            cr_reason,
+            " (store convergence active)" if self.client_ranks < self.tp_size else "",
+        )
+
         self.metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
             tp_rank=self.head_or_tp_rank,
@@ -1001,6 +1037,12 @@ class DfkvStoreWorker:
                 self.enable_kv_events,
                 record_operation=self._record_kv_connector_operation,
             )
+            if self.client_ranks < self.tp_size:
+                # Converged mode: re-stripe stores over the participant set.
+                self.kv_send_thread.stripe_idx = participant(
+                    self.tp_rank, self.tp_size, self.client_ranks
+                )
+                self.kv_send_thread.stripe_step = self.client_ranks
             self.kv_send_thread.start()
 
         ready_event_recving = threading.Event()
