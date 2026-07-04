@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,6 +53,72 @@ dfkv_client_t dfkv_open(const char* members, uint64_t model_hash,
     return nullptr;
   } catch (...) {
     DFKV_LOG_ERROR("dfkv_open failed: unknown exception");
+    return nullptr;
+  }
+}
+
+namespace {
+// Process-wide mutex serializing dfkv_open_v2's scoped-env dance. setenv() is
+// not thread-safe and the transport constructors read DFKV_* at construction,
+// so two concurrent v2 opens would race on the process environment. Connector
+// construction happens at init time (low concurrency), so a global lock is fine.
+std::mutex g_v2_env_mu;
+
+// RAII: snapshot the named env vars, apply v2 overrides (non-zero/non-NULL),
+// and restore the snapshot on destruction — so v2's settings don't leak into
+// the process environment after the client is built. NULL/0 fields leave their
+// env untouched (fall back to whatever DFKV_* the process already has).
+class ScopedEnv {
+ public:
+  struct KV { const char* name; const char* value; bool set; };
+  std::vector<KV> saved;
+  ~ScopedEnv() {
+    for (auto& kv : saved) {
+      if (kv.set) ::setenv(kv.name, kv.value ? kv.value : "", 1);
+      else ::unsetenv(kv.name);
+    }
+  }
+  void override_(const char* name, const char* value) {
+    const char* prev = std::getenv(name);
+    saved.push_back({name, prev, prev != nullptr});
+    ::setenv(name, value ? value : "", 1);
+  }
+};
+}  // namespace
+
+dfkv_client_t dfkv_open_v2(const dfkv_client_config_t* cfg) {
+  if (!cfg) return nullptr;
+  try {
+    std::lock_guard<std::mutex> lk(g_v2_env_mu);
+    ScopedEnv env;
+    // Apply transport/tuning overrides (0/NULL => leave env untouched).
+    if (cfg->rdma_depth)
+      env.override_("DFKV_RDMA_DEPTH", std::to_string(cfg->rdma_depth).c_str());
+    if (cfg->rdma_numa)
+      env.override_("DFKV_RDMA_NUMA", std::to_string(cfg->rdma_numa).c_str());
+    if (cfg->rdma_dev)
+      env.override_("DFKV_RDMA_DEV", cfg->rdma_dev);
+    if (cfg->require_rdma) {
+      env.override_("DFKV_REQUIRE_RDMA", "1");
+      env.override_("DFKV_RDMA", "1");
+    }
+    // Geometry identity (same as dfkv_open).
+    ValueHeader self = ValueHeader::Make(
+        cfg->model_hash, cfg->page_size, cfg->dtype_tag,
+        static_cast<uint16_t>(cfg->flags), static_cast<uint16_t>(cfg->tp_size),
+        static_cast<uint16_t>(cfg->tp_rank), static_cast<uint16_t>(cfg->layer_num),
+        static_cast<uint16_t>(cfg->head_num), static_cast<uint16_t>(cfg->head_dim));
+    auto mem = ParseMembers(cfg->members);
+    KVClient* c = new KVClient(std::move(mem), self);
+    // Batch concurrency is a per-client knob (not transport), so it's safe to
+    // set after construction (no env involvement).
+    if (cfg->batch_concurrency) c->set_batch_concurrency(cfg->batch_concurrency);
+    return c;
+  } catch (const std::exception& e) {
+    DFKV_LOG_ERROR(std::string("dfkv_open_v2 failed: ") + e.what());
+    return nullptr;
+  } catch (...) {
+    DFKV_LOG_ERROR("dfkv_open_v2 failed: unknown exception");
     return nullptr;
   }
 }

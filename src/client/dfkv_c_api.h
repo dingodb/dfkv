@@ -21,6 +21,33 @@ dfkv_client_t dfkv_open(const char* members, uint64_t model_hash,
                         uint32_t tp_size, uint32_t tp_rank, uint32_t layer_num,
                         uint32_t head_num, uint32_t head_dim);
 
+// v2: structured config. Fields beyond the geometry identity are transport /
+// tuning knobs that v1 could only set via process-wide DFKV_* env vars (a
+// global side-effect — multiple connectors in one process overwrote each
+// other's settings). v2 takes them per-client; 0/NULL means "use the env
+// fallback" so v2 is a strict superset of v1 behavior.
+//
+// Geometry fields (members + model_hash..head_dim) mirror dfkv_open's args.
+// Transport/tuning fields:
+//   rdma_depth      — RDMA write pipeline depth (env DFKV_RDMA_DEPTH; 0=env)
+//   rdma_numa       — 0=env, 1=enable NUMA-local rail selection (DFKV_RDMA_NUMA)
+//   rdma_dev        — comma-separated device list (DFKV_RDMA_DEV; NULL=env)
+//   require_rdma    — 0=env, 1=require RDMA, fail if no device (DFKV_REQUIRE_RDMA)
+//   batch_concurrency — 0=env/default, else cap concurrent batch ops per client
+typedef struct dfkv_client_config {
+  const char* members;        // required ("name=ip:port,..." or "" for MDS discovery)
+  uint64_t model_hash;
+  uint32_t page_size, dtype_tag, flags;
+  uint32_t tp_size, tp_rank, layer_num, head_num, head_dim;
+  uint32_t rdma_depth;        // 0 = env fallback
+  uint32_t rdma_numa;         // 0 = env fallback
+  const char* rdma_dev;       // NULL = env fallback
+  uint32_t require_rdma;      // 0 = env fallback
+  uint32_t batch_concurrency; // 0 = env/default
+} dfkv_client_config_t;
+
+dfkv_client_t dfkv_open_v2(const dfkv_client_config_t* cfg);
+
 int dfkv_put(dfkv_client_t c, const char* key, const void* ptr, uint64_t n);  // 0=ok
 int dfkv_get(dfkv_client_t c, const char* key, void* ptr, uint64_t n);        // 1=hit,0=miss
 // Variable-size get: writes the stored payload (whatever length it was put with)
