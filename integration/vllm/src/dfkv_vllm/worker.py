@@ -76,6 +76,15 @@ logger = init_logger(__name__)
 _T = TypeVar("_T")
 
 
+def _truthy(v) -> bool:
+    """Interpret an extra_config value as a boolean (mirrors the SGLang
+    connector). Strings: ""/"0"/"false"/"no"/"off" → False; everything else
+    True. Numbers/bools: plain bool()."""
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(v)
+
+
 def _rotate_list(values: list[_T], offset: int) -> list[_T]:
     return values[offset:] + values[:offset]
 
@@ -834,6 +843,10 @@ class DfkvStoreWorker:
             model_hash=int(extra.get("model_hash", 0)),
             lib_path=extra.get("lib"),
             batch_concurrency=int(extra.get("batch_concurrency", 8)),
+            rdma_depth=int(extra.get("rdma_depth", 0)) or 0,
+            rdma_numa=1 if _truthy(extra.get("rdma_numa")) else 0,
+            rdma_dev=extra.get("rdma_dev", ""),
+            require_rdma=_truthy(extra.get("require_rdma")),
         )
 
         # dfkv: no disk-offload staging budget (Mooncake owner-DirectIO only).

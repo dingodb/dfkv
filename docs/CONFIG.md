@@ -147,7 +147,7 @@
 | `model_hash` / `page_size` / `dtype_tag` / `flags` | ✅ | ✅（geometry） | ✅（geometry） | ✅ |
 | `tp_size` / `tp_rank` / `layer_num` / `head_num` / `head_dim` | ✅ | ✅（geometry） | ✅（geometry） | ✅ |
 | `lib` / `lib_path` | `lib_path` | `lib` | `lib_path` | 否（loader） |
-| `rdma_depth` / `rdma_numa` / `rdma_dev` / `require_rdma` | ✅ | — | — | ✅（v2 scoped env） |
+| `rdma_depth` / `rdma_numa` / `rdma_dev` / `require_rdma` | ✅ | ✅（v1.13.1+） | — | ✅（v2 scoped env） |
 | `batch_concurrency` | ✅ | ✅ | — | ✅（v2 直接设 KVClient） |
 
 SGLang 专属：`probe_interval_ms`、`rail_affinity`（deprecated，no-op）、`interface_v1`（必填=1，零拷贝契约）。

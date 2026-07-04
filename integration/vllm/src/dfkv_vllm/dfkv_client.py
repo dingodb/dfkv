@@ -78,6 +78,10 @@ class DfkvDeviceClient:
         mds_endpoints: str = "",
         mds_group: str = "default",
         mds_poll_ms: int = 3000,
+        rdma_depth: int = 0,
+        rdma_numa: int = 0,
+        rdma_dev: str = "",
+        require_rdma: bool = False,
     ):
         if len(geometry) != 8:
             raise ValueError("geometry must have exactly 8 fields")
@@ -89,9 +93,13 @@ class DfkvDeviceClient:
         self._lib = load_lib(lib_path)
         # MDS path opens with an empty/seed member list and lets discovery build
         # the ring; the static path opens directly with the given members.
-        # v2 config: batch_concurrency is set per-client (no env), and transport
-        # fields (rdma_*) are left 0/NULL => env fallback (vLLM connector doesn't
-        # tune RDMA via extra_config; DFKV_RDMA_* env still works as before).
+        # v2 config: transport/tuning knobs (rdma_*) come from kv_connector_extra_config
+        # (see worker.py) and go per-client through the v2 struct → scoped env inside
+        # dfkv_open_v2 (no process-wide os.environ[...] leak; two connector instances
+        # in one process no longer clobber each other). 0/NULL => leave env untouched
+        # (binary default); no env fallback on the Python side — extra_config is the
+        # single source. rdma_dev is a comma-separated multi-rail list (e.g.
+        # "ib7s400p0,ib7s400p1,...").
         ccfg = _DfkvClientConfig(
             members=members.encode() if members else b"",
             model_hash=c_uint64(model_hash & 0xFFFFFFFFFFFFFFFF),
@@ -103,14 +111,26 @@ class DfkvDeviceClient:
             layer_num=c_uint32(int(geometry[5]) & 0xFFFFFFFF),
             head_num=c_uint32(int(geometry[6]) & 0xFFFFFFFF),
             head_dim=c_uint32(int(geometry[7]) & 0xFFFFFFFF),
-            rdma_depth=0, rdma_numa=0, rdma_dev=None,
-            require_rdma=0,
+            rdma_depth=c_uint32(int(rdma_depth) & 0xFFFFFFFF),
+            rdma_numa=c_uint32(int(rdma_numa) & 0xFFFFFFFF),
+            rdma_dev=rdma_dev.encode() if rdma_dev else None,
+            require_rdma=c_uint32(1 if require_rdma else 0),
             batch_concurrency=c_uint32(int(batch_concurrency) & 0xFFFFFFFF),
         )
         self._h = self._lib.dfkv_open_v2(ctypes.byref(ccfg))
         if not self._h:
             raise RuntimeError(
                 f"dfkv_open_v2 failed (members={members!r}, mds={mds_endpoints!r})"
+            )
+        # Fail fast if RDMA zero-copy was required but the transport fell back to
+        # TCP (e.g. no IB device / wrong rdma_dev). Mirrors the SGLang connector.
+        self._transport_mode = self._lib.dfkv_transport_mode(self._h).decode(
+            "utf-8", errors="replace")
+        if require_rdma and self._transport_mode != "rdma":
+            self._lib.dfkv_close(self._h)
+            self._h = None
+            raise RuntimeError(
+                f"dfkv requires RDMA zero-copy transport, got {self._transport_mode}"
             )
         if mds_endpoints:
             rc = self._lib.dfkv_start_mds_discovery(
@@ -139,7 +159,7 @@ class DfkvDeviceClient:
 
     @property
     def transport_mode(self) -> str:
-        return self._lib.dfkv_transport_mode(self._h).decode()
+        return self._transport_mode
 
     def register_memory(self, base: int, size: int) -> None:
         """Register a (host or GPU device) region as an RDMA MR. One call per
