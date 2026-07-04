@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
       "Usage: dfkv_mds --listen <port> [--etcd <host:port>] [options]\n\n"
       "  --listen <port>      TCP port to serve MDS requests on\n"
       "  --etcd <host:port>   etcd endpoint (default 127.0.0.1:2379)\n"
+      "  --etcd-probe-ms <n>  etcd reachability probe window ms (default 30000; env DFKV_MDS_ETCD_PROBE_MS)\n"
       "  --metrics-port <p>   enable Prometheus /metrics (omit = off); --metrics-bind <addr>\n"
       "  --version, -V        print version and exit\n"
       "  --help, -h           print this help and exit\n",
@@ -35,11 +36,15 @@ int main(int argc, char** argv) {
     return help ? 0 : 1;
   }
   dfkv::Args args(argc, argv,
-                  {"--etcd", "--listen", "--metrics-port", "--metrics-bind"});
+                  {"--etcd", "--listen", "--metrics-port", "--metrics-bind",
+                   "--etcd-probe-ms"});
   std::string etcd = args.Get("--etcd", "127.0.0.1:2379");
   std::string metrics_bind = args.Get("--metrics-bind", "");
   int port = args.GetInt("--listen", 0);
   int metrics_port = args.GetInt("--metrics-port", -1);
+  // etcd probe window: flag wins over a pre-set DFKV_MDS_ETCD_PROBE_MS.
+  std::string etcd_probe_ms = args.Get("--etcd-probe-ms", "");
+  if (!etcd_probe_ms.empty()) ::setenv("DFKV_MDS_ETCD_PROBE_MS", etcd_probe_ms.c_str(), 1);
   if (!args.ok()) {
     std::fprintf(stderr, "dfkv_mds: %s\n(run with --help for usage)\n",
                  args.error().c_str());

@@ -92,3 +92,40 @@ TEST(HostPort, ValidatesAdvertise) {
   EXPECT_FALSE(IsValidHostPort("host:70000"));   // out of range
   EXPECT_FALSE(IsValidHostPort("host:80x"));     // trailing garbage
 }
+
+// Regression: the flag→env facades added in dfkv_server_main /
+// dfkv_mds_main must all be in the Args valued set, or a typo'd
+// addition silently becomes "unknown flag". This mirrors the exact valued
+// set the daemons construct; if a new flag is added to main but not here,
+// this test breaks as a reminder to keep them in sync.
+TEST(Args, ServerFlagFacadesAllAccepted) {
+  const std::set<std::string> server_valued = {
+      "--dir", "--port", "--cap", "--rdma-port", "--rdma-dev",
+      "--mds", "--group", "--id", "--advertise", "--weight",
+      "--metrics-port", "--metrics-bind", "--store-engine",
+      "--slab-write", "--ram-tier", "--ram-tier-bytes",
+      "--slab-granularity", "--put-inflight-limit",
+      "--rdma-depth", "--rdma-numa", "--rdma-idle-ms",
+      "--rdma-op-timeout-ms", "--server-uring",
+      "--server-uring-depth", "--ram-flush-threads",
+      "--ram-tier-numa", "--slab-table-sync-ms", "--log"};
+  // Every facade flag parses cleanly (non-empty value, ok=true).
+  for (const auto& f : server_valued) {
+    Argv a({"prog", f, "1"});
+    Args args(a.argc(), a.argv(), server_valued);
+    EXPECT_TRUE(args.ok()) << "flag " << f << ": " << args.error();
+    EXPECT_EQ(args.Get(f, ""), "1") << "flag " << f << " lost its value";
+  }
+}
+
+TEST(Args, MdsFlagFacadesAllAccepted) {
+  const std::set<std::string> mds_valued = {
+      "--etcd", "--listen", "--metrics-port", "--metrics-bind",
+      "--etcd-probe-ms"};
+  for (const auto& f : mds_valued) {
+    Argv a({"prog", f, "1"});
+    Args args(a.argc(), a.argv(), mds_valued);
+    EXPECT_TRUE(args.ok()) << "flag " << f << ": " << args.error();
+    EXPECT_EQ(args.Get(f, ""), "1") << "flag " << f << " lost its value";
+  }
+}

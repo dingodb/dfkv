@@ -55,11 +55,21 @@ int main(int argc, char** argv) {
       "  --ram-tier-bytes <n> RAM arena size in bytes (default 4 GiB; pinned once registered)\n"
       "  --slab-granularity <n>  slab slot quantum bytes (default 1 MiB; CHANGING IT COLD-STARTS the store)\n"
       "  --put-inflight-limit <n>  cap concurrent disk PUTs; excess fast-fail kCacheFull (0 = off)\n"
+      "  --rdma-depth <n>     RDMA write pipeline depth (must be <= client's; env DFKV_RDMA_DEPTH)\n"
+      "  --rdma-numa <0|1>    NUMA-local rail selection per connection (env DFKV_RDMA_NUMA)\n"
+      "  --rdma-idle-ms <n>   idle connection reaper interval ms (env DFKV_RDMA_IDLE_MS)\n"
+      "  --rdma-op-timeout-ms <n>  per-op RDMA timeout ms (env DFKV_RDMA_OP_TIMEOUT_MS)\n"
+      "  --server-uring <0|1> enable io_uring async-GET path (env DFKV_SERVER_URING; needs -DDFKV_WITH_URING)\n"
+      "  --server-uring-depth <n>  io_uring SQ depth (env DFKV_SERVER_URING_DEPTH)\n"
+      "  --ram-flush-threads <n>   RAM tier flush thread count (env DFKV_RAM_FLUSH_THREADS)\n"
+      "  --ram-tier-numa <n>  RAM tier NUMA node (env DFKV_RAM_TIER_NUMA)\n"
+      "  --slab-table-sync-ms <n>  slab table sync cadence ms (env DFKV_SLAB_TABLE_SYNC_MS)\n"
+      "  --log <level>        log level: INFO|DEBUG|WARN|ERROR (env DFKV_LOG)\n"
       "  --version, -V        print version and exit\n"
       "  --help, -h           print this help and exit\n"
-      "Behavior flags are facades over their DFKV_* env twins (STORE_ENGINE, SLAB_WRITE,\n"
-      "RAM_TIER, RAM_TIER_BYTES, SLAB_GRANULARITY, PUT_INFLIGHT_LIMIT); a flag always\n"
-      "overrides a pre-set env value.\n",
+      "Behavior flags are facades over their DFKV_* env twins (see docs/CONFIG.md\n"
+      "for the full matrix); a flag always overrides a pre-set env value.\n"
+      "--rdma-dev is passed directly to the RDMA server (param wins over env).\n",
       dfkv::Version());
     return help ? 0 : 1;
   }
@@ -68,7 +78,11 @@ int main(int argc, char** argv) {
                    "--mds", "--group", "--id", "--advertise", "--weight",
                    "--metrics-port", "--metrics-bind", "--store-engine",
                    "--slab-write", "--ram-tier", "--ram-tier-bytes",
-                   "--slab-granularity", "--put-inflight-limit"});
+                   "--slab-granularity", "--put-inflight-limit",
+                   "--rdma-depth", "--rdma-numa", "--rdma-idle-ms",
+                   "--rdma-op-timeout-ms", "--server-uring",
+                   "--server-uring-depth", "--ram-flush-threads",
+                   "--ram-tier-numa", "--slab-table-sync-ms", "--log"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -106,6 +120,39 @@ int main(int argc, char** argv) {
   // a deep device queue. 0 = off (default).
   std::string put_limit = args.Get("--put-inflight-limit", "");
   if (!put_limit.empty()) ::setenv("DFKV_PUT_INFLIGHT_LIMIT", put_limit.c_str(), 1);
+  // --- Remaining env-only knobs: same flag→env facade pattern. Each flag is
+  // an empty-by-default string; when set it wins over a pre-set DFKV_* env via
+  // setenv(overwrite=1). See docs/CONFIG.md for the full matrix.
+  // RDMA transport knobs (DFKV_RDMA_DEV already handled via --rdma-dev above,
+  // which the RdmaServer constructor takes as a direct arg, so no setenv here).
+  std::string rdma_depth = args.Get("--rdma-depth", "");
+  if (!rdma_depth.empty()) ::setenv("DFKV_RDMA_DEPTH", rdma_depth.c_str(), 1);
+  std::string rdma_numa = args.Get("--rdma-numa", "");
+  if (!rdma_numa.empty()) ::setenv("DFKV_RDMA_NUMA", rdma_numa.c_str(), 1);
+  std::string rdma_idle_ms = args.Get("--rdma-idle-ms", "");
+  if (!rdma_idle_ms.empty()) ::setenv("DFKV_RDMA_IDLE_MS", rdma_idle_ms.c_str(), 1);
+  std::string rdma_op_timeout_ms = args.Get("--rdma-op-timeout-ms", "");
+  if (!rdma_op_timeout_ms.empty())
+    ::setenv("DFKV_RDMA_OP_TIMEOUT_MS", rdma_op_timeout_ms.c_str(), 1);
+  // io_uring async-GET path (built -DDFKV_WITH_URING).
+  std::string server_uring = args.Get("--server-uring", "");
+  if (!server_uring.empty()) ::setenv("DFKV_SERVER_URING", server_uring.c_str(), 1);
+  std::string server_uring_depth = args.Get("--server-uring-depth", "");
+  if (!server_uring_depth.empty())
+    ::setenv("DFKV_SERVER_URING_DEPTH", server_uring_depth.c_str(), 1);
+  // RAM tier flusher + NUMA placement.
+  std::string ram_flush_threads = args.Get("--ram-flush-threads", "");
+  if (!ram_flush_threads.empty())
+    ::setenv("DFKV_RAM_FLUSH_THREADS", ram_flush_threads.c_str(), 1);
+  std::string ram_tier_numa = args.Get("--ram-tier-numa", "");
+  if (!ram_tier_numa.empty()) ::setenv("DFKV_RAM_TIER_NUMA", ram_tier_numa.c_str(), 1);
+  // Slab table sync cadence (ms).
+  std::string slab_table_sync_ms = args.Get("--slab-table-sync-ms", "");
+  if (!slab_table_sync_ms.empty())
+    ::setenv("DFKV_SLAB_TABLE_SYNC_MS", slab_table_sync_ms.c_str(), 1);
+  // Log level (DFKV_LOG: e.g. "INFO", "DEBUG", "WARN").
+  std::string log_level = args.Get("--log", "");
+  if (!log_level.empty()) ::setenv("DFKV_LOG", log_level.c_str(), 1);
   if (!args.ok()) {
     std::fprintf(stderr, "dfkv_server: %s\n(run with --help for usage)\n",
                  args.error().c_str());
