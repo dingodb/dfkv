@@ -146,8 +146,12 @@ export DFKV_RDMA_MAX_PAYLOAD_BYTES=67108864  # 可选：单 chunk payload 上限
 > ⚠️ hd04 当前只有 `ib7s400p0,ib7s400p1` 两轨 up，但标准训练计算网节点是 8×400G，
 > 按本机实际 up 的口列全。
 
-传输相关 env 亦可走 extra_config（`dfkv_open` 前自动设 env，extra_config 优先）：
-`"rdma_depth":K`、`"require_rdma":1`、`"rdma_numa":1`。
+传输相关 env 亦可走 extra_config：`"rdma_depth":K`、`"require_rdma":1`、
+`"rdma_numa":1`、`"rdma_dev":"..."`。**v1.12.1+（PR#121/#122）这些走 `dfkv_open_v2`
+的 config struct → C 层 scoped env（构造时临时设、返回时恢复），不再永久污染进程
+env**——多 connector 实例同进程不会互相覆盖（旧版 `os.environ[...]=...` 的副作用已消除）。
+env 仍作 fallback（extra_config/struct 字段为 0/NULL 时读 `DFKV_*` env）。完整参数矩阵见
+[CONFIG.md](CONFIG.md)。
 
 ### 2.2 SGLang 启动 + 后端配置
 

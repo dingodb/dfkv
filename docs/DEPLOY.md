@@ -122,11 +122,11 @@ LimitMEMLOCK=infinity        # RDMA 需要锁页内存
 WantedBy=multi-user.target
 ```
 
-> **可选存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7）。行为开关均为「门面 flag + `DFKV_*` env 双生」，flag 覆盖预设 env；运行时真值经 `dfkvctl ring` INFO 列审计（`engine=`/`wr=`/`ram=`）。**
+> **可选存储/加速开关（见 [ARCHITECTURE.md](ARCHITECTURE.md) §5–7；完整参数清单见 [CONFIG.md](CONFIG.md)）。行为开关均为「门面 flag + `DFKV_*` env 双生」，flag 覆盖预设 env；运行时真值经 `dfkvctl ring` INFO 列审计（`engine=`/`wr=`/`ram=`）。**
 > - `--store-engine file|slab`（默认 `file`）：`slab` = extent 池 + slots.tbl 重启保温，消除"每块一文件"隐患。**切 slab 需清盘冷启**（旧 blocks/ 布局不复用），属独立迁移动作。
 > - `--slab-write direct|buffered`（**默认 `direct`**）：slab 数据面全程 O_DIRECT（写+对齐读+异步 prep），零 page cache/脏页占用——GPU 节点上突发吸收交给显式 RAM 热层而非内核缓存；extent 在 direct 模式下 fallocate 实体化（升级后 df 显示预分配为预期行为）。文件系统拒绝 O_DIRECT（如 tmpfs）时整店回退 buffered，以 `wr=` 上报真值。
 > - `--ram-tier on`（默认关）：写直通 RAM 热层 + RDMA arena 零拷贝 GET；`--ram-tier-bytes <bytes>` 定 arena 大小（预注册即 pin 内存，须核 `MemoryMax` 有余量）。开后观测 `dfkv_ram_hit_total` / `dfkv_ram_put_bypass_total`（见 METRICS.md §3.1）。**direct 模式下 flusher 经 CacheDirect DIO 落盘，RAM 池写入量不过 page cache。**
-> - 微调项（env only）：`DFKV_SLAB_TABLE_SYNC_MS`（slots.tbl fdatasync 节奏，默认 100，0=关；限定崩溃复活窗口）、`DFKV_RAM_FLUSH_THREADS`（RAM 落盘 worker 数，默认=盘数）。
+> - 微调项：`--slab-table-sync-ms` / `DFKV_SLAB_TABLE_SYNC_MS`（slots.tbl fdatasync 节奏，默认 100，0=关；限定崩溃复活窗口）、`--ram-flush-threads` / `DFKV_RAM_FLUSH_THREADS`（RAM 落盘 worker 数，默认=盘数）。v1.12.0+ 起均有 flag facade（见 [CONFIG.md](CONFIG.md) §1.2）。
 > - `--slab-granularity <bytes>`（默认 1 MiB）：slot 量子，小值负载调小（64KB 值在 1MiB 粒度下浪费 94%）。**改动 = 布局变化 = 该店清空冷启**，按迁移动作对待。
 > - `--put-inflight-limit <n>`（默认 0=关）：并发盘写超过 n 的 PUT 以 kCacheFull 快速拒绝（客户端视为普通 put 失败、不进 cooldown）= 用受控 miss 换掉过载排队尾延迟。RDMA 与 TCP 两条数据路径同受此门约束；RAM 热层的异步 flusher 落盘**不受**此门限制（否则背压会放大为 flush 丢弃）。
 > - RAM 热层 arena 预触 + RDMA MR 注册都在启动期走页：**arena 每 16 GiB 约 +5-10s 启动时间**，配大 arena（≥64 GiB）时同步调大 systemd `TimeoutStartSec`（默认 90s）并让就绪探测等待 metrics 端口。
