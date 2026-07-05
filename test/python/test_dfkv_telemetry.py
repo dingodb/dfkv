@@ -57,8 +57,20 @@ class DisabledByDefaultTest(TelemetryTestBase):
 class ConnectorIdTest(TelemetryTestBase):
     def test_default_id_is_host_pid_rank(self):
         cid = config.resolve_connector_id({}, tp_rank=2)
-        self.assertEqual(cid.rsplit(":", 1)[1], "2")
-        self.assertEqual(cid, "{}:{}:2".format(__import__("socket").gethostname(), os.getpid()))
+        self.assertEqual(cid.rsplit("_", 1)[1], "2")
+        self.assertEqual(cid, "{}_{}_2".format(__import__("socket").gethostname(), os.getpid()))
+
+    def test_default_id_passes_mds_isvalidgrouporid(self):
+        # The auto-derived id is the etcd key tail /dfkv/v1/groups/<g>/clients/<id>,
+        # so it MUST match the MDS IsValidGroupOrId alphabet [A-Za-z0-9._-]. A ":"
+        # (an earlier default) is rejected -> UpsertClient returns kInvalid -> the
+        # registrar never advances to the heartbeat loop -> dfkvctl clients is empty.
+        cid = config.resolve_connector_id({}, tp_rank=3)
+        self.assertTrue(cid and len(cid) <= 128)
+        for c in cid:
+            self.assertTrue(
+                (c.isalnum() and c.isascii()) or c in "._-",
+                f"connector_id {cid!r} has char {c!r} outside IsValidGroupOrId alphabet")
 
     def test_env_overrides_default(self):
         os.environ[config.ENV_CONNECTOR_ID] = "node-A-rank0"

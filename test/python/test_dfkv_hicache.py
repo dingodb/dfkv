@@ -1010,7 +1010,12 @@ class DfkvClientRegistrationTest(unittest.TestCase):
         self.assertIn("model=glm-5.2", info)
         self.assertIn("tp_size=8", info)
         self.assertIn("tp_rank=3", info)
-        self.assertTrue(cid)  # client_id resolves to host:pid:rank
+        self.assertTrue(cid)  # client_id resolves to host_pid_rank
+        # The id is the etcd key tail /clients/<id>, so it must pass the MDS
+        # IsValidGroupOrId alphabet [A-Za-z0-9._-] (no ":" — see resolve_connector_id).
+        self.assertTrue(all(
+            (c.isalnum() and c.isascii()) or c in "._-" for c in cid),
+            f"cid {cid!r} has chars outside IsValidGroupOrId alphabet")
 
     def test_opt_out_via_extra_config(self):
         # client_register=0 in extra_config disables registration; discovery still runs.

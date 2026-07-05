@@ -107,7 +107,17 @@ def resolve_connector_id(cfg: Optional[dict], tp_rank: int = 0) -> str:
     so the dashboard can enumerate / drill into a single instance.
 
     Explicit ``connector_id`` (extra_config or DFKV_CONNECTOR_ID) wins; otherwise
-    auto-derive ``<host>:<pid>:<tp_rank>`` which is unique per process/rank."""
+    auto-derive ``<host>_<pid>_<tp_rank>`` which is unique per process/rank.
+
+    The separator MUST be in the MDS ``IsValidGroupOrId`` alphabet
+    ``[A-Za-z0-9._-]`` — a ``:`` (the previous default) makes the whole id fail
+    validation, so ``MdsServer::UpsertClient`` returns ``kInvalid``, the
+    registrar's ``SendOnce`` never sees ``kOk``, and ``MdsRegistrar::Loop`` is
+    stuck retrying ``kClientRegister`` forever and never advances to the
+    heartbeat loop — ``dfkvctl clients`` stays empty despite thousands of
+    register requests. Underscore is path-safe and not part of any hostname
+    convention (hostnames are ``[a-z0-9-]``), so it cannot collide with the
+    host segment."""
     cid = resolve(cfg, "connector_id", ENV_CONNECTOR_ID, "")
     if cid:
         return str(cid)
@@ -115,4 +125,4 @@ def resolve_connector_id(cfg: Optional[dict], tp_rank: int = 0) -> str:
         host = socket.gethostname()
     except Exception:
         host = "unknown"
-    return "{}:{}:{}".format(host, os.getpid(), int(tp_rank))
+    return "{}_{}_{}".format(host, os.getpid(), int(tp_rank))
