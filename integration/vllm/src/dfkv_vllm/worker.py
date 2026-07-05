@@ -64,6 +64,7 @@ from .data import (
 from .dfkv_client import DfkvDeviceClient
 from .dfkv_utils import get_dp_engine_index
 from .metrics import DfkvStoreConnectorStats
+from ._telemetry import config as _tcfg  # connector identity + client_register switch
 from .protocol import (
     LOOKUP_MSG,
     RESET_MSG,
@@ -826,14 +827,35 @@ class DfkvStoreWorker:
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config
         # Membership: prefer MDS discovery (production) when mds_endpoints is set;
         # else fall back to a static members list. The client requires one of them.
+        mds_endpoints = extra.get("mds_endpoints", "")
+        mds_group = extra.get("mds_group", "default")
+        # Client registration (so `dfkvctl clients` can list this instance): on by
+        # default when MDS is in use; opt out via extra_config["client_register"]
+        # = false or DFKV_CLIENT_REGISTER=0. The identity string is parsed by the
+        # CLI into type/model/role/tp columns; client_id defaults to host:pid:rank.
+        client_register = _tcfg.truthy(
+            extra.get("client_register",
+                      os.environ.get("DFKV_CLIENT_REGISTER", "1")))
+        client_id = ""
+        client_info = ""
+        if mds_endpoints and client_register:
+            client_id = _tcfg.resolve_connector_id(extra, tp_rank=self.tp_rank)
+            client_info = (
+                f"type={_tcfg.TYPE_VLLM},model={self.metadata.model_name},"
+                f"role={self.kv_role},tp_size={self.tp_size},"
+                f"tp_rank={self.tp_rank},ver={_tcfg.dist_version('dfkv-vllm')}"
+            )
         self.client = DfkvDeviceClient(
             members=extra.get("members", ""),
-            mds_endpoints=extra.get("mds_endpoints", ""),
-            mds_group=extra.get("mds_group", "default"),
+            mds_endpoints=mds_endpoints,
+            mds_group=mds_group,
             mds_poll_ms=int(extra.get("mds_poll_ms", 3000)),
             model_hash=int(extra.get("model_hash", 0)),
             lib_path=extra.get("lib"),
             batch_concurrency=int(extra.get("batch_concurrency", 8)),
+            client_register=client_register,
+            client_id=client_id,
+            client_info=client_info,
         )
 
         # dfkv: no disk-offload staging budget (Mooncake owner-DirectIO only).

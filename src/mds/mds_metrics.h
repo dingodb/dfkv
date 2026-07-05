@@ -20,6 +20,12 @@ struct MdsMetrics {
   std::atomic<uint64_t> lease_grants{0};
   std::atomic<uint64_t> etcd_errors{0};
   std::atomic<uint64_t> members_last_list{0};  // members returned by the last ListMembers
+  // Client (consumer) registration — mirrors the member counters above. Lets the
+  // fleet see "who is using dfkv" by connector type without a per-node sweep.
+  std::atomic<uint64_t> client_register_requests{0};
+  std::atomic<uint64_t> client_keepalives{0};
+  std::atomic<uint64_t> client_list_requests{0};
+  std::atomic<uint64_t> clients_last_list{0};  // clients returned by the last ListClients
 
   std::string Render() const {
     std::string s;
@@ -42,6 +48,10 @@ struct MdsMetrics {
     m("dfkv_mds_lease_grants_total", "counter", "etcd lease grants issued", ld(lease_grants));
     m("dfkv_mds_etcd_errors_total", "counter", "etcd I/O failures", ld(etcd_errors));
     m("dfkv_mds_members", "gauge", "Members returned by the last ListMembers", ld(members_last_list));
+    m("dfkv_mds_client_register_requests_total", "counter", "Client register ops received", ld(client_register_requests));
+    m("dfkv_mds_client_keepalives_total", "counter", "Client heartbeat ops received", ld(client_keepalives));
+    m("dfkv_mds_client_list_requests_total", "counter", "ListClients ops served", ld(client_list_requests));
+    m("dfkv_mds_clients", "gauge", "Clients returned by the last ListClients", ld(clients_last_list));
     return s;
   }
 };

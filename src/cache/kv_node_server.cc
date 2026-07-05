@@ -408,9 +408,13 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
     case WireOp::kRegister:
     case WireOp::kHeartbeat:
     case WireOp::kListMembers:
+    case WireOp::kListGroups:
+    case WireOp::kClientRegister:
+    case WireOp::kClientHeartbeat:
+    case WireOp::kListClients:
       st = Status::kInvalid;  // MDS ops are not served by a cache node
       break;
-  }
+    }
   if (st == Status::kInvalid) invalid_ops_.fetch_add(1, std::memory_order_relaxed);
   return st;
 }

@@ -92,6 +92,12 @@ def load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_set_members.argtypes = [c_void_p, c_char_p]
     lib.dfkv_start_mds_discovery.restype = c_int
     lib.dfkv_start_mds_discovery.argtypes = [c_void_p, c_char_p, c_char_p, c_int]
+    # Client registration (additive >= dfkv with the /clients/<id> lease). Guarded
+    # at the call site for older libdfkv.so without the symbol.
+    if hasattr(lib, "dfkv_start_client_registration"):
+        lib.dfkv_start_client_registration.restype = c_int
+        lib.dfkv_start_client_registration.argtypes = [
+            c_void_p, c_char_p, c_char_p, c_char_p, c_char_p, c_int]
     lib.dfkv_transport_mode.restype = c_char_p
     lib.dfkv_transport_mode.argtypes = [c_void_p]
     lib.dfkv_version.restype = c_char_p
@@ -188,6 +194,30 @@ class DfkvNativeClient:
                     raise RuntimeError(
                         f"dfkv_start_mds_discovery failed (rc={rc})"
                     )
+                # Register this LMCache connector as a cache consumer so
+                # `dfkvctl clients` can list it. Best-effort: a missing symbol
+                # (older libdfkv.so) or failure is logged, never fatal — the data
+                # path is already up via discovery above. Default on; opt out with
+                # DFKV_CLIENT_REGISTER=0.
+                if _tcfg.truthy(os.environ.get("DFKV_CLIENT_REGISTER", "1")):
+                    tp_rank = int(g.get("tp_rank", 0))
+                    cid = _tcfg.resolve_connector_id({}, tp_rank=tp_rank)
+                    info = (
+                        f"type={_tcfg.TYPE_LMCACHE},"
+                        f"tp_size={int(g.get('tp_size', 0))},"
+                        f"tp_rank={tp_rank},"
+                        f"ver={_tcfg.dist_version('dfkv-connector')}"
+                    )
+                    try:
+                        rc2 = self._lib.dfkv_start_client_registration(
+                            self._h, raw_endpoint.encode(), group.encode(),
+                            cid.encode(), info.encode(), 10000)
+                        if rc2 != 0:
+                            raise RuntimeError(f"rc={rc2}")
+                    except AttributeError:
+                        pass  # older libdfkv.so without the symbol
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("dfkv client registration skipped: %s", e)
 
             # Register the host arena(s) once so RDMA Put/Get into any slice of
             # them skips per-op MR registration. No-op on TCP.

@@ -4,6 +4,7 @@
  *   dfkvctl --members "n=ip:port,..." exist <key>
  *   dfkvctl stat <node-ip:port>           # fetch a node's Prometheus metrics
  *   dfkvctl ring --mds <ep,...> --group <g>          # show the cluster ring + vnode share
+ *   dfkvctl clients --mds <ep,...> --group <g>        # list cache consumers (inference instances)
  *   dfkvctl stat --all --mds <ep,...> --group <g> [--stat-port <p>]  # per-node metrics + aggregate
  *     The MDS now hands back each node's TCP stat port (MemberInfo.tcp_port), so stat --all
  *     reaches nodes automatically even in RDMA deploys. --stat-port <p> stays as a manual
@@ -55,6 +56,50 @@ static bool QueryMembers(const std::string& mds, const std::string& group,
   // instances are healthy (RUNBOOK uses `dfkvctl ring` to verify upgrades).
   for (size_t i = 0; i < eps.size() && !got; ++i) poller.PollOnce();
   return got;
+}
+
+// One-shot MDS client-list query via the poller (PollOnce fires the callback on
+// the first epoch). Returns true if the MDS answered. Mirrors QueryMembers but
+// carries kListClients so the MDS reads /clients/<id> instead of /members/<id>.
+static bool QueryClients(const std::string& mds, const std::string& group,
+                         std::vector<MemberInfo>* out) {
+  auto eps = SplitCsv(mds);
+  if (eps.empty()) return false;
+  bool got = false;
+  // Reuse the member poller's endpoint failover by issuing a single kListClients
+  // roundtrip per endpoint — the poller's Pick/MarkFailed steers the next try.
+  for (const auto& ep : eps) {
+    int fd = net::Dial(ep, 2000, 2000);
+    if (fd < 0) continue;
+    char pre[kReqPrefix];
+    EncodeReq(pre, WireOp::kListClients, BlockKey{}, 0, 0, group.size());
+    bool ok = net::WriteAll(fd, pre, kReqPrefix) &&
+              (!group.empty() && net::WriteAll(fd, group.data(), group.size()));
+    std::string data;
+    if (ok) {
+      char rp[kRespPrefix];
+      Status st = Status::kInvalid;
+      uint64_t dlen = 0;
+      ok = net::ReadAll(fd, rp, kRespPrefix) &&
+           DecodeResp(rp, &st, &dlen, wire_limits::kMdsMaxRespData) && st == Status::kOk;
+      if (ok) { data.resize(dlen); ok = (dlen == 0) || net::ReadAll(fd, &data[0], dlen); }
+    }
+    ::close(fd);
+    if (!ok) continue;
+    uint64_t epoch = 0;
+    if (DecodeMembers(data.data(), data.size(), out, &epoch)) { got = true; break; }
+  }
+  return got;
+}
+
+// Extract the value of `key=` from a "k=v,k=v" info string, or "" if absent.
+static std::string InfoField(const std::string& info, const std::string& key) {
+  std::string tok = key + "=";
+  size_t p = info.find(tok);
+  if (p == std::string::npos) return "";
+  p += tok.size();
+  size_t e = info.find(',', p);
+  return info.substr(p, (e == std::string::npos ? info.size() : e) - p);
 }
 
 // Raw kListGroups roundtrip against any one reachable MDS endpoint: returns
@@ -146,13 +191,17 @@ static int CmdStats(const std::string& mds, const std::string& group) {
     sum.dio_write_fallbacks += st.dio_write_fallbacks; sum.ram_used_bytes += st.ram_used_bytes;
   }
   const uint64_t lk = sum.hits_total + sum.misses_total;
-  std::printf("-- group=%s: %zu nodes  %s/%s (%.0f%%)  hit %.1f%%  evic %llu  busy %llu  dio-fb %llu  ram %s  stats-missing %llu\n",
+  // Surface registered consumers on the same line so `dfkvctl stats` answers
+  // "and who is using this ring" without a second command.
+  std::vector<MemberInfo> cs;
+  size_t nclients = QueryClients(mds, group, &cs) ? cs.size() : 0;
+  std::printf("-- group=%s: %zu nodes  %s/%s (%.0f%%)  hit %.1f%%  evic %llu  busy %llu  dio-fb %llu  ram %s  stats-missing %llu  clients %zu\n",
               group.c_str(), ms.size(), HumanBytes(sum.used_bytes).c_str(), HumanBytes(sum.capacity_bytes).c_str(),
               sum.capacity_bytes ? 100.0 * (double)sum.used_bytes / (double)sum.capacity_bytes : 0.0,
               lk ? 100.0 * (double)sum.hits_total / (double)lk : 0.0,
               (unsigned long long)sum.evictions_total, (unsigned long long)sum.put_busy_total,
               (unsigned long long)sum.dio_write_fallbacks, HumanBytes(sum.ram_used_bytes).c_str(),
-              (unsigned long long)missing);
+              (unsigned long long)missing, nclients);
   return 0;
 }
 
@@ -187,6 +236,28 @@ static int CmdRing(const std::string& mds, const std::string& group) {
     // cap, ...). "-" = node predates info reporting (itself a version signal).
     std::printf("%-16s %-22s %6u %8zu %6.1f%%  %s\n", m.id.c_str(), addr.c_str(), m.weight,
                 v, share, m.info.empty() ? "-" : m.info.c_str());
+  }
+  return 0;
+}
+
+static int CmdClients(const std::string& mds, const std::string& group) {
+  if (mds.empty()) { std::fprintf(stderr, "clients needs --mds ip:port[,...]\n"); return 2; }
+  std::vector<MemberInfo> cs;
+  if (!QueryClients(mds, group, &cs)) { std::fprintf(stderr, "clients: MDS query failed\n"); return 1; }
+  std::printf("group=%s clients=%zu (only upgraded clients register)\n", group.c_str(), cs.size());
+  if (cs.empty()) return 0;
+  std::printf("%-28s %-10s %-24s %-14s %-8s %s\n", "ID", "TYPE", "MODEL", "ROLE", "TP", "INFO");
+  for (const auto& m : cs) {
+    std::string type = InfoField(m.info, "type");
+    std::string model = InfoField(m.info, "model");
+    std::string role = InfoField(m.info, "role");
+    std::string tp = InfoField(m.info, "tp_size");
+    std::printf("%-28s %-10s %-24s %-14s %-8s %s\n", m.id.c_str(),
+                type.empty() ? "-" : type.c_str(),
+                model.empty() ? "-" : model.c_str(),
+                role.empty() ? "-" : role.c_str(),
+                tp.empty() ? "-" : tp.c_str(),
+                m.info.empty() ? "-" : m.info.c_str());
   }
   return 0;
 }
@@ -279,6 +350,7 @@ int main(int argc, char** argv) {
   const std::string& cmd = pos[0];
 
   if (cmd == "ring") return CmdRing(mds, group);
+  if (cmd == "clients") return CmdClients(mds, group);
 
   if (cmd == "stats") {
     if (all) return CmdStatsAllGroups(mds);

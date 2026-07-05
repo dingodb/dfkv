@@ -252,6 +252,27 @@ int dfkv_start_mds_discovery(dfkv_client_t c, const char* mds_endpoints,
   return 0;
 }
 
+int dfkv_start_client_registration(dfkv_client_t c, const char* mds_endpoints,
+                                   const char* group, const char* client_id,
+                                   const char* client_info, int heartbeat_ms) {
+  if (!c || !mds_endpoints || !group || !client_id) return -1;
+  std::vector<std::string> eps;
+  std::string s(mds_endpoints);
+  for (size_t i = 0, j; i <= s.size(); i = j + 1) {
+    j = s.find(',', i);
+    if (j == std::string::npos) j = s.size();
+    if (j > i) eps.push_back(s.substr(i, j - i));
+  }
+  // Identity-only MemberInfo: ip/port/weight are irrelevant for a consumer (the
+  // MDS writes /clients/<id>, never the placement ring). info carries the
+  // "k=v,k=v" identity string surfaced by `dfkvctl clients`.
+  dfkv::MemberInfo self{client_id, "0.0.0.0", 0, 0};
+  self.info = client_info ? std::string(client_info) : std::string();
+  static_cast<KVClient*>(c)->StartClientRegistration(
+      std::move(eps), group, self, heartbeat_ms > 0 ? heartbeat_ms : 10000);
+  return 0;
+}
+
 const char* dfkv_transport_mode(dfkv_client_t c) {
   if (!c) return "";
   return static_cast<KVClient*>(c)->TransportMode().c_str();

@@ -116,7 +116,24 @@ void KVClient::StopMdsDiscovery() {
   if (poller_) { poller_->Stop(); poller_.reset(); }
 }
 
-KVClient::~KVClient() { StopProbe(); StopMdsDiscovery(); }
+void KVClient::StartClientRegistration(std::vector<std::string> mds_eps,
+                                       const std::string& group, MemberInfo self,
+                                       int heartbeat_ms) {
+  StopClientRegistration();
+  // is_client=true routes the registrar to kClientRegister/kClientHeartbeat,
+  // which the MDS writes under /clients/<id> (never the placement ring). No
+  // stats provider: a consumer has no ring-level stats to report.
+  client_registrar_ = std::make_unique<MdsRegistrar>(
+      std::move(mds_eps), group, self, heartbeat_ms, /*io_timeout_ms=*/2000,
+      /*is_client=*/true);
+  client_registrar_->Start();
+}
+
+void KVClient::StopClientRegistration() {
+  if (client_registrar_) { client_registrar_->Stop(); client_registrar_.reset(); }
+}
+
+KVClient::~KVClient() { StopProbe(); StopClientRegistration(); StopMdsDiscovery(); }
 
 void KVClient::StartProbe(int interval_ms) {
   if (interval_ms <= 0 || probe_running_.load(std::memory_order_relaxed)) return;

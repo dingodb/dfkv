@@ -23,6 +23,7 @@
 #include "utils/con_hash.h"
 #include "common/membership.h"
 #include "mds/mds_member_poller.h"
+#include "mds/mds_registrar.h"
 #include "client/op_metrics.h"
 #include "client/peer_health.h"
 #include "client/peer_latency.h"
@@ -128,6 +129,16 @@ class KVClient {
   void StartMdsDiscovery(std::vector<std::string> mds_eps, const std::string& group,
                          int poll_ms = 3000);
   void StopMdsDiscovery();
+  // Register THIS client (a cache consumer / inference instance) with the MDS so
+  // `dfkvctl clients` can surface "who is using dfkv". `self` carries identity
+  // only (id + info string; ip/port/weight are ignored for placement). The
+  // registrar leases its own etcd key under /clients/<id> and keeps it alive via
+  // heartbeats; on process death the lease expires within the MDS TTL — no
+  // explicit deregister, no stale keys. Best-effort: registration failure is
+  // logged and retried, never blocking the data path.
+  void StartClientRegistration(std::vector<std::string> mds_eps, const std::string& group,
+                               MemberInfo self, int heartbeat_ms = 10000);
+  void StopClientRegistration();
 
   // Discovery: query a seed node ("ip:port") for the current cluster membership
   // and SetMembers() it. Lets clients learn add/remove without a static list or
@@ -168,6 +179,7 @@ class KVClient {
   // Atomic: configurable via the C ABI; reads on the batch path are relaxed.
   std::atomic<size_t> batch_concurrency_{8};
   std::unique_ptr<MdsMemberPoller> poller_;
+  std::unique_ptr<MdsRegistrar> client_registrar_;  // consumer identity lease (best-effort)
   PeerHealth health_;
   OpMetrics op_stats_;  // per-op (put/get/exist) counters + latency, snapshot'd
 
