@@ -12,6 +12,9 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import numpy as np
 
@@ -22,6 +25,21 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "integration", "hicache"))  # 
 
 BUILD = os.environ.get("DFKV_BUILD", os.path.join(HERE, "..", "..", "build"))
 SERVER_BIN = os.path.join(BUILD, "dfkv_server")
+
+
+@contextmanager
+def _env(key, value):
+    """Set an env var for the duration of a block, restoring the prior value."""
+    saved = os.environ.get(key)
+    os.environ[key] = value
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
+
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig  # noqa: E402
 import dfkv_hicache  # noqa: E402  (RED until implemented)
@@ -907,6 +925,159 @@ class ClientStatsPollerTest(unittest.TestCase):
         self.assertIsNotNone(p._thread)
         p.stop()
         self.assertIsNone(p._thread)
+
+
+class DfkvClientRegistrationTest(unittest.TestCase):
+    """SGLang HiCache client registration (parity with vLLM/LMCache, v1.15.0).
+
+    The registration call rides on the MDS-discovery path. We don't run a real
+    etcd/MDS here (deterministic, no external deps): we swap _load_lib for a fake
+    CDLL that records the C-ABI calls. The fake's dfkv_start_mds_discovery
+    returns 0 (success) so the registration call is reached; we then assert the
+    info string carries type=hicache + model/tp fields, and that the opt-out and
+    older-lib (missing symbol) paths are honored.
+    """
+    PAGE_SIZE = 64
+    PAGE_BYTES = 4096
+
+    def _fake_lib(self, *, with_symbol=True, reg_rc=0):
+        """A ctypes-shaped stand-in for libdfkv.so. Records ABI calls so tests
+        can assert what the plugin invoked, without a real cache node / MDS."""
+        calls = {"discovery": [], "registration": []}
+
+        class _FakeLib:
+            # The plugin probes the symbol at _load_lib time (hasattr) to declare
+            # its argtypes/restype. Hide it entirely to model an older lib.
+            def __init__(self):
+                if with_symbol:
+                    self.dfkv_start_client_registration = self._reg
+                self.dfkv_start_mds_discovery = self._disc
+                self.dfkv_open = self._open
+                self.dfkv_set_batch_concurrency = lambda *a, **k: 0
+                self.dfkv_transport_mode = lambda *a, **k: b"tcp"
+                self.dfkv_close = lambda *a, **k: None
+                self.dfkv_version = lambda *a, **k: b"1.15.1"
+
+            def _open(self, *a, **k):
+                return ctypes.c_void_p(0xDEADBEEF)  # non-null handle
+
+            def _disc(self, h, mds, group, poll_ms):
+                calls["discovery"].append((mds.decode(), group.decode(), poll_ms))
+                return 0  # success -> registration call is reached
+
+            def _reg(self, h, mds, group, cid, info, hb_ms):
+                calls["registration"].append(
+                    (mds.decode(), group.decode(), cid.decode(),
+                     info.decode(), hb_ms))
+                return reg_rc
+
+        return _FakeLib(), calls
+
+    def _mds_cfg(self, mds="127.0.0.1:9999", tp_rank=0, tp_size=8,
+                 model="glm-5.1", extra=None):
+        ec = {
+            "mds_endpoints": mds, "mds_group": "t-grp", "model_hash": 0x51,
+            "dtype_tag": 0x46384534, "page_size": self.PAGE_SIZE,
+            "layer_num": 78, "head_num": 1, "head_dim": 576,
+            "interface_v1": 1,
+        }
+        if extra:
+            ec.update(extra)
+        return HiCacheStorageConfig(
+            tp_rank=tp_rank, tp_size=tp_size, is_mla_model=True,
+            is_page_first_layout=False, model_name=model, extra_config=ec)
+
+    def _make_plugin(self, cfg, fake_lib):
+        with patch.object(dfkv_hicache, "_load_lib", return_value=fake_lib):
+            return dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+
+    def test_registers_on_mds_path_with_hicache_info(self):
+        # Default (DFKV_CLIENT_REGISTER unset, client_register unset) => registers.
+        # Info must be type=hicache + model + tp fields, mirroring vLLM/LMCache so
+        # `dfkvctl clients` populates TYPE/MODEL/TP columns.
+        os.environ.pop("DFKV_CLIENT_REGISTER", None)
+        fake, calls = self._fake_lib()
+        cfg = self._mds_cfg(tp_rank=3, tp_size=8, model="glm-5.2")
+        self._make_plugin(cfg, fake)
+        self.assertEqual(len(calls["discovery"]), 1)
+        self.assertEqual(calls["discovery"][0][1], "t-grp")
+        self.assertEqual(len(calls["registration"]), 1)
+        mds, grp, cid, info, hb = calls["registration"][0]
+        self.assertEqual(mds, "127.0.0.1:9999")
+        self.assertEqual(grp, "t-grp")
+        self.assertEqual(hb, 10000)
+        self.assertIn("type=hicache", info)
+        self.assertIn("model=glm-5.2", info)
+        self.assertIn("tp_size=8", info)
+        self.assertIn("tp_rank=3", info)
+        self.assertTrue(cid)  # client_id resolves to host:pid:rank
+
+    def test_opt_out_via_extra_config(self):
+        # client_register=0 in extra_config disables registration; discovery still runs.
+        os.environ.pop("DFKV_CLIENT_REGISTER", None)
+        fake, calls = self._fake_lib()
+        cfg = self._mds_cfg(extra={"client_register": 0})
+        self._make_plugin(cfg, fake)
+        self.assertEqual(len(calls["discovery"]), 1)
+        self.assertEqual(calls["registration"], [])
+
+    def test_opt_out_via_env(self):
+        # DFKV_CLIENT_REGISTER=0 disables registration too.
+        with _env("DFKV_CLIENT_REGISTER", "0"):
+            fake, calls = self._fake_lib()
+            cfg = self._mds_cfg()
+            self._make_plugin(cfg, fake)
+        self.assertEqual(len(calls["discovery"]), 1)
+        self.assertEqual(calls["registration"], [])
+
+    def test_extra_config_wins_over_env(self):
+        # explicit client_register=1 wins over DFKV_CLIENT_REGISTER=0.
+        with _env("DFKV_CLIENT_REGISTER", "0"):
+            fake, calls = self._fake_lib()
+            cfg = self._mds_cfg(extra={"client_register": 1})
+            self._make_plugin(cfg, fake)
+        self.assertEqual(len(calls["registration"]), 1)
+
+    def test_older_lib_missing_symbol_skips_silently(self):
+        # An older libdfkv.so without dfkv_start_client_registration must not
+        # crash startup (the hasattr guard drops the symbol; the call site's
+        # AttributeError branch swallows it). Discovery still succeeds.
+        os.environ.pop("DFKV_CLIENT_REGISTER", None)
+        fake, calls = self._fake_lib(with_symbol=False)
+        cfg = self._mds_cfg()
+        self._make_plugin(cfg, fake)  # must not raise
+        self.assertEqual(len(calls["discovery"]), 1)
+        self.assertEqual(calls["registration"], [])
+
+    def test_registration_failure_does_not_block_startup(self):
+        # A non-zero rc from dfkv_start_client_registration must not abort: the
+        # data path is already up via discovery, so registration is best-effort.
+        os.environ.pop("DFKV_CLIENT_REGISTER", None)
+        fake, calls = self._fake_lib(reg_rc=1)
+        cfg = self._mds_cfg()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            self._make_plugin(cfg, fake)  # must not raise
+            self.assertTrue(any("client registration skipped" in str(x.message) for x in w))
+        self.assertEqual(len(calls["discovery"]), 1)
+
+    def test_no_registration_on_static_members_path(self):
+        # Static-members deployments (no mds_endpoints) never register: there's
+        # no MDS to register with, and discovery doesn't run either.
+        os.environ.pop("DFKV_CLIENT_REGISTER", None)
+        fake, calls = self._fake_lib()
+        ec = {
+            "members": "n1=127.0.0.1:1", "model_hash": 0x51,
+            "dtype_tag": 0x46384534, "page_size": self.PAGE_SIZE,
+            "layer_num": 78, "head_num": 1, "head_dim": 576,
+            "interface_v1": 1,
+        }
+        cfg = HiCacheStorageConfig(
+            tp_rank=0, tp_size=8, is_mla_model=True, is_page_first_layout=False,
+            model_name="glm-5.1", extra_config=ec)
+        self._make_plugin(cfg, fake)
+        self.assertEqual(calls["discovery"], [])
+        self.assertEqual(calls["registration"], [])
 
 
 if __name__ == "__main__":
