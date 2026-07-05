@@ -56,13 +56,14 @@ without any ring change. The legacy static path (`dfkv_open(members=...)` /
 `dfkv_set_members`) still exists for simple or single-node setups.
 
 **Client registration** (who is using dfkv): cache *consumers* (inference
-connector instances — vLLM / LMCache) register themselves with the MDS under a
-disjoint etcd prefix (`/dfkv/v1/groups/<g>/clients/<id>`) so they never enter the
-placement ring. The same lease/heartbeat contract as nodes applies — a dead
-connector's key expires out of etcd within the TTL, no explicit deregister, no
-stale keys. `dfkv_start_client_registration(c, mds, group, client_id, client_info,
-heartbeat_ms)` is the C entry point; the vLLM/LMCache connectors call it
-automatically when MDS discovery is in use (opt out with `DFKV_CLIENT_REGISTER=0`).
+connector instances — vLLM / LMCache / SGLang HiCache) register themselves with
+the MDS under a disjoint etcd prefix (`/dfkv/v1/groups/<g>/clients/<id>`) so
+they never enter the placement ring. The same lease/heartbeat contract as nodes
+applies — a dead connector's key expires out of etcd within the TTL, no explicit
+deregister, no stale keys. `dfkv_start_client_registration(c, mds, group,
+client_id, client_info, heartbeat_ms)` is the C entry point; the
+vLLM/LMCache/SGLang connectors call it automatically when MDS discovery is in
+use (opt out with `DFKV_CLIENT_REGISTER=0`).
 Observe with `dfkvctl clients --mds <ep,...> --group <g>` or the
 `dfkv_mds_group_clients` gauge. Only upgraded clients register, so an empty list
 means "none of the current consumers are registered," not "no one is using dfkv."

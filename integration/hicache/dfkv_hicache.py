@@ -76,6 +76,14 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_refresh_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.dfkv_start_mds_discovery.restype = ctypes.c_int
     lib.dfkv_start_mds_discovery.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    # Client registration (additive >= dfkv with the /clients/<id> lease). Guarded
+    # at the call site for older libdfkv.so without the symbol (same pattern as the
+    # vLLM/LMCache connectors — see integration/vllm + integration/lmcache).
+    if hasattr(lib, "dfkv_start_client_registration"):
+        lib.dfkv_start_client_registration.restype = ctypes.c_int
+        lib.dfkv_start_client_registration.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                                       ctypes.c_char_p, ctypes.c_char_p,
+                                                       ctypes.c_char_p, ctypes.c_int]
     lib.dfkv_transport_mode.restype = ctypes.c_char_p
     lib.dfkv_transport_mode.argtypes = [ctypes.c_void_p]
     lib.dfkv_set_batch_concurrency.restype = ctypes.c_int
@@ -261,6 +269,34 @@ class DfkvHiCache(HiCacheStorage):
                 rc = self._lib.dfkv_start_mds_discovery(self._h, mds.encode(), group.encode(), poll_ms)
                 if rc != 0:
                     raise RuntimeError("dfkv_start_mds_discovery failed")
+                # Register this SGLang HiCache connector as a cache consumer so
+                # `dfkvctl clients` can answer "who is using dfkv" (parity with the
+                # vLLM/LMCache connectors added in v1.15.0). Best-effort: a missing
+                # symbol (older libdfkv.so) or a registration failure is logged,
+                # never fatal — the data path is already up via discovery above.
+                # Default on; opt out with extra_config client_register=0 or
+                # DFKV_CLIENT_REGISTER=0. SGLang HiCache is a prefix L3 cache with
+                # no producer/consumer split, so no 'role' field (the CLI shows '-'
+                # for it, same as LMCache which has no role either).
+                if _truthy(cfg.get("client_register",
+                                    os.environ.get("DFKV_CLIENT_REGISTER", "1"))):
+                    cid = _tcfg.resolve_connector_id(cfg, tp_rank=self.tp_rank)
+                    info = (f"type={_tcfg.TYPE_HICACHE},model={self.model},"
+                            f"tp_size={self.tp_size},tp_rank={self.tp_rank},"
+                            f"ver={native_ver}")
+                    try:
+                        rc2 = self._lib.dfkv_start_client_registration(
+                            self._h, mds.encode(), group.encode(), cid.encode(),
+                            info.encode(), 10000)
+                        if rc2 != 0:
+                            raise RuntimeError(f"rc={rc2}")
+                    except AttributeError:
+                        pass  # older libdfkv.so without the symbol — skip silently
+                    except Exception as e:  # noqa: BLE001 — never block startup
+                        import warnings
+                        warnings.warn(
+                            f"dfkv client registration skipped (mds={mds!r}): {e}",
+                            stacklevel=2)
             self.mem_pool_host = None
             mode = f" transport={self.transport_mode}"
             r.result = ("ok mds-discovery" if mds else "ok static") + mode
