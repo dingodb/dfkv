@@ -49,6 +49,17 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_start_mds_discovery.restype = c_int
     lib.dfkv_start_mds_discovery.argtypes = [c_void_p, c_char_p, c_char_p, c_int]
 
+    # int = dfkv_start_client_registration(c, mds_endpoints, group, client_id,
+    #                                      client_info, heartbeat_ms)
+    # Registers THIS connector (a cache consumer) with the MDS so `dfkvctl
+    # clients` can surface "who is using dfkv". Leases a /clients/<id> etcd key
+    # kept alive by a background thread; expires within the MDS TTL on exit.
+    # Best-effort: never blocks the data path. Missing on older libdfkv.so ->
+    # AttributeError, caught by the connector so an old lib doesn't break startup.
+    lib.dfkv_start_client_registration.restype = c_int
+    lib.dfkv_start_client_registration.argtypes = [
+        c_void_p, c_char_p, c_char_p, c_char_p, c_char_p, c_int]
+
     # GPUDirect MR registration (ibv_reg_mr on a host OR device pointer).
     lib.dfkv_register_memory.restype = c_int
     lib.dfkv_register_memory.argtypes = [c_void_p, c_void_p, c_uint64]

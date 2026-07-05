@@ -3,7 +3,10 @@
 #include "mds/mds_server.h"
 #include "mds/mds_registrar.h"
 #include "common/value_header.h"
+#include "transport/wire.h"
+#include "utils/net_util.h"
 #include <gtest/gtest.h>
+#include <unistd.h>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -65,4 +68,50 @@ TEST(KvClientMds, DiscoversNodesAndRoundTrips) {
   }
   mds.Stop(); n1.Stop(); n2.Stop();
   fs::remove_all(d1); fs::remove_all(d2);
+}
+
+// KVClient::StartClientRegistration leases a /clients/<id> key so `dfkvctl
+// clients` can see this instance. The lease is kept alive on a background
+// thread; StopClientRegistration (also run by the dtor) stops it.
+TEST(KvClientMds, ClientRegistrationVisibleViaListClients) {
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  std::string mds_ep = "127.0.0.1:" + std::to_string(mds.port());
+  std::string group = "m3-cli-" + std::to_string(mds.port());
+
+  MemberInfo self{"conn-e2e", "0.0.0.0", 0, 0, 0,
+                  "type=vllm,model=glm51,role=kv_producer,tp_size=8"};
+  KVClient c({}, SelfHdr());
+  c.StartClientRegistration({mds_ep}, group, self, /*heartbeat_ms=*/10000);
+
+  // Give the registrar's background loop one register attempt.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  std::vector<MemberInfo> cs;
+  while (cs.empty() && std::chrono::steady_clock::now() < deadline) {
+    int fd = net::Dial(mds_ep, 2000, 2000);
+    if (fd >= 0) {
+      char pre[kReqPrefix];
+      EncodeReq(pre, WireOp::kListClients, BlockKey{}, 0, 0, group.size());
+      if (net::WriteAll(fd, pre, kReqPrefix) && net::WriteAll(fd, group.data(), group.size())) {
+        char rp[kRespPrefix]; Status st; uint64_t dlen = 0;
+        if (net::ReadAll(fd, rp, kRespPrefix) && DecodeResp(rp, &st, &dlen) && st == Status::kOk) {
+          std::string data(dlen, '\0');
+          if (dlen == 0 || net::ReadAll(fd, &data[0], dlen)) {
+            uint64_t e = 0;
+            DecodeMembers(data.data(), data.size(), &cs, &e);
+          }
+        }
+      }
+      ::close(fd);
+    }
+    if (cs.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  ASSERT_EQ(cs.size(), 1u);
+  EXPECT_EQ(cs[0].id, "conn-e2e");
+  EXPECT_EQ(cs[0].info, self.info);
+
+  c.StopClientRegistration();
+  mds.Stop();
 }

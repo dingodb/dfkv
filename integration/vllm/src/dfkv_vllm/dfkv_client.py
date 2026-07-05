@@ -62,6 +62,10 @@ class DfkvDeviceClient:
         mds_endpoints: str = "",
         mds_group: str = "default",
         mds_poll_ms: int = 3000,
+        client_register: bool = True,
+        client_id: str = "",
+        client_info: str = "",
+        client_heartbeat_ms: int = 10000,
     ):
         if len(geometry) != 8:
             raise ValueError("geometry must have exactly 8 fields")
@@ -92,6 +96,26 @@ class DfkvDeviceClient:
                     f"dfkv_start_mds_discovery failed (rc={rc}, "
                     f"mds={mds_endpoints!r}, group={mds_group!r})"
                 )
+            # Register this connector as a cache consumer so `dfkvctl clients` can
+            # answer "who is using dfkv". Best-effort: a missing symbol (older
+            # libdfkv.so) or a registration failure is logged, never fatal — the
+            # data path is already up via discovery above. Default on; opt out with
+            # client_register=False / DFKV_CLIENT_REGISTER=0.
+            if client_register and client_id:
+                try:
+                    rc = self._lib.dfkv_start_client_registration(
+                        self._h, mds_endpoints.encode(), mds_group.encode(),
+                        client_id.encode(),
+                        (client_info or "").encode(), int(client_heartbeat_ms))
+                    if rc != 0:
+                        raise RuntimeError(f"rc={rc}")
+                except AttributeError:
+                    pass  # older libdfkv.so without the symbol — skip silently
+                except Exception as e:  # noqa: BLE001 — never block startup
+                    import warnings
+                    warnings.warn(
+                        f"dfkv client registration skipped (mds={mds_endpoints!r}): {e}",
+                        stacklevel=2)
         # Unified fleet metrics pushed over OTLP to the central Collector (off by
         # default; zero cost when DFKV_METRICS_ENABLED is unset). Env-driven so it
         # needs no connector plumbing: set DFKV_METRICS_ENABLED + OTEL_*. Report

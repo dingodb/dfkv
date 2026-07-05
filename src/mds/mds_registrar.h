@@ -19,10 +19,18 @@ namespace dfkv {
 // alive via periodic heartbeats. Uses MdsEndpoints for no-LB multi-endpoint
 // selection + failover. One background thread; steady_clock drives both the
 // endpoint backoff clock and the heartbeat cadence.
+//
+// With is_client=true the SAME agent registers a cache *consumer* (an inference
+// connector instance) under the /clients/<id> prefix instead of a cache node.
+// Only the wire op differs (kClientRegister/kClientHeartbeat vs kRegister/
+// kHeartbeat); lease/keepalive/failover logic is identical, so consumers get the
+// same lease-TTL auto-cleanup as nodes — a dead client's key expires out of etcd
+// within kTtlSeconds with no explicit deregister.
 class MdsRegistrar {
  public:
   MdsRegistrar(std::vector<std::string> mds_eps, std::string group, MemberInfo self,
-               int heartbeat_ms = 10000, int io_timeout_ms = 2000);
+               int heartbeat_ms = 10000, int io_timeout_ms = 2000,
+               bool is_client = false);
   ~MdsRegistrar();
 
   void Start();
@@ -49,6 +57,7 @@ class MdsRegistrar {
   StatsFn stats_fn_;
   int hb_ms_;
   int io_ms_;
+  bool is_client_;
   std::atomic<bool> running_{false};
   std::thread th_;
   std::mutex mu_;

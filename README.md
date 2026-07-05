@@ -55,6 +55,18 @@ peer that fails transport IO is short-circuited to miss for a cooldown period
 without any ring change. The legacy static path (`dfkv_open(members=...)` /
 `dfkv_set_members`) still exists for simple or single-node setups.
 
+**Client registration** (who is using dfkv): cache *consumers* (inference
+connector instances — vLLM / LMCache) register themselves with the MDS under a
+disjoint etcd prefix (`/dfkv/v1/groups/<g>/clients/<id>`) so they never enter the
+placement ring. The same lease/heartbeat contract as nodes applies — a dead
+connector's key expires out of etcd within the TTL, no explicit deregister, no
+stale keys. `dfkv_start_client_registration(c, mds, group, client_id, client_info,
+heartbeat_ms)` is the C entry point; the vLLM/LMCache connectors call it
+automatically when MDS discovery is in use (opt out with `DFKV_CLIENT_REGISTER=0`).
+Observe with `dfkvctl clients --mds <ep,...> --group <g>` or the
+`dfkv_mds_group_clients` gauge. Only upgraded clients register, so an empty list
+means "none of the current consumers are registered," not "no one is using dfkv."
+
 ## Build & test (no GPU / no RDMA needed)
 ```bash
 cmake -S . -B build            # add -DDFKV_STATIC_LIBSTDCXX=ON for portable binaries
@@ -78,8 +90,17 @@ dfkv_server --dir /mnt/disk1/dfkv,/mnt/disk2/dfkv,/mnt/disk3/dfkv \
 
 # 4. Client: MDS-based discovery (recommended)
 #    dfkv_start_mds_discovery(c, "10.0.0.1:9400,10.0.0.2:9400", "default", 3000);
+#    (connectors also auto-register as consumers; see "Client registration" above)
 # OR legacy static path (single-node / simple setups)
 #    dfkv_open("n1=10.0.0.10:12000,...", ...)
+```
+
+## Observe the cluster
+```bash
+dfkvctl ring    --mds 10.0.0.1:9400 --group default        # cache nodes + ring share
+dfkvctl clients --mds 10.0.0.1:9400 --group default        # inference consumers
+dfkvctl stats   --mds 10.0.0.1:9400 --group default        # ring stats + clients=N
+dfkvctl stat    --mds 10.0.0.1:9400 --group default --all  # per-node deep-dive
 ```
 Full dfkv CLUSTER deploy runbook (etcd + MDS + systemd units): `docs/DEPLOY.md`.
 Per-engine connect/config + client env/config reference (all connectors): `docs/CONNECTORS.md`.

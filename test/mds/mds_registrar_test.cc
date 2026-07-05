@@ -35,6 +35,36 @@ bool ListMembers(int port, const std::string& group, std::vector<MemberInfo>* ou
   return DecodeMembers(data.data(), data.size(), out, &epoch);
 }
 
+bool ListClients(int port, const std::string& group, std::vector<MemberInfo>* out) {
+  int fd = net::Dial("127.0.0.1:" + std::to_string(port), 2000, 2000);
+  if (fd < 0) return false;
+  char pre[kReqPrefix];
+  EncodeReq(pre, WireOp::kListClients, BlockKey{}, 0, 0, group.size());
+  bool ok = net::WriteAll(fd, pre, kReqPrefix) &&
+            (!group.empty() && net::WriteAll(fd, group.data(), group.size()));
+  std::string data;
+  if (ok) {
+    char rp[kRespPrefix]; Status st; uint64_t dlen = 0;
+    ok = net::ReadAll(fd, rp, kRespPrefix) && DecodeResp(rp, &st, &dlen) && st == Status::kOk;
+    if (ok) { data.resize(dlen); ok = (dlen == 0) || net::ReadAll(fd, &data[0], dlen); }
+  }
+  ::close(fd);
+  if (!ok) return false;
+  uint64_t epoch = 0;
+  return DecodeMembers(data.data(), data.size(), out, &epoch);
+}
+
+bool WaitForClient(int port, const std::string& group, const MemberInfo& m, int timeout_ms) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::vector<MemberInfo> cs;
+    if (ListClients(port, group, &cs))
+      for (auto& x : cs) if (x == m) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return false;
+}
+
 bool WaitForMember(int port, const std::string& group, const MemberInfo& m, int timeout_ms) {
   auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   while (std::chrono::steady_clock::now() < deadline) {
@@ -92,6 +122,51 @@ TEST(MdsRegistrar, BackgroundLoopRegistersAndKeepsAlive) {
   MdsRegistrar reg({"127.0.0.1:" + std::to_string(mds.port())}, group, self, /*hb_ms=*/200);
   reg.Start();
   EXPECT_TRUE(WaitForMember(mds.port(), group, self, /*timeout_ms=*/5000));
+  reg.Stop();
+  mds.Stop();
+}
+
+// ---- Client (consumer) registration via is_client=true ----------------------
+// The SAME MdsRegistrar, with is_client=true, must register under /clients/ and
+// keep the lease alive — inheriting the lease-TTL auto-cleanup contract for free.
+
+TEST(MdsRegistrar, ClientRegistrarRegistersVisibleUnderClientsPrefix) {
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  std::string group = "cli-grp-" + std::to_string(mds.port());
+  MemberInfo self{"conn-x", "0.0.0.0", 0, 0, 0,
+                  "type=vllm,model=glm51,role=kv_producer,tp_size=8,tp_rank=0"};
+  MdsRegistrar reg({"127.0.0.1:" + std::to_string(mds.port())}, group, self,
+                   /*hb_ms=*/10000, /*io_ms=*/2000, /*is_client=*/true);
+  ASSERT_TRUE(reg.RegisterOnce());
+  ASSERT_TRUE(reg.HeartbeatOnce());
+
+  std::vector<MemberInfo> cs;
+  ASSERT_TRUE(ListClients(mds.port(), group, &cs));
+  ASSERT_EQ(cs.size(), 1u);
+  EXPECT_EQ(cs[0], self);
+  EXPECT_EQ(cs[0].info, self.info);
+
+  // Must NOT leak into the member ring.
+  std::vector<MemberInfo> ms;
+  ASSERT_TRUE(ListMembers(mds.port(), group, &ms));
+  EXPECT_TRUE(ms.empty());
+  mds.Stop();
+}
+
+TEST(MdsRegistrar, ClientBackgroundLoopKeepsAlive) {
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  std::string group = "cli-bg-" + std::to_string(mds.port());
+  MemberInfo self{"conn-bg", "0.0.0.0", 0, 0, 0, "type=vllm"};
+  MdsRegistrar reg({"127.0.0.1:" + std::to_string(mds.port())}, group, self,
+                   /*hb_ms=*/200, /*io_ms=*/2000, /*is_client=*/true);
+  reg.Start();
+  EXPECT_TRUE(WaitForClient(mds.port(), group, self, /*timeout_ms=*/5000));
   reg.Stop();
   mds.Stop();
 }

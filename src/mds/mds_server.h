@@ -41,7 +41,6 @@ class MdsServer {
   // joined). Feeds `dfkvctl stats --all`.
   Status ListGroups(std::string* out);
   size_t live_conn_count();  // handler threads not yet reaped (test/diagnostic)
-
   // One read against etcd (a bounded RangePrefix on a probe key). Returns true
   // iff etcd answered. Used at startup to fail loud on a misconfigured --etcd
   // (a wrong endpoint/scheme otherwise runs "healthy" while every registration
@@ -56,7 +55,18 @@ class MdsServer {
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   Status Upsert(const std::string& group, const MemberInfo& m);
   Status ListMembers(const std::string& group, std::string* out);
+  // Client (consumer) registration — same lease/keepalive contract as Upsert/
+  // ListMembers but under a disjoint etcd prefix (/clients/<id> vs /members/<id>)
+  // so consumers never enter the placement ring. A consumer carries no data-path
+  // port or stats; it is pure identity ("who is using dfkv").
+  Status UpsertClient(const std::string& group, const MemberInfo& m);
+  Status ListClients(const std::string& group, std::string* out);
+  // Shared by Upsert/UpsertClient: lease keepalive + re-Put under the lock-free
+  // pattern. Callers pass the right etcd key + the matching {key->lease} map+mu.
+  Status UpsertLeased(const std::string& key, const MemberInfo& m,
+                      std::map<std::string, int64_t>& leases, std::mutex& mu);
   static std::string MemberKey(const std::string& group, const std::string& id);
+  static std::string ClientKey(const std::string& group, const std::string& id);
 
   TcpHttpTransport http_;
   EtcdClient etcd_;
@@ -73,6 +83,8 @@ class MdsServer {
   std::vector<Conn> conns_;
   std::mutex lease_mu_;
   std::map<std::string, int64_t> leases_;
+  std::mutex client_lease_mu_;
+  std::map<std::string, int64_t> client_leases_;  // mirrors leases_ for /clients/
   MdsMetrics metrics_;
 };
 

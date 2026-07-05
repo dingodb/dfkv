@@ -22,7 +22,13 @@ namespace dfkv {
 enum class WireOp : uint8_t {
   kCache = 1, kRange = 2, kExist = 3, kStats = 4, kMembers = 5,
   kRegister = 6, kHeartbeat = 7, kListMembers = 8, kRemove = 9,
-  kListGroups = 10  // MDS: newline-joined distinct group names (dfkvctl stats --all)
+  kListGroups = 10,  // MDS: newline-joined distinct group names (dfkvctl stats --all)
+  // Client registration (mirrors kRegister/kHeartbeat/kListMembers but for cache
+  // *consumers* — inference instances — so the MDS can surface "who is using dfkv"
+  // via `dfkvctl clients` + the dfkv_mds_group_clients gauge). Same payload framing
+  // (group + MemberInfo) and lease semantics; only the etcd key prefix differs
+  // (/clients/<id> vs /members/<id>), so clients never pollute the placement ring.
+  kClientRegister = 11, kClientHeartbeat = 12, kListClients = 13
 };
 
 constexpr uint8_t kProtoVersion = 1;

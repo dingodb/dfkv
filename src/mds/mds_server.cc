@@ -21,6 +21,10 @@ std::string MdsServer::MemberKey(const std::string& group, const std::string& id
   return "/dfkv/v1/groups/" + group + "/members/" + id;
 }
 
+std::string MdsServer::ClientKey(const std::string& group, const std::string& id) {
+  return "/dfkv/v1/groups/" + group + "/clients/" + id;
+}
+
 Status MdsServer::Start(int port) {
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) return Status::kIOError;
@@ -105,7 +109,24 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
   // Reject before the id/group reach the etcd key: an unrestricted token can
   // contain '/' and escape its own key subtree (phantom-member injection).
   if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
-  std::string key = MemberKey(group, m.id);
+  return UpsertLeased(MemberKey(group, m.id), m, leases_, lease_mu_);
+}
+
+Status MdsServer::UpsertClient(const std::string& group, const MemberInfo& m) {
+  // Same path-traversal guard as Upsert; clients live under a parallel prefix
+  // (/clients/<id>) so a malformed id can't escape into /members/ either.
+  if (!IsValidGroupOrId(group) || !IsValidGroupOrId(m.id)) return Status::kInvalid;
+  return UpsertLeased(ClientKey(group, m.id), m, client_leases_, client_lease_mu_);
+}
+
+// Shared lease keepalive + re-Put for both members and clients. The two maps
+// are identical in shape; only the etcd key prefix differs. Keeping one
+// implementation guarantees the client path inherits the lease-drift fix
+// (every heartbeat re-Puts the value under the registrar's own lease -- see
+// the long comment in the former Upsert below).
+Status MdsServer::UpsertLeased(const std::string& key, const MemberInfo& m,
+                               std::map<std::string, int64_t>& leases,
+                               std::mutex& mu) {
   std::string val = EncodeMembers({m}, 0);
   // Look up this member's known lease under the lock, then do the BLOCKING etcd
   // calls OUTSIDE it. Previously lease_mu_ was held across LeaseKeepAlive/Grant/Put,
@@ -115,9 +136,9 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
   int64_t existing = 0;
   bool have = false;
   {
-    std::lock_guard<std::mutex> lk(lease_mu_);
-    auto it = leases_.find(key);
-    if (it != leases_.end()) { existing = it->second; have = true; }
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = leases.find(key);
+    if (it != leases.end()) { existing = it->second; have = true; }
   }
   // Fast path: refresh the lease AND re-write the key under it. The Put is
   // load-bearing, not redundant: with several MDS instances behind a rotating
@@ -143,8 +164,8 @@ Status MdsServer::Upsert(const std::string& group, const MemberInfo& m) {
   metrics_.lease_grants.fetch_add(1, std::memory_order_relaxed);
   if (!etcd_.Put(key, val, *lid)) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
   {
-    std::lock_guard<std::mutex> lk(lease_mu_);
-    leases_[key] = *lid;
+    std::lock_guard<std::mutex> lk(mu);
+    leases[key] = *lid;
   }
   return Status::kOk;
 }
@@ -170,6 +191,29 @@ Status MdsServer::ListMembers(const std::string& group, std::string* out) {
   // group's membership content changes.
   metrics_.members_last_list.store(members.size(), std::memory_order_relaxed);
   *out = EncodeMembers(members, MembersEpoch(members));
+  return Status::kOk;
+}
+
+Status MdsServer::ListClients(const std::string& group, std::string* out) {
+  metrics_.client_list_requests.fetch_add(1, std::memory_order_relaxed);
+  // Same path-traversal guard as ListMembers: a malformed group would build a
+  // RangePrefix straddling other groups' client subtrees.
+  if (!IsValidGroupOrId(group)) return Status::kInvalid;
+  std::string prefix = "/dfkv/v1/groups/" + group + "/clients/";
+  auto r = etcd_.RangePrefix(prefix);
+  if (!r) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return Status::kIOError; }
+  std::vector<MemberInfo> clients;
+  for (const auto& kv : r->kvs) {
+    std::vector<MemberInfo> one;
+    uint64_t e = 0;
+    if (DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) && one.size() == 1)
+      clients.push_back(one[0]);
+  }
+  // Clients carry no placement semantics, so the epoch is a content hash over the
+  // identity set only — `dfkvctl clients` re-fetches every run, so a changing
+  // epoch need not (and cannot) trigger any ring rebuild.
+  metrics_.clients_last_list.store(clients.size(), std::memory_order_relaxed);
+  *out = EncodeMembers(clients, MembersEpoch(clients));
   return Status::kOk;
 }
 
@@ -199,7 +243,7 @@ std::string MdsServer::GroupMetricsText() {
   auto r = etcd_.RangePrefix("/dfkv/v1/groups/");
   if (!r) { metrics_.etcd_errors.fetch_add(1, std::memory_order_relaxed); return ""; }
   struct Agg {
-    uint64_t nodes = 0, missing = 0;
+    uint64_t nodes = 0, missing = 0, clients = 0;
     MemberStats sum;
     std::map<std::string, int> vers;  // version skew, from info "ver="
   };
@@ -209,6 +253,14 @@ std::string MdsServer::GroupMetricsText() {
     const size_t slash = kv.first.find('/', base);
     if (kv.first.size() <= base || slash == std::string::npos) continue;
     Agg& a = groups[kv.first.substr(base, slash - base)];
+    // Distinguish /members/<id> (placement ring) from /clients/<id> (consumers).
+    // A client key carries identity only (no port/stats); it must NOT inflate the
+    // ring node count, the capacity/hit aggregates, or the version-skew set —
+    // otherwise a fleet of connectors would silently corrupt every group metric.
+    const size_t seg2 = kv.first.find('/', slash + 1);
+    const std::string kind = (seg2 == std::string::npos)
+        ? std::string() : kv.first.substr(slash + 1, seg2 - slash - 1);
+    if (kind == "clients") { a.clients++; continue; }
     std::vector<MemberInfo> one;
     uint64_t e = 0;
     if (!DecodeMembers(kv.second.data(), kv.second.size(), &one, &e) || one.size() != 1)
@@ -275,6 +327,11 @@ std::string MdsServer::GroupMetricsText() {
   for (auto& [g, a] : groups) line("dfkv_mds_group_stats_missing", g, a.missing);
   emit("dfkv_mds_group_version_skew", "Distinct member versions per group (>1 = drift)");
   for (auto& [g, a] : groups) line("dfkv_mds_group_version_skew", g, a.vers.size());
+  // Registered cache consumers (inference connector instances) per group. A
+  // gauge under the lease TTL: a connector that dies stops heartbeating and its
+  // /clients/<id> key expires out of etcd within ~kTtlSeconds.
+  emit("dfkv_mds_group_clients", "Registered client (consumer) instances per group");
+  for (auto& [g, a] : groups) line("dfkv_mds_group_clients", g, a.clients);
   return s;
 }
 
@@ -301,9 +358,24 @@ void MdsServer::Handle(int fd) {
       MemberInfo m;
       if (DecodeMemberReq(payload.data(), rq.payload_len, &group, &m))
         st = Upsert(group, m);
+    } else if (op == WireOp::kClientRegister || op == WireOp::kClientHeartbeat) {
+      if (op == WireOp::kClientRegister)
+        metrics_.client_register_requests.fetch_add(1, std::memory_order_relaxed);
+      else
+        metrics_.client_keepalives.fetch_add(1, std::memory_order_relaxed);
+      // Same payload (group + MemberInfo) as member registration; only the etcd
+      // prefix differs. A client's ip/port/weight are identity-only and carry no
+      // placement meaning (UpsertClient writes /clients/<id>, never the ring).
+      std::string group;
+      MemberInfo m;
+      if (DecodeMemberReq(payload.data(), rq.payload_len, &group, &m))
+        st = UpsertClient(group, m);
     } else if (op == WireOp::kListMembers) {
       std::string group(payload.data(), rq.payload_len);
       st = ListMembers(group, &data);
+    } else if (op == WireOp::kListClients) {
+      std::string group(payload.data(), rq.payload_len);
+      st = ListClients(group, &data);
     } else if (op == WireOp::kListGroups) {
       st = ListGroups(&data);
     }

@@ -47,6 +47,17 @@ int dfkv_refresh_members(dfkv_client_t c, const char* seed);
 // poll_ms: poll interval (default 3000 if <= 0). Returns 0 on success.
 int dfkv_start_mds_discovery(dfkv_client_t c, const char* mds_endpoints,
                              const char* group, int poll_ms);
+// Register this client (a cache consumer / inference instance) with the MDS so
+// `dfkvctl clients` can list it. client_id: stable instance id (e.g.
+// "host:pid:tp_rank"); client_info: optional "k=v,k=v" identity string
+// (type/model/role/tp_size/tp_rank/ver/host) surfaced by the CLI. The MDS leases
+// a /clients/<id> key; process death expires it within the MDS TTL (no
+// deregister needed). Best-effort: registration runs in a background thread and
+// never blocks the data path. heartbeat_ms <= 0 defaults to 10000. Returns 0 on
+// success, non-zero on bad args.
+int dfkv_start_client_registration(dfkv_client_t c, const char* mds_endpoints,
+                                   const char* group, const char* client_id,
+                                   const char* client_info, int heartbeat_ms);
 
 // Actual client transport selected at dfkv_open(), e.g. "rdma",
 // "tcp(rdma-not-requested)", or "injected". Returns "" for null clients.

@@ -255,3 +255,133 @@ TEST(MdsServer, StatsFlowThroughEtcdAndAggregateInMetrics) {
   ASSERT_EQ(st, Status::kOk);
   EXPECT_NE(data.find(group), std::string::npos);
 }
+
+// ---- Client (consumer) registration -----------------------------------------
+// Clients register under /clients/<id> with the SAME payload (group + MemberInfo)
+// as members, but the MDS writes a disjoint etcd prefix so they never enter the
+// placement ring. These tests pin that contract: register/list round-trip,
+// heartbeat refresh, isolation from ListMembers, path-traversal rejection, and
+// the per-group clients gauge.
+
+TEST(MdsServer, ClientRegisterThenListRoundTripsThroughEtcd) {
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  int port = mds.port();
+  std::string group = "itest-cli-" + std::to_string(port);
+
+  // A consumer's ip/port/weight carry no placement meaning; only id + info
+  // (identity) are load-bearing.
+  MemberInfo a{"ca", "0.0.0.0", 0, 0, 0, "type=vllm,model=glm51,role=kv_producer,tp_size=8"};
+  MemberInfo b{"cb", "0.0.0.0", 0, 0, 0, "type=lmcache,model=glm51,role=kv_consumer,tp_size=8"};
+  Status st; std::string data;
+  ASSERT_TRUE(DoReq(port, WireOp::kClientRegister, EncodeMemberReq(group, a), &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+  ASSERT_TRUE(DoReq(port, WireOp::kClientRegister, EncodeMemberReq(group, b), &st, &data));
+  EXPECT_EQ(st, Status::kOk);
+
+  ASSERT_TRUE(DoReq(port, WireOp::kListClients, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  std::vector<MemberInfo> got; uint64_t epoch = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &got, &epoch));
+  EXPECT_GT(epoch, 0u);
+  ASSERT_EQ(got.size(), 2u);
+  bool sawA = false, sawB = false;
+  for (auto& c : got) { if (c == a) sawA = true; if (c == b) sawB = true; }
+  EXPECT_TRUE(sawA); EXPECT_TRUE(sawB);
+  // info (identity) must round-trip — `dfkvctl clients` parses it.
+  for (auto& c : got) EXPECT_FALSE(c.info.empty());
+  mds.Stop();
+}
+
+TEST(MdsServer, ClientKeyDoesNotPolluteMembers) {
+  // The whole point of the separate prefix: registering a client must NOT make
+  // it appear in ListMembers (the placement ring), nor inflate group_nodes.
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  int port = mds.port();
+  std::string group = "itest-iso-" + std::to_string(port);
+
+  MemberInfo c{"c1", "0.0.0.0", 0, 0, 0, "type=vllm"};
+  Status st; std::string data;
+  ASSERT_TRUE(DoReq(port, WireOp::kClientRegister, EncodeMemberReq(group, c), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+
+  ASSERT_TRUE(DoReq(port, WireOp::kListMembers, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  std::vector<MemberInfo> members; uint64_t e = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &members, &e));
+  EXPECT_TRUE(members.empty()) << "client must not appear in the placement ring";
+
+  // The clients gauge counts it, but group_nodes stays 0.
+  const std::string mt = mds.MetricsText();
+  EXPECT_NE(mt.find("dfkv_mds_group_clients{group=\"" + group + "\"} 1"),
+            std::string::npos) << mt;
+  EXPECT_NE(mt.find("dfkv_mds_group_nodes{group=\"" + group + "\"} 0"),
+            std::string::npos) << mt;
+  mds.Stop();
+}
+
+TEST(MdsServer, ClientHeartbeatRewritesInfo) {
+  // Mirrors HeartbeatRewritesMemberValueUnderOwnLease: a heartbeat with changed
+  // identity info must re-put the value (the lease-drift fix applies to clients
+  // too, since UpsertClient shares UpsertLeased).
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  int port = mds.port();
+  std::string group = "itest-cli-hb-" + std::to_string(port);
+
+  MemberInfo c{"ch", "0.0.0.0", 0, 0, 0, "type=vllm,ver=1.0"};
+  Status st; std::string data;
+  ASSERT_TRUE(DoReq(port, WireOp::kClientRegister, EncodeMemberReq(group, c), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+
+  c.info = "type=vllm,ver=2.0";  // connector upgraded within the TTL
+  ASSERT_TRUE(DoReq(port, WireOp::kClientHeartbeat, EncodeMemberReq(group, c), &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+
+  ASSERT_TRUE(DoReq(port, WireOp::kListClients, group, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  std::vector<MemberInfo> got; uint64_t e = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &got, &e));
+  ASSERT_EQ(got.size(), 1u);
+  EXPECT_EQ(got[0].info, "type=vllm,ver=2.0") << "heartbeat must refresh client info";
+  mds.Stop();
+}
+
+TEST(MdsServer, ClientRejectsPathTraversalGroupAndId) {
+  // A malicious client must not inject keys into another group's /clients/ (or
+  // /members/) subtree via a '/' in group or id. Same guard as member registration.
+  const char* ep = EtcdEp();
+  if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port";
+  MdsServer mds(ep);
+  ASSERT_EQ(mds.Start(0), Status::kOk);
+  int port = mds.port();
+  Status st; std::string data;
+  std::string victim = "vcli-" + std::to_string(port);
+
+  MemberInfo ghost{"ghost", "0.0.0.0", 0, 0, 0, "type=vllm"};
+  std::string evil_group = victim + "/clients/x/clients";
+  ASSERT_TRUE(DoReq(port, WireOp::kClientRegister, EncodeMemberReq(evil_group, ghost),
+                    &st, &data));
+  EXPECT_EQ(st, Status::kInvalid);
+
+  MemberInfo m{"a/clients/x", "0.0.0.0", 0, 0, 0, "type=vllm"};
+  ASSERT_TRUE(DoReq(port, WireOp::kClientRegister, EncodeMemberReq(victim, m), &st, &data));
+  EXPECT_EQ(st, Status::kInvalid);
+
+  ASSERT_TRUE(DoReq(port, WireOp::kListClients, victim, &st, &data));
+  ASSERT_EQ(st, Status::kOk);
+  std::vector<MemberInfo> got; uint64_t e = 0;
+  ASSERT_TRUE(DecodeMembers(data.data(), data.size(), &got, &e));
+  EXPECT_TRUE(got.empty()) << "no phantom client injected";
+
+  ASSERT_TRUE(DoReq(port, WireOp::kListClients, "a/b", &st, &data));
+  EXPECT_EQ(st, Status::kInvalid);
+  mds.Stop();
+}

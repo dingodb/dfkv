@@ -15,12 +15,14 @@
 namespace dfkv {
 
 MdsRegistrar::MdsRegistrar(std::vector<std::string> mds_eps, std::string group,
-                           MemberInfo self, int heartbeat_ms, int io_timeout_ms)
+                           MemberInfo self, int heartbeat_ms, int io_timeout_ms,
+                           bool is_client)
     : eps_(std::move(mds_eps)),
       group_(std::move(group)),
       self_(std::move(self)),
       hb_ms_(heartbeat_ms),
-      io_ms_(io_timeout_ms) {}
+      io_ms_(io_timeout_ms),
+      is_client_(is_client) {}
 
 MdsRegistrar::~MdsRegistrar() { Stop(); }
 
@@ -62,8 +64,14 @@ bool MdsRegistrar::SendOnce(uint8_t op) {
   return ok;
 }
 
-bool MdsRegistrar::RegisterOnce() { return SendOnce(static_cast<uint8_t>(WireOp::kRegister)); }
-bool MdsRegistrar::HeartbeatOnce() { return SendOnce(static_cast<uint8_t>(WireOp::kHeartbeat)); }
+bool MdsRegistrar::RegisterOnce() {
+  return SendOnce(static_cast<uint8_t>(is_client_ ? WireOp::kClientRegister
+                                                   : WireOp::kRegister));
+}
+bool MdsRegistrar::HeartbeatOnce() {
+  return SendOnce(static_cast<uint8_t>(is_client_ ? WireOp::kClientHeartbeat
+                                                   : WireOp::kHeartbeat));
+}
 
 bool MdsRegistrar::WaitMs(int ms) {
   std::unique_lock<std::mutex> lk(mu_);
@@ -72,13 +80,17 @@ bool MdsRegistrar::WaitMs(int ms) {
 }
 
 void MdsRegistrar::Loop() {
+  const uint8_t reg_op = static_cast<uint8_t>(is_client_ ? WireOp::kClientRegister
+                                                          : WireOp::kRegister);
+  const uint8_t hb_op = static_cast<uint8_t>(is_client_ ? WireOp::kClientHeartbeat
+                                                         : WireOp::kHeartbeat);
   while (running_.load()) {
-    if (SendOnce(static_cast<uint8_t>(WireOp::kRegister))) break;
+    if (SendOnce(reg_op)) break;
     if (WaitMs(1000)) return;
   }
   while (running_.load()) {
     if (WaitMs(hb_ms_)) return;
-    SendOnce(static_cast<uint8_t>(WireOp::kHeartbeat));
+    SendOnce(hb_op);
   }
 }
 
