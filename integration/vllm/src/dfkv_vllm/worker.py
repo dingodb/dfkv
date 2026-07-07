@@ -845,12 +845,25 @@ class DfkvStoreWorker:
                 f"role={self.kv_role},tp_size={self.tp_size},"
                 f"tp_rank={self.tp_rank},ver={_tcfg.dist_version('dfkv-vllm')}"
             )
+        # model_hash config is a free-form label (a model version/tag), folded
+        # with the served model name into the uint64 the dfkv client isolates by:
+        # md5(model_name || label). Any string is accepted (no startup crash on a
+        # non-numeric value), it self-disambiguates across models, and it stays
+        # deterministic so cross-instance/restart reuse lines up. See
+        # _tcfg.resolve_model_hash.
+        model_hash = _tcfg.resolve_model_hash(
+            self.metadata.model_name, extra.get("model_hash", "")
+        )
+        logger.info(
+            "dfkv model_hash: model=%s label=%r -> id=%d",
+            self.metadata.model_name, extra.get("model_hash", ""), model_hash,
+        )
         self.client = DfkvDeviceClient(
             members=extra.get("members", ""),
             mds_endpoints=mds_endpoints,
             mds_group=mds_group,
             mds_poll_ms=int(extra.get("mds_poll_ms", 3000)),
-            model_hash=int(extra.get("model_hash", 0)),
+            model_hash=model_hash,
             lib_path=extra.get("lib"),
             batch_concurrency=int(extra.get("batch_concurrency", 8)),
             client_register=client_register,

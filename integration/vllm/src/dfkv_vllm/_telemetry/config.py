@@ -8,9 +8,33 @@ the access log, the push-metrics layer and (later) tracing.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 from typing import Any, Optional
+
+
+def resolve_model_hash(model_name: str, raw: Any) -> int:
+    """Resolve the connector's ``model_hash`` config into the uint64 the dfkv
+    client keys/isolates by.
+
+    The config value is a free-form label (a model version/tag, e.g.
+    ``"glm-5.2-int4-fp8-v2"``) -- NOT a 64-bit integer the operator has to
+    hand-pick. It is folded together with the served model name into a stable
+    64-bit id: ``md5(model_name || label)[:8]`` (little-endian). This:
+
+    * makes misconfiguration safe -- any string is accepted, so a bad value can
+      never crash the engine at startup (the old ``int(...)`` did);
+    * self-disambiguates the namespace -- two different models that happen to
+      share a label still get distinct ids (model_name is part of the material);
+    * is deterministic across processes/hosts (md5, not the per-process-salted
+      built-in ``hash``), so cross-instance / cross-restart cache reuse lines up.
+
+    An empty/unset label isolates by ``model_name`` alone (still deterministic).
+    """
+    label = "" if raw is None else str(raw).strip()
+    material = f"{model_name}\x00{label}".encode("utf-8")
+    return int.from_bytes(hashlib.md5(material).digest()[:8], "little")
 
 # --- master switches (off by default => zero cost) -------------------------
 # Metrics push is on when DFKV_METRICS_ENABLED is truthy, OR the umbrella
