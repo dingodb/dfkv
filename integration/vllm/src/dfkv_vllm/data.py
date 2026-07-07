@@ -33,6 +33,19 @@ class KeyMetadata:
     dcp_rank: int
     pp_rank: int
     group_id: int = 0
+    # Embed model_hash in the on-wire key. The dfkv C client isolates GET/PUT by
+    # model_hash (stored in the ValueHeader) but EXIST checks key-presence only
+    # and ignores model_hash -- so a key stored under model_hash A is reported
+    # present when probed under model_hash B, while GET under B misses. The
+    # scheduler's lookup uses EXIST and the worker's load uses GET, so this
+    # inconsistency makes lookup a false positive: the request is scheduled to
+    # load blocks that GET then misses, gets flagged for recompute, and is
+    # rescheduled -- looping forever (never prefills/saves). Putting model_hash
+    # in the key makes EXIST/GET/PUT all operate on the SAME model-hash-scoped
+    # keyspace, so a different model_hash yields different keys and EXIST can no
+    # longer cross-match. Default 0 preserves the legacy key for callers that do
+    # not set it.
+    model_hash: int = 0
 
 
 @dataclass(order=True)
@@ -46,6 +59,7 @@ class PoolKey:
         return hash(
             (
                 self.key_metadata.model_name,
+                self.key_metadata.model_hash,
                 self.key_metadata.tp_rank,
                 self.key_metadata.pcp_rank,
                 self.key_metadata.dcp_rank,
@@ -58,6 +72,7 @@ class PoolKey:
     def to_string(self) -> str:
         return (
             f"{self.key_metadata.model_name}"
+            f"@mh:{self.key_metadata.model_hash}"
             f"@tp_rank:{self.key_metadata.tp_rank}"
             f"@pcp{self.key_metadata.pcp_rank}"
             f"@dcp{self.key_metadata.dcp_rank}"

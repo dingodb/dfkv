@@ -813,6 +813,15 @@ class DfkvStoreWorker:
 
         self.metadata = KeyMetadata(
             model_name=model_config.model.rstrip("/").split("/")[-1],
+            # Scope the on-wire key by model_hash: the dfkv EXIST op ignores
+            # model_hash (only GET/PUT honor it via the ValueHeader), so without
+            # this the scheduler's EXIST-based lookup cross-matches another
+            # model_hash's keys and loops forever on GET misses. See KeyMetadata.
+            model_hash=int(
+                vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+                    "model_hash", 0
+                )
+            ),
             tp_rank=self.head_or_tp_rank,
             pcp_rank=self.pcp_rank,
             dcp_rank=self.dcp_rank,
