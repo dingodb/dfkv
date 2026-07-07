@@ -28,11 +28,41 @@ namespace dfkv {
 // Identity-only size constant. Real payload length lives in the value header.
 inline constexpr uint32_t kKvFixedSize = 1;
 
-inline BlockKey ToBlockKey(const std::string& key) {
+// model_hash is folded into the block identity so EXIST/GET/PUT/REMOVE are all
+// scoped by model_hash at the key layer. EXIST is a pure server-side key-
+// presence check that never reads the value header, so without this it cross-
+// matches another model_hash's key (same model_name+content) as present, while
+// GET -- which compares the header's model_hash client-side -- misses. That
+// EXIST-present/GET-miss split makes the scheduler's lookup a false positive:
+// the request is scheduled to load blocks that GET then misses, the blocks are
+// flagged for recompute, the request is rescheduled, lookup reports present
+// again -> it loops forever and never prefills/saves. Salting the identity hash
+// with model_hash makes a different model_hash yield a different BlockKey that
+// EXIST can no longer cross-match. Routing (a separate hash over the raw key)
+// is unchanged, so same-content pages still land on the same node -- only the
+// stored/probed identity differs. A mixed old/new-lib fleet cross-misses once
+// (clean cache warm-up, never corruption), same as the id/index change above.
+inline BlockKey ToBlockKey(const std::string& key, uint64_t model_hash = 0) {
   uint8_t d[16];
-  Md5(key.data(), key.size(), d);  // one hash; split into id + index
+  if (model_hash == 0) {
+    // Legacy / shared keyspace (model_hash==0 == "no isolation"): hash the raw
+    // key so id stays byte-identical to the old library -- existing data and a
+    // mixed old/new fleet are unaffected.
+    Md5(key.data(), key.size(), d);
+  } else {
+    // Isolated keyspace: salt the identity hash with model_hash (LE) so a
+    // different model_hash yields a different BlockKey (see note above). Only
+    // non-zero (i.e. explicitly-set) model_hashes -- the ones that were buggy --
+    // change key; their old data re-warms once, never corrupts.
+    std::string salted;
+    salted.reserve(sizeof(model_hash) + key.size());
+    for (int i = 0; i < 8; ++i)
+      salted.push_back(static_cast<char>(model_hash >> (8 * i)));
+    salted.append(key);
+    Md5(salted.data(), salted.size(), d);
+  }
   uint64_t id = 0;
-  for (int i = 0; i < 8; ++i) id |= uint64_t(d[i]) << (8 * i);         // bytes 0..7 (== Md5_64)
+  for (int i = 0; i < 8; ++i) id |= uint64_t(d[i]) << (8 * i);         // bytes 0..7
   uint32_t index = uint32_t(d[8]) | (uint32_t(d[9]) << 8) |
                    (uint32_t(d[10]) << 16) | (uint32_t(d[11]) << 24);   // bytes 8..11
   return BlockKey{id, index, kKvFixedSize};

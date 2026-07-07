@@ -170,7 +170,7 @@ TEST_F(KVClientTest, PayloadCorruptionNotDetectedAfterV3) {
   std::string v(1024, 'y');
   ASSERT_TRUE(c.Put("k_crc", v.data(), v.size()));
   // corrupt a payload byte on disk (after the 48B header)
-  BlockKey bk = ToBlockKey("k_crc");
+  BlockKey bk = ToBlockKey("k_crc", 0x51ULL);
   fs::path f = nodes_[0]->dir / bk.StoreKey();
   ASSERT_TRUE(fs::exists(f));
   { std::fstream io(f, std::ios::in | std::ios::out | std::ios::binary);

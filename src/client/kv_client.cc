@@ -151,7 +151,7 @@ void KVClient::StopProbe() {
 void KVClient::ProbeLoop() {
   // A sentinel key that no real workload writes; kExist of it is a cheap round
   // trip that measures the node's responsiveness (kNotFound is a healthy reply).
-  const BlockKey probe = ToBlockKey("__dfkv_probe__");
+  const BlockKey probe = ToBlockKey("__dfkv_probe__", self_hdr_.model_hash);
   while (probe_running_.load(std::memory_order_relaxed)) {
     std::vector<std::string> addrs;
     {
@@ -246,7 +246,7 @@ bool KVClient::Put(const std::string& key, const void* value, size_t n) {
 
   ValueHeader h = self_hdr_;
   h.payload_len = n;  // geometry comes from self_hdr_; no payload checksum (v3)
-  BlockKey bk = ToBlockKey(key);
+  BlockKey bk = ToBlockKey(key, self_hdr_.model_hash);
   Status st;
   if (t_->pipelined()) {
     // Zero copy: build only the 48B header, scatter-send [header|value] with the
@@ -279,7 +279,7 @@ bool KVClient::Get(const std::string& key, void* out, size_t n) {
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
 
-  BlockKey bk = ToBlockKey(key);
+  BlockKey bk = ToBlockKey(key, self_hdr_.model_hash);
   if (t_->pipelined()) {
     // Zero copy AND zero touch: the payload scatters straight into `out` and the
     // CPU never reads it; only the 48B header comes back (hdrs[0]) for geometry verify.
@@ -327,7 +327,7 @@ bool KVClient::GetAuto(const std::string& key, std::string* out, size_t max_byte
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  BlockKey bk = ToBlockKey(key);
+  BlockKey bk = ToBlockKey(key, self_hdr_.model_hash);
 
   if (t_->pipelined()) {
     // Zero-copy via RangeInto (a 1-element batch), matching Get(): the payload
@@ -377,7 +377,7 @@ bool KVClient::GetAuto(const std::string& key, void* out, size_t cap, size_t* ou
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  BlockKey bk = ToBlockKey(key);
+  BlockKey bk = ToBlockKey(key, self_hdr_.model_hash);
 
   if (t_->pipelined()) {
     // Zero-copy: the payload scatters straight into the caller's buffer and the
@@ -425,7 +425,7 @@ bool KVClient::Exist(const std::string& key) {
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
   bool e = false;
-  Status st = t_->Exist(node, ToBlockKey(key), &e);
+  Status st = t_->Exist(node, ToBlockKey(key, self_hdr_.model_hash), &e);
   // Fresh clock: `now` was taken before a round trip that can burn the whole
   // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
   if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
@@ -440,7 +440,7 @@ bool KVClient::Remove(const std::string& key) {
   if (node.empty()) return false;
   uint64_t now = NowMs();
   if (!health_.Healthy(node, now)) return false;
-  Status st = t_->Remove(node, ToBlockKey(key));
+  Status st = t_->Remove(node, ToBlockKey(key, self_hdr_.model_hash));
   // Fresh clock: `now` was taken before a round trip that can burn the whole
   // io_timeout, which would shorten (or void) the cooldown this MarkBad sets.
   if (st == Status::kIOError) { health_.MarkBad(node, NowMs()); return false; }
@@ -483,7 +483,7 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
     std::vector<CacheSrc> srcs;
     srcs.reserve(idx.size());
     for (size_t k : idx)
-      srcs.push_back(CacheSrc{ToBlockKey(items[k].key), hdrs[k].data(),
+      srcs.push_back(CacheSrc{ToBlockKey(items[k].key, self_hdr_.model_hash), hdrs[k].data(),
                               ValueHeader::kSize, items[k].value, items[k].n});
     std::vector<Status> sts = t_->CacheFrom(node, srcs);
     for (size_t m = 0; m < idx.size(); ++m) ok[idx[m]] = (sts[m] == Status::kOk) ? 1 : 0;
@@ -531,7 +531,7 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     keys.reserve(idx.size());
     dsts.reserve(idx.size());
     for (size_t k : idx) {
-      keys.push_back(ToBlockKey(items[k].key));
+      keys.push_back(ToBlockKey(items[k].key, self_hdr_.model_hash));
       dsts.push_back(RangeDst{items[k].out, n});
     }
     // Zero-copy + zero-touch: the payload lands straight in items[].out (CPU never
@@ -595,7 +595,7 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
     keys.reserve(idx.size());
     dsts.reserve(idx.size());
     for (size_t k : idx) {
-      keys.push_back(ToBlockKey(items[k].key));
+      keys.push_back(ToBlockKey(items[k].key, self_hdr_.model_hash));
       dsts.push_back(RangeDst{items[k].out, cap});
     }
     std::vector<std::string> hdrs;
@@ -651,7 +651,7 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
     const std::vector<size_t>& idx = groups[g].second;
     std::vector<BlockKey> bkeys;
     bkeys.reserve(idx.size());
-    for (size_t k : idx) bkeys.push_back(ToBlockKey(keys[k]));
+    for (size_t k : idx) bkeys.push_back(ToBlockKey(keys[k], self_hdr_.model_hash));
     std::vector<char> ex;
     std::vector<Status> sts = t_->ExistMany(node, bkeys, &ex);
     bool resp = false, ioerr = false;
@@ -692,7 +692,7 @@ std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
     const std::vector<size_t>& idx = groups[g].second;
     std::vector<BlockKey> bkeys;
     bkeys.reserve(idx.size());
-    for (size_t k : idx) bkeys.push_back(ToBlockKey(keys[k]));
+    for (size_t k : idx) bkeys.push_back(ToBlockKey(keys[k], self_hdr_.model_hash));
     std::vector<Status> sts = t_->RemoveMany(node, bkeys);
     bool resp = false, ioerr = false;
     // kInvalid (oversize/per-item guard) is neither: it must not clear the
@@ -751,7 +751,7 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     srcs.reserve(idx.size());
     for (size_t k : idx) {
       CacheSrcMulti s;
-      s.key = ToBlockKey(items[k].key);
+      s.key = ToBlockKey(items[k].key, self_hdr_.model_hash);
       s.header = hdrs[k].data();
       s.header_len = ValueHeader::kSize;
       s.payloads.reserve(items[k].ptrs.size());
@@ -814,7 +814,7 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
     keys.reserve(idx.size());
     dsts.reserve(idx.size());
     for (size_t k : idx) {
-      keys.push_back(ToBlockKey(items[k].key));
+      keys.push_back(ToBlockKey(items[k].key, self_hdr_.model_hash));
       RangeDstMulti d;
       d.payloads.reserve(items[k].dsts.size());
       for (size_t j = 0; j < items[k].dsts.size(); ++j)

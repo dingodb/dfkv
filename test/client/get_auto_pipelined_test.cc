@@ -83,7 +83,7 @@ TEST(GetAutoPipelined, VoidBufferUsesRangeIntoNotRange) {
   FakePipelinedTransport t;
   KVClient c = MakeClient(&t);
   std::string v(1234, 'p');
-  t.blobs[ToBlockKey("kv").Filename()] = v;
+  t.blobs[ToBlockKey("kv", 0x51ULL).Filename()] = v;
 
   std::vector<char> buf(4096);
   size_t got = 0;
@@ -98,7 +98,7 @@ TEST(GetAutoPipelined, StringOverloadTrimsToTrueLength) {
   FakePipelinedTransport t;
   KVClient c = MakeClient(&t);
   std::string v(777, 'q');
-  t.blobs[ToBlockKey("ks").Filename()] = v;
+  t.blobs[ToBlockKey("ks", 0x51ULL).Filename()] = v;
 
   std::string out;
   ASSERT_TRUE(c.GetAuto("ks", &out, 8192));
@@ -115,7 +115,7 @@ TEST(GetAutoPipelined, ValueLargerThanEightMiBIsServed) {
   KVClient c = MakeClient(&t);
   const size_t big = (10u << 20);  // 10 MiB > 8 MiB control_cap
   std::string v(big, 'B');
-  t.blobs[ToBlockKey("kbig").Filename()] = v;
+  t.blobs[ToBlockKey("kbig", 0x51ULL).Filename()] = v;
 
   std::string out;
   ASSERT_TRUE(c.GetAuto("kbig", &out, 16u << 20));
@@ -128,7 +128,7 @@ TEST(GetAutoPipelined, ValueLargerThanEightMiBIsServed) {
 TEST(GetAutoPipelined, CapSmallerThanPayloadIsMiss) {
   FakePipelinedTransport t;
   KVClient c = MakeClient(&t);
-  t.blobs[ToBlockKey("kbig2").Filename()] = std::string(5000, 'z');
+  t.blobs[ToBlockKey("kbig2", 0x51ULL).Filename()] = std::string(5000, 'z');
 
   std::vector<char> buf(1024);
   size_t got = 0;
