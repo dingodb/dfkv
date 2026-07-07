@@ -135,6 +135,8 @@ class RamTier {
   FlushFn flush_;
   char* arena_ = nullptr;
   void* arena_mr_ = nullptr;
+  uint64_t extent_bytes_ = 0;   // SlabAllocator extent size; global arena offset
+                                // of a slot = ref.extent * extent_bytes_ + ref.offset
   std::unique_ptr<SlabAllocator> alloc_;
 
   mutable std::mutex mu_;

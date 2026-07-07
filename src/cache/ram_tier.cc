@@ -56,9 +56,28 @@ RamTier::RamTier(Options opt, FlushFn flush)
                                    : "default") + ")");
   }
 
+  // Partition the arena into MANY extents. SlabAllocator binds each extent to a
+  // single size class; with one giant extent (num_extents=1) the RAM tier could
+  // hold only ONE size class at a time, so a real KV working set (block values
+  // of assorted sizes -- partial blocks, variable-length coalesced chunks)
+  // evicted the whole tier on every cross-class Put (observed on hd04 prod:
+  // ram_objects collapsed to ~1-5 in a 16 GiB arena, every reuse GET missed to
+  // slab -> load ran at disk speed, ~25x slower than a RAM hit). Many smaller
+  // extents let the working set's size classes coexist. Sizing: SlabAllocator
+  // keeps up to kStripeWays(8) extents open per size class, so we want
+  // num_extents >> num_classes*8 (a real KV mix spans ~15-20 size classes). A
+  // 32 MiB extent gives 512 extents on a 16 GiB arena (>> 160) while staying far
+  // above any single KV block, so large values still get many slots per extent.
+  uint64_t ext = 32ull << 20;
+  if (const char* e = std::getenv("DFKV_RAM_TIER_EXTENT_BYTES")) {
+    uint64_t v = std::strtoull(e, nullptr, 10);
+    if (v >= (1ull << 20)) ext = v;
+  }
+  if (ext > opt_.bytes) ext = opt_.bytes;
+  extent_bytes_ = ext;
   SlabAllocator::Options ao;
-  ao.extent_bytes = opt_.bytes;   // the whole arena is one extent
-  ao.num_extents = 1;
+  ao.extent_bytes = ext;
+  ao.num_extents = static_cast<uint32_t>(std::max<uint64_t>(1, opt_.bytes / ext));
   ao.align = opt_.slot_granularity;
   ao.max_waste = 0.25;
   alloc_ = std::make_unique<SlabAllocator>(ao);
@@ -108,8 +127,8 @@ bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
     // Flush-pin the slot: RAM_ONLY, not evictable until the async flush lands.
     alloc_->Pin(fn);
     writing_.insert(fn);  // reserve the key so a concurrent same-key Put dedups
-    offset = ref.offset;
-    cap = ref.slot_size;
+    offset = ref.extent * extent_bytes_ + ref.offset;  // global arena offset
+    cap = ref.slot_size;                               // (ref.offset is within-extent)
     // NOT visible yet: index_ install is deferred until after the copy, so a
     // concurrent GetPrep can't read the slot mid-copy.
   }

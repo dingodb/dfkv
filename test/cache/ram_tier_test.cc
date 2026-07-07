@@ -95,6 +95,45 @@ TEST(RamTier, FlushMakesDurable) {
   EXPECT_EQ(rt.FlushBacklog(), 0u);
 }
 
+// Regression (hd04 prod, 2026-07): the RAM tier bound its whole arena to ONE
+// SlabAllocator extent, so it could hold only a single size class at a time. A
+// real KV working set has assorted value sizes (partial blocks, variable-length
+// coalesced chunks); each cross-class Put stole the lone extent and evicted the
+// whole tier (ram_objects collapsed to ~1-5 in a 16 GiB arena), so every reuse
+// GET missed to slab and load ran at disk speed. With the arena partitioned into
+// many extents, distinct size classes coexist and stay resident. Also exercises
+// the global-arena-offset math (slots now live in extents > 0).
+TEST(RamTier, VaryingSizesCoexistNoChurn) {
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "2097152", 1);  // 2 MiB extents
+  FlushSink sink;
+  RamTier rt(Opts(256ull << 20), sink.fn());             // 256 MiB arena -> ~128 extents
+  ASSERT_TRUE(rt.ok());
+  // 6 distinct size classes x 4 keys each (models a real KV mix: a handful of
+  // block sizes, many blocks each). 6 classes * kStripeWays(8) = 48 extents of
+  // headroom vs 128 available. Each value < the 2 MiB extent.
+  const size_t sizes[6] = {40000, 90000, 200000, 380000, 560000, 730000};
+  std::vector<std::pair<uint64_t, size_t>> items;
+  for (int i = 0; i < 24; ++i) {
+    size_t sz = sizes[i % 6];
+    std::vector<char> v(sz, static_cast<char>(i + 1));
+    ASSERT_TRUE(rt.Put(K(1000 + i), v.data(), v.size())) << "put i=" << i;
+    items.emplace_back(1000 + i, sz);
+  }
+  // All resident (no cross-class eviction) and byte-correct after the global
+  // offset resolves each slot's extent.
+  EXPECT_EQ(rt.Count(), items.size());
+  EXPECT_EQ(rt.Evictions(), 0u);
+  for (auto& [id, sz] : items) {
+    RamTier::Hit h;
+    ASSERT_TRUE(rt.GetPrep(K(id), 0, sz, &h)) << "get id=" << id;
+    EXPECT_EQ(h.len, sz);
+    EXPECT_EQ(static_cast<unsigned char>(h.ptr[0]),
+              static_cast<unsigned char>((id - 1000) + 1));
+    rt.Release(h.token);
+  }
+  ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
+}
+
 TEST(RamTier, MissReturnsFalse) {
   FlushSink sink;
   RamTier rt(Opts(64 * 4096), sink.fn());
