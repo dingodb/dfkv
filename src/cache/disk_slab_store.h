@@ -53,6 +53,12 @@ class DiskSlabStore : public StoreEngine {
     // If the filesystem rejects O_DIRECT (tmpfs in tests/CI), the store falls
     // back to buffered -- DirectWritesActive() reports the resolved truth.
     bool direct_writes = false;
+    // Background free-slot reclaimer cadence (ms; 0 = off). Keeps a demand-
+    // driven headroom of free slots per active class so Put's fast path stays
+    // pop-free-slot; without it every Put under capacity pressure runs the
+    // CLOCK eviction sweep inline under the store lock (the measured write-
+    // path serialization on a full store).
+    uint32_t reclaim_interval_ms = 50;
     // slots.tbl fdatasync cadence (ms; 0 = off). Bounds the crash window in
     // which a REUSED slot's new payload is on disk while the reused record is
     // still page-cache-only -- rebuild would then resurrect the PREVIOUS
@@ -73,6 +79,7 @@ class DiskSlabStore : public StoreEngine {
     uint64_t deferred_removes = 0;     // Removes deferred behind in-flight I/O
     uint64_t inflight = 0;             // keys with an unlocked read/write in flight
     uint64_t prep_holds = 0;           // outstanding async-prep slot holds
+    uint64_t reclaimed_slots = 0;      // slots freed by the background reclaimer
   };
 
   // Opens (or creates) the store under Options::dir, pre-allocating extents and
@@ -188,6 +195,15 @@ class DiskSlabStore : public StoreEngine {
   std::condition_variable sync_cv_;
   std::mutex sync_mu_;
   bool sync_stop_ = false;
+  // Background free-slot reclaimer (see Options::reclaim_interval_ms): runs
+  // ReclaimTick every interval, evicting ahead of demand in bounded batches.
+  void ReclaimTick();
+  std::atomic<uint64_t> reclaimed_{0};
+  std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
+  std::thread reclaim_thread_;
+  std::condition_variable reclaim_cv_;
+  std::mutex reclaim_mu_;
+  bool reclaim_stop_ = false;
 };
 
 }  // namespace dfkv

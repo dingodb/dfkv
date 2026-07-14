@@ -109,6 +109,30 @@ class SlabAllocator {
   bool Pin(const std::string& key);
   bool Unpin(const std::string& key);
 
+  // Per-class occupancy snapshot for an external reclaimer thread. Indices are
+  // stable (classes_ only grows), so a caller can diff `puts` across polls to
+  // detect write demand per class.
+  struct ClassStat {
+    uint32_t slot_size = 0;
+    size_t free_slots = 0;   // free slots across this class's bound extents
+    size_t resident = 0;     // resident keys
+    uint64_t puts = 0;       // cumulative new-key inserts (idempotent hits excluded)
+  };
+  std::vector<ClassStat> Classes() const;
+
+  // Evict up to `max_victims` unpinned entries (CLOCK order) from class
+  // `cls_index` until it holds >= `target_free` free slots. Runs the same sweep
+  // Put would run inline, but from a background thread in bounded batches, so
+  // the Put fast path stays pop-free-slot. No-op while the shared pool still
+  // has unbound extents (Put grows the class by binding one -- cheap, no
+  // residency loss; eviction only earns its keep on a full store). Stops early
+  // if an eviction returned a fully-free extent to the pool (free count went
+  // DOWN: reclaiming further would cascade-shrink the class, and the pool
+  // gained capacity anyway). Returns the number evicted; keys are appended to
+  // *evicted for the caller to drop from its own index.
+  size_t ReclaimClass(size_t cls_index, size_t target_free, size_t max_victims,
+                      std::vector<std::string>* evicted);
+
   // stats (diagnostic)
   size_t Count() const;
   uint64_t UsedBytes() const;       // sum of slot_size over resident keys
@@ -128,6 +152,10 @@ class SlabAllocator {
     uint32_t refs = 0;                       // pin count
     bool referenced = false;                 // CLOCK bit
     std::list<std::string>::iterator ring_it;  // this key's node in its class ring
+    // This key's node in its extent's resident list (points at the index_ map
+    // key, which is node-stable). Lets StealExtentFor enumerate one extent's
+    // residents in O(residents) instead of scanning the whole index.
+    std::list<const std::string*>::iterator ext_it;
   };
   struct Class {
     uint32_t slot_size = 0;
@@ -140,6 +168,8 @@ class SlabAllocator {
     std::unordered_map<uint32_t, std::vector<uint32_t>> free_by_ext;
     std::vector<uint32_t> ext_rr;              // extents with >=1 free slot
     size_t rr_next = 0;                        // rotation cursor into ext_rr
+    size_t free_count = 0;                     // total free slots (== sum over free_by_ext)
+    uint64_t puts = 0;                         // cumulative new-key inserts (demand signal)
     std::list<std::string> ring;               // CLOCK ring of resident keys
     std::list<std::string>::iterator hand;     // persistent eviction cursor
     Class() : hand(ring.end()) {}
@@ -152,6 +182,9 @@ class SlabAllocator {
     uint32_t free_slots = 0; // free slots (== total when fully empty)
     uint32_t total_slots = 0;
     uint32_t pinned = 0;     // resident pinned slots in this extent (steal guard)
+    // Keys resident in this extent (pointers into index_'s node-stable keys);
+    // per-key node handle lives in Entry::ext_it. Empty iff fully free.
+    std::list<const std::string*> residents;
   };
 
   size_t ClassForLen(size_t aligned_len);  // returns class index (creates if needed)

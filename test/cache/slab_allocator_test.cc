@@ -295,3 +295,142 @@ TEST(SlabAllocator, RemoveFreesPinnedSlotImmediately) {
   EXPECT_EQ(r2.extent, r1.extent);
   EXPECT_EQ(r2.slot, r1.slot);
 }
+
+// ---- background-reclaimer + resident-list additions (put-path deserialization) ----
+
+// Classes() reports per-class free/resident/puts truthfully across put, evict,
+// remove, and extent hand-offs (the reclaimer's decisions ride on these counts).
+TEST(SlabAllocator, ClassStatsTrackFreeResidentAndPuts) {
+  SlabAllocator a(Opts(4 * 4096, 4));  // 16 slots of one 4096 class
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 10; ++i)
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  auto cs = a.Classes();
+  ASSERT_EQ(cs.size(), 1u);
+  EXPECT_EQ(cs[0].slot_size, 4096u);
+  EXPECT_EQ(cs[0].resident, 10u);
+  EXPECT_EQ(cs[0].free_slots, 6u);
+  EXPECT_EQ(cs[0].puts, 10u);
+  ASSERT_TRUE(a.Put("k0", 4096, &r, &ev));  // idempotent hit: NOT a new insert
+  EXPECT_EQ(a.Classes()[0].puts, 10u);
+  a.Remove("k9");
+  cs = a.Classes();
+  EXPECT_EQ(cs[0].resident, 9u);
+  EXPECT_EQ(cs[0].free_slots, 7u);
+}
+
+// ReclaimClass evicts ahead of demand: it frees slots up to the target, in
+// CLOCK order, without touching pinned entries, and reports the victims so the
+// caller can drop them from its own index.
+TEST(SlabAllocator, ReclaimClassCreatesHeadroomSkippingPinned) {
+  SlabAllocator a(Opts(4 * 4096, 2));  // 8 slots, one class
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 8; ++i)
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  ASSERT_TRUE(a.Pin("k0"));
+  ASSERT_TRUE(a.Pin("k1"));
+  std::vector<std::string> victims;
+  const size_t got = a.ReclaimClass(0, /*target_free=*/3, /*max_victims=*/8, &victims);
+  EXPECT_EQ(got, 3u);
+  EXPECT_EQ(victims.size(), 3u);
+  for (const auto& v : victims) {
+    EXPECT_NE(v, "k0");
+    EXPECT_NE(v, "k1");
+    EXPECT_FALSE(a.Contains(v));
+  }
+  EXPECT_EQ(a.Classes()[0].free_slots, 3u);
+  // A follow-up Put takes a reclaimed slot WITHOUT evicting inline.
+  ev.clear();
+  ASSERT_TRUE(a.Put("fresh", 4096, &r, &ev));
+  EXPECT_TRUE(ev.empty()) << "put should ride the reclaimed headroom";
+}
+
+// ReclaimClass respects max_victims (bounded work per lock hold) and is a no-op
+// when the class already holds the target headroom.
+TEST(SlabAllocator, ReclaimClassBoundedAndIdempotent) {
+  SlabAllocator a(Opts(4 * 4096, 2));
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 8; ++i)
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  std::vector<std::string> victims;
+  EXPECT_EQ(a.ReclaimClass(0, /*target_free=*/4, /*max_victims=*/2, &victims), 2u);
+  EXPECT_EQ(victims.size(), 2u);
+  victims.clear();
+  EXPECT_EQ(a.ReclaimClass(0, /*target_free=*/2, /*max_victims=*/8, &victims), 0u);
+  EXPECT_TRUE(victims.empty());
+  // Out-of-range class index: harmless no-op.
+  EXPECT_EQ(a.ReclaimClass(7, 4, 8, &victims), 0u);
+}
+
+// The cascade-shrink guard: when an eviction returns a fully-free extent to the
+// shared pool (free count goes DOWN, not up), ReclaimClass stops instead of
+// hollowing the class out chasing a target it can no longer reach.
+TEST(SlabAllocator, ReclaimClassStopsOnExtentReturn) {
+  // 12 extents x 1 slot each. Fill all 12, then Remove 8: the rotation now
+  // holds exactly kStripeWays(8) fully-free extents (one more and they start
+  // unbinding). The next eviction pushes the rotation past 8, so ITS extent
+  // returns to the pool -- free count nets zero, and the guard must stop the
+  // pass instead of hollowing out the remaining residents.
+  SlabAllocator a(Opts(4096, 12));
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 12; ++i)
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  for (int i = 0; i < 8; ++i) a.Remove("k" + std::to_string(i));
+  ASSERT_EQ(a.ExtentReturns(), 0u);
+  ASSERT_EQ(a.Classes()[0].free_slots, 8u);
+  std::vector<std::string> victims;
+  const size_t got = a.ReclaimClass(0, /*target_free=*/12, /*max_victims=*/12, &victims);
+  EXPECT_EQ(got, 1u) << "must stop after the eviction that returned an extent";
+  EXPECT_EQ(a.ExtentReturns(), 1u);
+  EXPECT_EQ(a.Classes()[0].resident, 3u);
+}
+
+// Steal now walks the stolen extent's resident list instead of scanning the
+// whole index: behavior must be identical -- exactly that extent's residents
+// are evicted, everything else survives, and the needy class gets the extent.
+TEST(SlabAllocator, StealEvictsExactlyTheStolenExtentsResidents) {
+  SlabAllocator a(Opts(4 * 4096, 2));  // 2 extents x 4 slots
+  std::vector<std::string> ev;
+  SlotRef r;
+  std::vector<std::string> ext_keys[2];
+  for (int i = 0; i < 8; ++i) {
+    const std::string k = "k" + std::to_string(i);
+    ASSERT_TRUE(a.Put(k, 4096, &r, &ev));
+    ext_keys[r.extent].push_back(k);
+  }
+  // A new class (16384 > 4096/0.25 waste bound) finds no pool extent -> steal.
+  ev.clear();
+  ASSERT_TRUE(a.Put("big", 16 * 1024, &r, &ev));
+  EXPECT_EQ(a.Steals(), 1u);
+  EXPECT_EQ(ev.size(), 4u) << "exactly one extent's residents evicted";
+  const uint32_t stolen = r.extent;
+  std::set<std::string> gone(ev.begin(), ev.end());
+  for (const auto& k : ext_keys[stolen]) EXPECT_TRUE(gone.count(k)) << k;
+  for (const auto& k : ext_keys[1 - stolen]) {
+    EXPECT_FALSE(gone.count(k)) << k;
+    EXPECT_TRUE(a.Contains(k)) << k;
+  }
+}
+
+// Restore populates the resident list too: a steal after a rebuild must evict
+// the restored keys of the stolen extent (they live only in the extent list --
+// a regression here silently leaks slots).
+TEST(SlabAllocator, StealAfterRestoreEvictsRestoredResidents) {
+  SlabAllocator a(Opts(4 * 4096, 1));  // one extent x 4 slots
+  for (int i = 0; i < 4; ++i)
+    ASSERT_TRUE(a.Restore("k" + std::to_string(i), 4096, /*extent=*/0,
+                          /*slot=*/static_cast<uint32_t>(i)));
+  EXPECT_EQ(a.Count(), 4u);
+  std::vector<std::string> ev;
+  SlotRef r;
+  ASSERT_TRUE(a.Put("big", 16 * 1024, &r, &ev));  // must steal extent 0
+  EXPECT_EQ(a.Steals(), 1u);
+  EXPECT_EQ(ev.size(), 4u);
+  EXPECT_EQ(a.Count(), 1u);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_FALSE(a.Contains("k" + std::to_string(i)));
+}

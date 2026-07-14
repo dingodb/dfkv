@@ -66,6 +66,9 @@ void KvNodeServer::InitRamTier() {
     unsigned long long n = std::strtoull(f, nullptr, 10);
     if (n > 0 && n <= 64) o.flush_threads = static_cast<uint32_t>(n);
   }
+  // Background free-slot reclaimer cadence (ms; 0 disables). Default 10.
+  if (const char* r = std::getenv("DFKV_RAM_RECLAIM_MS"))
+    o.reclaim_interval_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
   // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache): the
   // arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab lands it
   // via O_DIRECT -- a buffered flush would route the RAM tier's entire write
@@ -256,6 +259,8 @@ std::string KvNodeServer::MetricsText() const {
            "Keys with an unlocked read/write in flight", ss.inflight);
     metric("dfkv_slab_prep_holds", "gauge",
            "Outstanding async-prep slot holds", ss.prep_holds);
+    metric("dfkv_slab_reclaimed_total", "counter",
+           "Slots freed ahead of demand by the background reclaimer", ss.reclaimed_slots);
   }
   if (put_busy_limit_ > 0)
     metric("dfkv_put_busy_total", "counter",
@@ -272,6 +277,7 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_flushed_total", "counter", "RAM slots flushed to disk (now durable)", ram_->Flushed());
     metric("dfkv_ram_flush_dropped_total", "counter", "RAM slots dropped after flush failure", ram_->FlushDropped());
     metric("dfkv_ram_evictions_total", "counter", "RAM slots evicted under capacity pressure", ram_->Evictions());
+    metric("dfkv_ram_reclaimed_total", "counter", "RAM slots freed ahead of demand by the background reclaimer", ram_->Reclaimed());
     metric("dfkv_ram_objects", "gauge", "Blocks currently resident in the RAM hot tier", ram_->Count());
     metric("dfkv_ram_flush_backlog", "gauge", "RAM slots queued for flush (not yet durable)", ram_->FlushBacklog());
   }

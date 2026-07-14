@@ -64,6 +64,8 @@ int main(int argc, char** argv) {
       "  --ram-flush-threads <n>   RAM tier flush thread count (env DFKV_RAM_FLUSH_THREADS)\n"
       "  --ram-tier-numa <n>  RAM tier NUMA node (env DFKV_RAM_TIER_NUMA)\n"
       "  --slab-table-sync-ms <n>  slab table sync cadence ms (env DFKV_SLAB_TABLE_SYNC_MS)\n"
+      "  --slab-reclaim-ms <n>  slab background free-slot reclaimer cadence ms, 0 = off (env DFKV_SLAB_RECLAIM_MS)\n"
+      "  --ram-reclaim-ms <n>   RAM tier background reclaimer cadence ms, 0 = off (env DFKV_RAM_RECLAIM_MS)\n"
       "  --log <level>        log level: INFO|DEBUG|WARN|ERROR (env DFKV_LOG)\n"
       "  --version, -V        print version and exit\n"
       "  --help, -h           print this help and exit\n"
@@ -82,7 +84,8 @@ int main(int argc, char** argv) {
                    "--rdma-depth", "--rdma-numa", "--rdma-idle-ms",
                    "--rdma-op-timeout-ms", "--server-uring",
                    "--server-uring-depth", "--ram-flush-threads",
-                   "--ram-tier-numa", "--slab-table-sync-ms", "--log"});
+                   "--ram-tier-numa", "--slab-table-sync-ms",
+                   "--slab-reclaim-ms", "--ram-reclaim-ms", "--log"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
   std::string mds = args.Get("--mds", "");
@@ -150,6 +153,13 @@ int main(int argc, char** argv) {
   std::string slab_table_sync_ms = args.Get("--slab-table-sync-ms", "");
   if (!slab_table_sync_ms.empty())
     ::setenv("DFKV_SLAB_TABLE_SYNC_MS", slab_table_sync_ms.c_str(), 1);
+  // Background free-slot reclaimer cadences (ms; 0 disables).
+  std::string slab_reclaim_ms = args.Get("--slab-reclaim-ms", "");
+  if (!slab_reclaim_ms.empty())
+    ::setenv("DFKV_SLAB_RECLAIM_MS", slab_reclaim_ms.c_str(), 1);
+  std::string ram_reclaim_ms = args.Get("--ram-reclaim-ms", "");
+  if (!ram_reclaim_ms.empty())
+    ::setenv("DFKV_RAM_RECLAIM_MS", ram_reclaim_ms.c_str(), 1);
   // Log level (DFKV_LOG: e.g. "INFO", "DEBUG", "WARN").
   std::string log_level = args.Get("--log", "");
   if (!log_level.empty()) ::setenv("DFKV_LOG", log_level.c_str(), 1);
