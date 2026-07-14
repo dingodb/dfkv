@@ -123,6 +123,16 @@ RamTier::~RamTier() {
 // allocator call on the pop-free-slot fast path; without it a full arena runs
 // the CLOCK sweep inline under mu_ on every admission.
 void RamTier::ReclaimTick() {
+  // Flush-gated regime: when the flush queue is deep, the arena is mostly
+  // PINNED (not-yet-durable) slots -- free slots are not the admission
+  // constraint, and a CLOCK sweep over a pinned-heavy ring just burns lock
+  // time skipping entries. Sit the tick out; reclaim resumes as the flusher
+  // catches up. 4096 = the per-tick eviction budget: below it one pass could
+  // plausibly matter, above it admission is flusher-bound by definition.
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (flushq_.size() > 4096) return;
+  }
   const auto classes = alloc_->Classes();
   if (reclaim_last_puts_.size() < classes.size())
     reclaim_last_puts_.resize(classes.size(), 0);
