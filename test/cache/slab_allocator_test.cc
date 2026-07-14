@@ -507,3 +507,71 @@ TEST(SlabAllocator, ClassStatsExtentsTracksHandoffs) {
   EXPECT_EQ(bound_after + a.PoolExtents(), 12u) << "bind accounting must balance";
   EXPECT_GT(a.PoolExtents(), 0u);
 }
+
+// ---- inline growth-first additions (close the intra-tick starvation window) ----
+
+// A bootstrapping class (< kStripeWays extents) on a full store must GROW by
+// stealing from a big donor instead of eating itself: without growth-first,
+// self-eviction succeeds as soon as the class has one unpinned resident and
+// pins it at birth size until the background rebalance tick.
+TEST(SlabAllocator, PutGrowsBootstrappingClassBeforeSelfEvicting) {
+  // 16 extents x 4 slots of class A (4096); donor stays above the 8-extent floor.
+  SlabAllocator a(Opts(4 * 4096, 16));
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 64; ++i)
+    ASSERT_TRUE(a.Put("a" + std::to_string(i), 4096, &r, &ev));
+  ASSERT_EQ(a.Classes()[0].extents, 16u);
+  // Class B (16 KiB, 1 slot/extent): burst of 6. Every put after the first
+  // extent fills must STEAL (donor A: 16 > 8), never evict B's own residents.
+  ev.clear();
+  for (int i = 0; i < 6; ++i)
+    ASSERT_TRUE(a.Put("b" + std::to_string(i), 16 * 1024, &r, &ev));
+  for (int i = 0; i < 6; ++i)
+    EXPECT_TRUE(a.Contains("b" + std::to_string(i))) << "b" << i << " self-evicted";
+  auto cs = a.Classes();
+  EXPECT_EQ(cs[1].resident, 6u);
+  EXPECT_EQ(cs[1].extents, 6u);
+  EXPECT_EQ(a.Steals(), 6u);
+}
+
+// Donor floor on the growth-first path: when every other class is at or below
+// kStripeWays extents, a bootstrapping class must NOT steal (no ping-pong
+// between two under-provisioned classes) -- it falls back to self-eviction.
+TEST(SlabAllocator, GrowthFirstRespectsDonorFloor) {
+  // 8 extents x 4 slots, all bound to class A (exactly kStripeWays -> not a donor).
+  SlabAllocator a(Opts(4 * 4096, 8));
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 32; ++i)
+    ASSERT_TRUE(a.Put("a" + std::to_string(i), 4096, &r, &ev));
+  ASSERT_EQ(a.Classes()[0].extents, 8u);
+  // Class B: first put has no self to evict -> LAST-RESORT steal (floor 0) is
+  // allowed and takes one A extent (A drops to 7).
+  ev.clear();
+  ASSERT_TRUE(a.Put("b0", 16 * 1024, &r, &ev));
+  EXPECT_EQ(a.Steals(), 1u);
+  // Second put: B(1 extent, full) is bootstrapping, but A(7) is at/below the
+  // floor -> growth-first refuses; self-eviction evicts b0.
+  ev.clear();
+  ASSERT_TRUE(a.Put("b1", 16 * 1024, &r, &ev));
+  EXPECT_EQ(a.Steals(), 1u) << "must not steal from a donor at/below the floor";
+  ASSERT_EQ(ev.size(), 1u);
+  EXPECT_EQ(ev[0], "b0");
+  EXPECT_EQ(a.Classes()[0].extents, 7u) << "A must not shrink further";
+}
+
+// A class at or above kStripeWays extents behaves exactly as before: steady-
+// state churn is self-eviction, not stealing (growth-first is bootstrap-only).
+TEST(SlabAllocator, MatureClassStillSelfEvicts) {
+  SlabAllocator a(Opts(4096, 16));  // 16 extents x 1 slot, one class
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 16; ++i)
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  ASSERT_EQ(a.Classes()[0].extents, 16u);
+  ev.clear();
+  ASSERT_TRUE(a.Put("k16", 4096, &r, &ev));  // full + mature -> CLOCK evict
+  EXPECT_EQ(ev.size(), 1u);
+  EXPECT_EQ(a.Steals(), 0u);
+}

@@ -209,7 +209,13 @@ class SlabAllocator {
   size_t ClassForExactSize(uint32_t slot_size);  // find/create a class of exactly slot_size
   bool BindFreeExtent(size_t cls);         // bind a pool extent to cls; false if none
   bool EvictOneFrom(size_t cls, std::vector<std::string>* evicted);  // CLOCK evict 1
-  bool StealExtentFor(size_t cls, std::vector<std::string>* evicted); // rebind a full extent
+  // Steal an entirely-unpinned extent from another class and rebind it to cls.
+  // min_donor_extents > 0 restricts donors to classes holding MORE than that
+  // many extents (the growth-first path uses kStripeWays: two under-provisioned
+  // classes must not ping-pong extents off each other). 0 = any donor (the
+  // last-resort semantics this function always had).
+  bool StealExtentFor(size_t cls, std::vector<std::string>* evicted,
+                      size_t min_donor_extents = 0); // rebind a full extent
   // Shared steal core: evict extent E's residents, unbind E, re-bind a pool
   // extent to target_cls. E must be fully unpinned. With mu_ held.
   bool StealExtentLocked(uint32_t E, size_t target_cls,

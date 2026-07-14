@@ -233,7 +233,8 @@ bool SlabAllocator::EvictOneFrom(size_t cls, std::vector<std::string>* evicted) 
   return false;  // every entry in this class is pinned
 }
 
-bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted) {
+bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted,
+                                   size_t min_donor_extents) {
   // Cold path: the target class has no slot and the pool is empty. Reclaim an
   // entirely-unpinned extent bound to ANOTHER class, evict its residents, unbind
   // it, and re-bind to the target class. Prefer the emptiest such extent.
@@ -243,6 +244,9 @@ bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted
     const ExtentMeta& m = extents_[e];
     if (m.cls == kUnbound || m.cls == static_cast<int>(cls)) continue;
     if (m.pinned != 0) continue;  // can't evict a pinned slot
+    if (min_donor_extents > 0 &&
+        classes_[m.cls]->bound_extents <= min_donor_extents)
+      continue;  // donor floor: never shrink a class below its striping width
     if (best < 0 || m.free_slots > best_free) { best = static_cast<int>(e); best_free = m.free_slots; }
   }
   if (best < 0) return false;
@@ -320,6 +324,14 @@ bool SlabAllocator::Put(const std::string& key, size_t len, SlotRef* out,
     // exhausted -- BindFreeExtent bails at unbound_ == 0).
     while (C.ext_rr.size() < kStripeWays && BindFreeExtent(cls)) {}
     if (PopFreeLocked(C, &got)) break;
+    // Growth-first while under the striping width: a class below kStripeWays
+    // extents is still bootstrapping -- self-evicting here pins it at birth
+    // size forever (its growth would be left to accidental all-pinned moments
+    // or the background rebalance tick; this closes the intra-tick window).
+    // Donor floor keeps two bootstrapping classes from ping-ponging.
+    if (C.bound_extents < kStripeWays &&
+        StealExtentFor(cls, evicted, /*min_donor_extents=*/kStripeWays))
+      continue;
     if (EvictOneFrom(cls, evicted)) continue;
     if (StealExtentFor(cls, evicted)) continue;
     return false;  // nothing to free: all candidate slots are pinned
