@@ -63,6 +63,12 @@ class SlabAllocator {
     std::function<void(uint32_t extent)> on_extent_bind;
   };
 
+  // Target write-parallelism per class: Put keeps up to this many extents open
+  // (bound with free slots) so concurrent writers stripe across inodes. Public
+  // because it is also the natural per-class capacity FLOOR for external
+  // rebalance policy (never shrink a donor below its striping width).
+  static constexpr size_t kStripeWays = 8;
+
   explicit SlabAllocator(Options opt);
 
   // Reserve a slot for `key` holding `len` bytes.
@@ -117,8 +123,11 @@ class SlabAllocator {
     size_t free_slots = 0;   // free slots across this class's bound extents
     size_t resident = 0;     // resident keys
     uint64_t puts = 0;       // cumulative new-key inserts (idempotent hits excluded)
+    uint32_t extents = 0;    // extents currently bound to this class
+    uint32_t slots_per_extent = 0;
   };
   std::vector<ClassStat> Classes() const;
+  uint32_t PoolExtents() const;  // unbound extents in the shared pool
 
   // Evict up to `max_victims` unpinned entries (CLOCK order) from class
   // `cls_index` until it holds >= `target_free` free slots. Runs the same sweep
@@ -132,6 +141,17 @@ class SlabAllocator {
   // *evicted for the caller to drop from its own index.
   size_t ReclaimClass(size_t cls_index, size_t target_free, size_t max_victims,
                       std::vector<std::string>* evicted);
+
+  // Move ONE entirely-unpinned extent from `donor_cls` to `target_cls`: evict
+  // the donor extent's residents (appended to *evicted), unbind, re-bind to the
+  // target. The rebalance mechanism for a demand shift on a full store -- the
+  // POLICY (which class is hot, which donor is cold, floors, rate) lives in the
+  // caller's reclaim tick, which is the layer that sees per-interval demand.
+  // Prefers the donor's emptiest eligible extent. Returns false when donor ==
+  // target, either index is invalid, the target's slot exceeds an extent, or
+  // the donor has no fully-unpinned extent.
+  bool StealFrom(size_t donor_cls, size_t target_cls,
+                 std::vector<std::string>* evicted);
 
   // stats (diagnostic)
   size_t Count() const;
@@ -169,14 +189,12 @@ class SlabAllocator {
     std::vector<uint32_t> ext_rr;              // extents with >=1 free slot
     size_t rr_next = 0;                        // rotation cursor into ext_rr
     size_t free_count = 0;                     // total free slots (== sum over free_by_ext)
+    uint32_t bound_extents = 0;                // extents currently bound to this class
     uint64_t puts = 0;                         // cumulative new-key inserts (demand signal)
     std::list<std::string> ring;               // CLOCK ring of resident keys
     std::list<std::string>::iterator hand;     // persistent eviction cursor
     Class() : hand(ring.end()) {}
   };
-  // Target write-parallelism per class: Put keeps up to this many extents open
-  // (bound with free slots) so concurrent writers stripe across inodes.
-  static constexpr size_t kStripeWays = 8;
   struct ExtentMeta {
     int cls = kUnbound;      // class index bound to, or kUnbound (in pool)
     uint32_t free_slots = 0; // free slots (== total when fully empty)
@@ -192,6 +210,10 @@ class SlabAllocator {
   bool BindFreeExtent(size_t cls);         // bind a pool extent to cls; false if none
   bool EvictOneFrom(size_t cls, std::vector<std::string>* evicted);  // CLOCK evict 1
   bool StealExtentFor(size_t cls, std::vector<std::string>* evicted); // rebind a full extent
+  // Shared steal core: evict extent E's residents, unbind E, re-bind a pool
+  // extent to target_cls. E must be fully unpinned. With mu_ held.
+  bool StealExtentLocked(uint32_t E, size_t target_cls,
+                         std::vector<std::string>* evicted);
   void FreeSlotLocked(const std::string& key, Entry& e);  // internal removal
   // Per-extent free-slot bookkeeping (all with mu_ held).
   void PushFreeLocked(Class& C, uint32_t ext, uint32_t slot);

@@ -119,6 +119,7 @@ bool SlabAllocator::Restore(const std::string& key, uint32_t slot_size,
     m.total_slots = C.slots_per_extent;
     m.free_slots = C.slots_per_extent;
     m.pinned = 0;
+    C.bound_extents++;
     --unbound_;
     for (uint32_t s = 0; s < m.total_slots; ++s) PushFreeLocked(C, extent, s);
   } else if (m.cls != static_cast<int>(cls)) {
@@ -153,6 +154,7 @@ bool SlabAllocator::BindFreeExtent(size_t cls) {
     extents_[e].total_slots = total;
     extents_[e].free_slots = total;
     extents_[e].pinned = 0;
+    C.bound_extents++;
     --unbound_;
     // Wipe-before-use: stale persisted records from a previous binding must be
     // gone before any slot of this extent can be handed out (same lock hold).
@@ -182,6 +184,7 @@ void SlabAllocator::FreeSlotLocked(const std::string& key, Entry& e) {
   ExtentMeta& m = extents_[ext];
   if (m.free_slots == m.total_slots && C.ext_rr.size() > kStripeWays) {
     DropExtentFreeLocked(C, ext);
+    C.bound_extents--;
     m.cls = kUnbound;
     m.total_slots = 0;
     m.free_slots = 0;
@@ -243,7 +246,11 @@ bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted
     if (best < 0 || m.free_slots > best_free) { best = static_cast<int>(e); best_free = m.free_slots; }
   }
   if (best < 0) return false;
-  const uint32_t E = static_cast<uint32_t>(best);
+  return StealExtentLocked(static_cast<uint32_t>(best), cls, evicted);
+}
+
+bool SlabAllocator::StealExtentLocked(uint32_t E, size_t target_cls,
+                                      std::vector<std::string>* evicted) {
   ExtentMeta& m = extents_[E];
   const int old_cls = m.cls;
   // Evict every resident key living in extent E, walked off its resident list:
@@ -262,6 +269,7 @@ bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted
   // Unbind E unless FreeSlotLocked's return-to-pool already did.
   if (m.cls != kUnbound) {
     DropExtentFreeLocked(*classes_[old_cls], E);
+    classes_[old_cls]->bound_extents--;
     m.cls = kUnbound;
     m.total_slots = 0;
     m.free_slots = 0;
@@ -269,7 +277,25 @@ bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted
     ++unbound_;
   }
   ++steals_;
-  return BindFreeExtent(cls);  // now picks the freshly-unbound E
+  return BindFreeExtent(target_cls);  // now picks the freshly-unbound E
+}
+
+bool SlabAllocator::StealFrom(size_t donor_cls, size_t target_cls,
+                              std::vector<std::string>* evicted) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (donor_cls == target_cls) return false;
+  if (donor_cls >= classes_.size() || target_cls >= classes_.size()) return false;
+  if (classes_[target_cls]->slots_per_extent == 0) return false;  // slot > extent
+  // The donor's emptiest fully-unpinned extent (fewest residents to evict).
+  int best = -1;
+  uint32_t best_free = 0;
+  for (uint32_t e = 0; e < extents_.size(); ++e) {
+    const ExtentMeta& m = extents_[e];
+    if (m.cls != static_cast<int>(donor_cls) || m.pinned != 0) continue;
+    if (best < 0 || m.free_slots > best_free) { best = static_cast<int>(e); best_free = m.free_slots; }
+  }
+  if (best < 0) return false;  // donor has no eligible extent
+  return StealExtentLocked(static_cast<uint32_t>(best), target_cls, evicted);
 }
 
 bool SlabAllocator::Put(const std::string& key, size_t len, SlotRef* out,
@@ -388,6 +414,8 @@ std::vector<SlabAllocator::ClassStat> SlabAllocator::Classes() const {
     s.free_slots = c->free_count;
     s.resident = c->ring.size();
     s.puts = c->puts;
+    s.extents = c->bound_extents;
+    s.slots_per_extent = c->slots_per_extent;
     out.push_back(s);
   }
   return out;
@@ -445,6 +473,10 @@ uint64_t SlabAllocator::ExtentReturns() const {
 size_t SlabAllocator::ClassCount() const {
   std::lock_guard<std::mutex> lk(mu_);
   return classes_.size();
+}
+uint32_t SlabAllocator::PoolExtents() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return unbound_;
 }
 uint32_t SlabAllocator::BoundExtents() const {
   std::lock_guard<std::mutex> lk(mu_);

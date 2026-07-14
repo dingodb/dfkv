@@ -272,3 +272,31 @@ TEST(RamTier, BackgroundReclaimerPreFreesDurableSlots) {
       << "reclaimer never pre-freed a slot";
   EXPECT_EQ(rt.PutBypass(), 0u);
 }
+
+// Class rebalance in the RAM tier: arena full of an idle class, then a burst of
+// a NEW size larger than its first extents -- the tick must move extents from
+// the idle donor so the burst stays resident (stock retained ~one extent).
+TEST(RamTier, ReclaimTickGrowsHotClassFromColdDonor) {
+  FlushSink sink;
+  RamTier::Options o;
+  o.bytes = 16ull << 20;  // 16 MiB arena
+  o.slot_granularity = 4096;
+  o.reclaim_interval_ms = 1;
+  setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);  // 16 extents x 1 MiB
+  RamTier rt(o, sink.fn());
+  unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
+  ASSERT_TRUE(rt.ok());
+  std::string a(4000, 'a');
+  for (uint64_t i = 0; i < 4096; ++i) ASSERT_TRUE(rt.Put(K(30000 + i), a.data(), a.size()));
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));  // donor durable
+  std::string b(16000, 'b');
+  for (uint64_t i = 0; i < 256; ++i) {  // 4 extents' worth of a new class
+    ASSERT_TRUE(rt.Put(K(40000 + i), b.data(), b.size()));
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));
+  size_t resident = 0;
+  for (uint64_t i = 0; i < 256; ++i) resident += rt.Contains(K(40000 + i));
+  EXPECT_GT(rt.Rebalanced(), 0u) << "growth never kicked in";
+  EXPECT_GE(resident, 250u) << "hot class must absorb capacity, not eat itself";
+}

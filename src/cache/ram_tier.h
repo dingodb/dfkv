@@ -56,9 +56,11 @@ class RamTier {
     // Flush worker threads draining the shared queue. One DIO stream sustains
     // only ~1.6-3 GB/s -- far below the arena's ingest -- so the drain rate,
     // not the arena size, decides when Put backpressure kicks in. The server
-    // defaults this to the disk count (keys hash-spread across disks, so K
-    // workers keep ~K devices busy). Same-key flushes can't run concurrently
-    // (one queued item per key at a time), so workers need no extra ordering.
+    // defaults this to 4x the disk count, capped at 16 (small objects are
+    // IOPS-bound: one sync write per worker leaves NVMe queues nearly idle;
+    // 3 -> 16 workers measured +73% on 64 KiB saturated writes once the ingest
+    // lock contention was fixed). Same-key flushes can't run concurrently (one
+    // queued item per key at a time), so workers need no extra ordering.
     uint32_t flush_threads = 1;
     // Background free-slot reclaimer cadence (ms; 0 = off). Keeps demand-driven
     // free-slot headroom per class so Put's allocator call stays pop-free-slot;
@@ -121,6 +123,7 @@ class RamTier {
   uint64_t Flushed() const { return flushed_.load(std::memory_order_relaxed); }
   uint64_t FlushDropped() const { return flush_dropped_.load(std::memory_order_relaxed); }
   uint64_t Reclaimed() const { return reclaimed_.load(std::memory_order_relaxed); }
+  uint64_t Rebalanced() const { return rebalanced_.load(std::memory_order_relaxed); }
   uint64_t Evictions() const { return alloc_->Evictions(); }
   uint64_t UsedBytes() const { return alloc_->UsedBytes(); }  // resident slot bytes
   size_t Count() const;
@@ -136,7 +139,10 @@ class RamTier {
   struct QItem { std::string fn; BlockKey key; uint32_t tries = 0; };
 
   void FlushLoop();
-  void ReclaimTick();  // one background free-slot top-up pass (see Options)
+  void ReclaimTick();  // one background grow + free-slot top-up pass (see Options)
+  // Rebalance rate cap: extents moved per tick per hot class (32 MiB default
+  // extents; converges in well under a second at the 10 ms tick).
+  static constexpr size_t kGrowExtentsPerTick = 8;
   void DropLocked(const std::string& fn);  // remove key from index_ + alloc + unpin
 
   Options opt_;
@@ -168,7 +174,7 @@ class RamTier {
   bool reclaim_stop_ = false;
 
   std::atomic<uint64_t> hits_{0}, misses_{0}, puts_{0}, put_bypass_{0};
-  std::atomic<uint64_t> flushed_{0}, flush_dropped_{0}, reclaimed_{0};
+  std::atomic<uint64_t> flushed_{0}, flush_dropped_{0}, reclaimed_{0}, rebalanced_{0};
 };
 
 }  // namespace dfkv
