@@ -1,14 +1,22 @@
 /* dfkv_bench — throughput / latency benchmark for a dfkv cluster.
  *
  *   dfkv_bench --members "n=ip:port,..." [--size BYTES] [--count N]
- *              [--threads T] [--batch B] [--op put|get|both]
+ *              [--threads T] [--batch B] [--op put|get|both] [--key-seed S]
  *
  * Transport is chosen by the same env switch as the client: DFKV_RDMA=1 (+ device
  * DFKV_RDMA_DEV) uses RDMA, else TCP. --batch B issues B keys per BatchPut/
  * BatchGet call, which on RDMA pipelines up to B requests in flight on one
  * connection (cap by DFKV_RDMA_DEPTH); B=1 is the per-op path. Each op uses a
  * unique key ("dfkv-bench-<i>") so the write-once cache never collides. Reports
- * aggregate GB/s and per-call p50/p99/max latency for the PUT and GET phases. */
+ * aggregate GB/s and per-call p50/p99/max latency for the PUT and GET phases.
+ *
+ * --key-seed S pins the key namespace to S instead of the default pid, so the
+ * phases can run in DIFFERENT processes or on DIFFERENT nodes: `--op put
+ * --key-seed x` on node A, then `--op get --key-seed x` (same --size/--count)
+ * on node B measures the cross-node read path (the PD "prefill writes, decode
+ * reads" shape). With an explicit seed, re-running PUT with the same seed+size
+ * hits the write-once dedup and measures nothing -- pick a fresh seed per
+ * experiment (the pid default exists precisely to make reruns collision-free). */
 #include <unistd.h>
 
 #include <algorithm>
@@ -86,7 +94,7 @@ static void Report(const char* phase, size_t count, size_t size, size_t threads,
 
 int main(int argc, char** argv) {
   if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_bench %s\n", dfkv::Version()); return 0; }
-  std::string members, op = "both";
+  std::string members, op = "both", key_seed;
   size_t size = 2752512, count = 2000, threads = 8, batch = 1, bc = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!std::strcmp(argv[i], "--members")) members = argv[i + 1];
@@ -96,6 +104,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--batch")) batch = std::stoull(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--bc")) bc = std::stoull(argv[i + 1]);  // KVClient internal batch_concurrency
     else if (!std::strcmp(argv[i], "--op")) op = argv[i + 1];
+    else if (!std::strcmp(argv[i], "--key-seed")) key_seed = argv[i + 1];
   }
   if (batch < 1) batch = 1;
   auto mem = ParseMembers(members);
@@ -120,9 +129,13 @@ int main(int argc, char** argv) {
   // Unique key namespace per run (pid + size): dfkv is write-once (idempotent
   // Cache), so a fixed key set would make reruns at a different --size skip the
   // PUT (measuring nothing) and miss the GET (stored size != requested size) =>
-  // false fails. pid+size guarantees fresh keys each invocation.
+  // false fails. pid+size guarantees fresh keys each invocation. --key-seed
+  // replaces the pid so a GET in another process/node can find a prior PUT's
+  // keys (cross-node read benchmarks); the caller owns collision avoidance.
   const std::string run_id =
-      "dfkv-bench-" + std::to_string(static_cast<long>(getpid())) + "-" + std::to_string(size) + "-";
+      "dfkv-bench-" +
+      (key_seed.empty() ? std::to_string(static_cast<long>(getpid())) : key_seed) +
+      "-" + std::to_string(size) + "-";
   auto key = [&run_id](size_t i) { return run_id + std::to_string(i); };
   const size_t units = (count + batch - 1) / batch;
 
