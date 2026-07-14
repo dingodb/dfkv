@@ -114,6 +114,14 @@ class RdmaTransport : public Transport {
   // 2-attempt loop in every batch op, mirroring RoundTrip). 0/negative => -1
   // (legacy block-forever). Normal ops finish in ms, so 5s never false-aborts.
   int op_timeout_ms_ = 5000;          // datapath completion timeout (DFKV_RDMA_OP_TIMEOUT_MS)
+  // Batch-window override (DFKV_RDMA_BATCH_OP_TIMEOUT_MS, only the multi-op
+  // Batch*/CacheFrom/RangeInto windows). <=0 = follow op_timeout_ms_. Lowering
+  // it bounds a batch's tail at the price of tearing the connection (all ops of
+  // the window report kIOError = miss, peer enters cooldown) when a server is
+  // merely slow -- an explicit latency-vs-hit-rate trade for wait_complete
+  // schedulers; leave unset for default behavior.
+  int batch_op_timeout_ms_ = 0;
+  int BatchTimeout() const { return batch_op_timeout_ms_ > 0 ? batch_op_timeout_ms_ : op_timeout_ms_; }
   size_t pool_max_ = 256;             // idle conns kept per node (DFKV_RDMA_POOL_MAX)
   std::vector<std::string> devs_;     // RDMA devices (multi-rail); "" = first
   std::vector<int> dev_node_;         // NUMA node per devs_ entry (-1 unknown)
