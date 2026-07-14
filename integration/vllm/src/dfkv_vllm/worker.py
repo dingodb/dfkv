@@ -49,7 +49,8 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 # dfkv handles its own RDMA bootstrap so the transfer-engine helpers are dropped.
 from ._determinism import ensure_deterministic_block_hashing
 from .client_ranks import ENV_NAME as CLIENT_RANKS_ENV
-from .client_ranks import participant, resolve_client_ranks
+from .client_ranks import (ELIDE_ENV, participant, resolve_client_ranks,
+                           should_create_client)
 from .coordinator import (
     ExternalCachedBlockPool,
     DfkvStoreCoordinator,
@@ -584,7 +585,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 # into this chunk's per-layer segments. hit == 1 + len == sum(caps)
                 # means the chunk loaded; a miss or short read marks the originating
                 # block as a load error so vLLM recomputes that span (never fatal).
-                hits, lens = self.client.batch_get_auto_sg(sg_keys, sg_ptrs, sg_caps)
+                if self.client is None:  # elided producer rank: defensive miss
+                    hits, lens = [False] * len(sg_keys), [0] * len(sg_keys)
+                else:
+                    hits, lens = self.client.batch_get_auto_sg(sg_keys, sg_ptrs, sg_caps)
                 failed_block_ids: list[int] = []
                 failed_detail: list[tuple[str, int]] = []
                 for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True)):
@@ -845,14 +849,23 @@ class DfkvStoreWorker:
                 f"role={self.kv_role},tp_size={self.tp_size},"
                 f"tp_rank={self.tp_rank},ver={_tcfg.dist_version('dfkv-vllm')}"
             )
-        self.client = DfkvDeviceClient(
+        # Phase 2a (issue #111): producer non-participants skip the client
+        # entirely (opt-in via DFKV_CONNECTOR_CLIENT_ELIDE=1; layout-clamped).
+        create_client, elide_reason = should_create_client(
+            self.kv_role, self.tp_rank, self.tp_size, self.client_ranks,
+            _tcfg.truthy(os.environ.get(ELIDE_ENV, "0")))
+        if not create_client:
+            logger.info("dfkv client elided: %s", elide_reason)
+            self.client = None
+        else:
+            self.client = DfkvDeviceClient(
             members=extra.get("members", ""),
             mds_endpoints=mds_endpoints,
             mds_group=mds_group,
             mds_poll_ms=int(extra.get("mds_poll_ms", 3000)),
             model_hash=int(extra.get("model_hash", 0)),
             lib_path=extra.get("lib"),
-            batch_concurrency=int(extra.get("batch_concurrency", 8)),
+            batch_concurrency=int(extra.get("batch_concurrency", 0)),  # 0 = lib default (>=1.20 auto)
             client_register=client_register,
             client_id=client_id,
             client_info=client_info,
@@ -1006,7 +1019,8 @@ class DfkvStoreWorker:
             # each physical storage region ONCE (aliased groups reuse the MR).
             if base_addr not in registered_ptrs:
                 registered_ptrs.add(base_addr)
-                self.client.register_memory(base_addr, region_len)
+                if self.client is not None:
+                    self.client.register_memory(base_addr, region_len)
 
             g_idx = layer_to_group[layer_name]
             # Address THIS layer's blocks from its own tensor data_ptr (== the

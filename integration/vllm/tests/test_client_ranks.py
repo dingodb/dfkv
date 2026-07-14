@@ -39,3 +39,43 @@ def test_participant_spread_is_even_and_exact():
     assert [participant(r, 4, 4) for r in range(4)] == [0, 1, 2, 3]
     # N=1: only rank 0.
     assert [participant(r, 4, 1) for r in range(4)] == [0, None, None, None]
+
+
+# ---- Phase 2a: producer-side client elision (should_create_client) ----
+
+from dfkv_vllm.client_ranks import should_create_client  # noqa: E402
+
+
+def test_elide_off_always_creates():
+    for role in ("kv_producer", "kv_consumer", "kv_both"):
+        for r in range(8):
+            ok, reason = should_create_client(role, r, 8, 2, False)
+            assert ok and reason == "default(create)"
+
+
+def test_elide_only_producer_non_participants():
+    # tp=8, N=2 -> participants are ranks 0 and 4.
+    for r in range(8):
+        ok, reason = should_create_client("kv_producer", r, 8, 2, True)
+        if r in (0, 4):
+            assert ok and reason == "participant"
+        else:
+            assert not ok and reason.startswith("elided(")
+
+
+def test_elide_never_touches_consumers_or_both():
+    for role in ("kv_consumer", "kv_both"):
+        for r in range(8):
+            ok, reason = should_create_client(role, r, 8, 2, True)
+            assert ok and reason.startswith("clamped(role=")
+
+
+def test_elide_noop_without_convergence():
+    for r in range(8):
+        ok, reason = should_create_client("kv_producer", r, 8, 8, True)
+        assert ok and reason == "clamped(no-convergence)"
+
+
+def test_elide_n1_keeps_rank0_only():
+    created = [should_create_client("kv_producer", r, 8, 1, True)[0] for r in range(8)]
+    assert created == [True] + [False] * 7

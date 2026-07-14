@@ -57,7 +57,7 @@ class DfkvDeviceClient:
         members: str = "",
         model_hash: int = 0,
         lib_path: Optional[str] = None,
-        batch_concurrency: int = 8,
+        batch_concurrency: int = 0,  # 0 = library default (>=1.20 auto-scales)
         geometry: Sequence[int] = _GEOMETRY_ZEROS,
         mds_endpoints: str = "",
         mds_group: str = "default",
@@ -86,7 +86,8 @@ class DfkvDeviceClient:
             raise RuntimeError(
                 f"dfkv_open failed (members={members!r}, mds={mds_endpoints!r})"
             )
-        self._lib.dfkv_set_batch_concurrency(self._h, c_uint64(batch_concurrency))
+        if batch_concurrency > 0:
+            self._lib.dfkv_set_batch_concurrency(self._h, c_uint64(batch_concurrency))
         if mds_endpoints:
             rc = self._lib.dfkv_start_mds_discovery(
                 self._h, mds_endpoints.encode(), mds_group.encode(), int(mds_poll_ms)
