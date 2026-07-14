@@ -454,7 +454,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         if (!sqe) break;  // SQ full: leave the rest to the loop path
         io_uring_prep_write(sqe, extent_dio_fds_[st[i].ref.extent], it.data,
                             static_cast<unsigned>(alen), st[i].ref.offset);
-        io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(i));
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));  // set_data64 needs liburing>=2.2; CI ships 2.1
         st[i].io_ok = false;  // set true on CQE
         ++submitted;
       }
@@ -464,7 +464,7 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         while (rc > 0 && done < submitted) {
           io_uring_cqe* cqe = nullptr;
           if (io_uring_wait_cqe(ring, &cqe) != 0) break;
-          const size_t i = static_cast<size_t>(io_uring_cqe_get_data64(cqe));
+          const size_t i = static_cast<size_t>(reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe)));
           const auto& it = items[i];
           const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
           if (i < N && cqe->res == static_cast<int>(alen)) st[i].io_ok = true;
