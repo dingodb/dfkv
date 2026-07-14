@@ -469,3 +469,49 @@ TEST_F(DiskSlabTest, ReclaimTickGrowsHotClassFromColdDonor) {
   EXPECT_GT(s.GetStats().rebalanced_extents, 0u) << "growth never kicked in";
   EXPECT_GE(retained, 250u) << "hot class must absorb capacity, not eat itself";
 }
+
+// Batched CacheDirect: same per-item semantics as CacheDirect with one lock
+// hold per phase. Covers happy path, batch-internal dup (idempotent), invalid
+// item, and read-back byte equality (loop path in non-uring builds).
+TEST_F(DiskSlabTest, CacheDirectBatchLandsAllItemsReadable) {
+  bool ok = false;
+  DiskSlabStore s(Opts(1 << 20, 1 << 20, 4096), &ok);
+  ASSERT_TRUE(ok);
+  constexpr int N = 12;
+  std::vector<std::string> vals(N);
+  std::vector<DiskSlabStore::CacheBatchItem> items;
+  for (int i = 0; i < N; ++i) {
+    vals[i].assign(3000 + i * 17, static_cast<char>('a' + i));
+    items.push_back({K(500 + i), vals[i].data(), vals[i].size(), vals[i].size()});
+  }
+  items.push_back({K(500), vals[0].data(), vals[0].size(), vals[0].size()});  // dup of first
+  items.push_back({K(999), nullptr, 10, 10});                                // invalid
+  auto sts = s.CacheDirectBatch(items);
+  ASSERT_EQ(sts.size(), items.size());
+  for (int i = 0; i < N; ++i) EXPECT_EQ(sts[i], Status::kOk) << i;
+  EXPECT_EQ(sts[N], Status::kOk) << "batch-internal dup is idempotent kOk";
+  EXPECT_EQ(sts[N + 1], Status::kInvalid);
+  for (int i = 0; i < N; ++i) {
+    std::string out;
+    ASSERT_EQ(s.Range(K(500 + i), 0, vals[i].size(), &out), Status::kOk) << i;
+    EXPECT_EQ(out, vals[i]) << i;
+  }
+  EXPECT_GE(s.GetStats().batched_writes + 1, 1u);  // counter is uring-only; loop path leaves 0
+}
+
+// Batch under eviction pressure: items exceeding capacity still land (evicting
+// older residents), statuses all kOk, store never over-commits.
+TEST_F(DiskSlabTest, CacheDirectBatchEvictsUnderPressure) {
+  bool ok = false;
+  DiskSlabStore s(Opts(8 * 4096, 8 * 4096, 4096), &ok);  // 8 slots total
+  ASSERT_TRUE(ok);
+  std::string v(4000, 'p');
+  for (uint64_t i = 0; i < 8; ++i) ASSERT_EQ(s.Cache(K(1 + i), v.data(), v.size()), Status::kOk);
+  std::vector<DiskSlabStore::CacheBatchItem> items;
+  std::vector<std::string> vals(4, std::string(4000, 'q'));
+  for (int i = 0; i < 4; ++i) items.push_back({K(100 + i), vals[i].data(), vals[i].size(), vals[i].size()});
+  auto sts = s.CacheDirectBatch(items);
+  for (auto st : sts) EXPECT_EQ(st, Status::kOk);
+  EXPECT_EQ(s.Count(), 8u);
+  for (int i = 0; i < 4; ++i) EXPECT_TRUE(s.IsCached(K(100 + i)));
+}

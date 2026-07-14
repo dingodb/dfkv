@@ -1,6 +1,7 @@
 #include "cache/disk_cache_group.h"
 
 #include <cstdlib>
+#include <map>
 
 #include "cache/disk_slab_store.h"
 
@@ -133,6 +134,27 @@ Status DiskCacheGroup::RangeDirectPrep(const BlockKey& key, uint64_t offset,
   return st;
 }
 
+std::vector<Status> DiskCacheGroup::CacheDirectBatch(
+    const std::vector<StoreEngine::CacheBatchItem>& items) {
+  // Split by owning disk (consistent-hash route), one engine batch per disk --
+  // preserves per-key placement while letting the slab engine amortize locks
+  // and submit the disk's payload writes together.
+  std::vector<Status> out(items.size(), Status::kIOError);
+  std::map<StoreEngine*, std::vector<size_t>> by_disk;
+  for (size_t i = 0; i < items.size(); ++i) {
+    StoreEngine* d = Route(items[i].key);
+    if (d) by_disk[d].push_back(i);
+  }
+  for (auto& [d, idx] : by_disk) {
+    std::vector<StoreEngine::CacheBatchItem> sub;
+    sub.reserve(idx.size());
+    for (size_t k : idx) sub.push_back(items[k]);
+    std::vector<Status> sts = d->CacheDirectBatch(sub);
+    for (size_t m = 0; m < idx.size(); ++m) out[idx[m]] = sts[m];
+  }
+  return out;
+}
+
 DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
   DiskSlabStore::Stats sum;
   for (const auto* d : slabs_) {
@@ -146,6 +168,12 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.inflight += st.inflight;
     sum.prep_holds += st.prep_holds;
     sum.reclaimed_slots += st.reclaimed_slots;
+    // rebalanced_extents was MISSING from this sum since its introduction --
+    // dfkv_slab_rebalanced_total silently read 0 fleet-wide (found while adding
+    // the batch counters; canary data showed 0 despite active rebalances).
+    sum.rebalanced_extents += st.rebalanced_extents;
+    sum.batched_writes += st.batched_writes;
+    sum.uring_write_batches += st.uring_write_batches;
   }
   return sum;
 }

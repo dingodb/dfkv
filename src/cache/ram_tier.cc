@@ -326,47 +326,73 @@ void RamTier::DropLocked(const std::string& fn) {
 
 void RamTier::FlushLoop() {
   for (;;) {
-    QItem item;
+    // Drain up to kFlushBatchMax queued items in one pass (one worker's batch).
+    std::vector<QItem> batch;
     {
       std::unique_lock<std::mutex> lk(mu_);
       flush_cv_.wait(lk, [this] { return stop_ || !flushq_.empty(); });
       if (stop_ && flushq_.empty()) return;
-      item = std::move(flushq_.front());
-      flushq_.pop_front();
+      while (!flushq_.empty() && batch.size() < kFlushBatchMax) {
+        batch.push_back(std::move(flushq_.front()));
+        flushq_.pop_front();
+      }
     }
 
-    // Snapshot the slot (guaranteed present: a queued item is flush-pinned, so
-    // it can't be evicted or Removed).
-    char* data = nullptr;
-    size_t len = 0, cap = 0;
+    // Snapshot the slots (guaranteed present: queued items are flush-pinned,
+    // so they can't be evicted or Removed). live[] marks items still to flush.
+    const size_t B = batch.size();
+    std::vector<FlushItem> items(B);
+    std::vector<char> live(B, 0);
     {
       std::lock_guard<std::mutex> lk(mu_);
-      auto it = index_.find(item.fn);
-      if (it == index_.end() || it->second.durable) continue;  // gone/already done
-      data = arena_ + it->second.offset;
-      len = it->second.len;
-      cap = it->second.cap;
+      for (size_t i = 0; i < B; ++i) {
+        auto it = index_.find(batch[i].fn);
+        if (it == index_.end() || it->second.durable) continue;  // gone/already done
+        items[i] = FlushItem{batch[i].key, arena_ + it->second.offset,
+                             it->second.len, it->second.cap};
+        live[i] = 1;
+      }
     }
 
-    const bool ok = flush_ ? flush_(item.key, data, len, cap) : true;
+    // Flush: batched sink when wired (one store visit for the whole dequeue),
+    // else the per-item sink. Per-item ok/fail semantics identical either way.
+    std::vector<char> ok(B, 0);
+    if (flush_batch_) {
+      std::vector<FlushItem> sub;
+      std::vector<size_t> map;
+      for (size_t i = 0; i < B; ++i)
+        if (live[i]) { sub.push_back(items[i]); map.push_back(i); }
+      if (!sub.empty()) {
+        std::vector<bool> r = flush_batch_(sub);
+        for (size_t m = 0; m < map.size() && m < r.size(); ++m) ok[map[m]] = r[m] ? 1 : 0;
+      }
+    } else {
+      for (size_t i = 0; i < B; ++i)
+        if (live[i])
+          ok[i] = (flush_ ? flush_(items[i].key, items[i].data, items[i].len, items[i].cap) : true) ? 1 : 0;
+    }
+    if (!flush_ && !flush_batch_) for (size_t i = 0; i < B; ++i) ok[i] = live[i];
 
     {
       std::lock_guard<std::mutex> lk(mu_);
-      auto it = index_.find(item.fn);
-      if (it == index_.end()) continue;  // defensive
-      if (ok) {
-        it->second.durable = true;
-        alloc_->Unpin(item.fn);  // release the flush-pin -> now evictable
-        flushed_.fetch_add(1, std::memory_order_relaxed);
-      } else if (++item.tries < opt_.flush_retries) {
-        flushq_.push_back(std::move(item));  // retry later
-        flush_cv_.notify_one();
-      } else {
-        // Give up: drop from RAM (releases flush-pin + frees slot). GET falls
-        // back to a miss (recompute) -- correct cache semantics, no arena leak.
-        alloc_->Unpin(item.fn);
-        DropLocked(item.fn);
-        flush_dropped_.fetch_add(1, std::memory_order_relaxed);
+      for (size_t i = 0; i < B; ++i) {
+        if (!live[i]) continue;
+        auto it = index_.find(batch[i].fn);
+        if (it == index_.end()) continue;  // defensive
+        if (ok[i]) {
+          it->second.durable = true;
+          alloc_->Unpin(batch[i].fn);  // release the flush-pin -> now evictable
+          flushed_.fetch_add(1, std::memory_order_relaxed);
+        } else if (++batch[i].tries < opt_.flush_retries) {
+          flushq_.push_back(std::move(batch[i]));  // retry later
+          flush_cv_.notify_one();
+        } else {
+          // Give up: drop from RAM (releases flush-pin + frees slot). GET falls
+          // back to a miss (recompute) -- correct cache semantics, no arena leak.
+          alloc_->Unpin(batch[i].fn);
+          DropLocked(batch[i].fn);
+          flush_dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
       }
     }
   }

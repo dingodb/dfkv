@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -43,6 +44,18 @@ class StoreEngine {
   virtual Status Cache(const BlockKey& key, const void* data, size_t len) = 0;
   virtual Status CacheDirect(const BlockKey& key, char* data, size_t len,
                              size_t cap) = 0;
+  // Batched CacheDirect: same per-item semantics/status as CacheDirect, but an
+  // engine may amortize its lock round-trips and submit the payload writes
+  // together (the RAM-tier flusher's small-object drain is IOPS-bound at one
+  // synchronous write per key). Default: per-item loop -- engines without a
+  // batch win (file engine) inherit correct behavior.
+  struct CacheBatchItem { BlockKey key; char* data; size_t len; size_t cap; };
+  virtual std::vector<Status> CacheDirectBatch(const std::vector<CacheBatchItem>& items) {
+    std::vector<Status> out;
+    out.reserve(items.size());
+    for (const auto& it : items) out.push_back(CacheDirect(it.key, it.data, it.len, it.cap));
+    return out;
+  }
   virtual Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
                        std::string* out) = 0;
   virtual Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,

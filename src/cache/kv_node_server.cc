@@ -81,6 +81,18 @@ void KvNodeServer::InitRamTier() {
       o, [this](const BlockKey& k, char* d, size_t l, size_t cap) {
         return group_.CacheDirect(k, d, l, cap) == Status::kOk;
       });
+  // Batched sink: a flush worker's whole dequeue rides one lock-amortized
+  // (and, with a uring build, one-submit) store visit per disk.
+  tier->set_flush_batch([this](const std::vector<RamTier::FlushItem>& items) {
+    std::vector<StoreEngine::CacheBatchItem> b;
+    b.reserve(items.size());
+    for (const auto& it : items)
+      b.push_back(StoreEngine::CacheBatchItem{it.key, it.data, it.len, it.cap});
+    std::vector<Status> sts = group_.CacheDirectBatch(b);
+    std::vector<bool> ok(items.size(), false);
+    for (size_t i = 0; i < sts.size(); ++i) ok[i] = (sts[i] == Status::kOk);
+    return ok;
+  });
   if (tier->ok()) ram_ = std::move(tier);  // arena alloc failed => stay disk-only
 }
 
@@ -264,6 +276,10 @@ std::string KvNodeServer::MetricsText() const {
            "Outstanding async-prep slot holds", ss.prep_holds);
     metric("dfkv_slab_reclaimed_total", "counter",
            "Slots freed ahead of demand by the background reclaimer", ss.reclaimed_slots);
+    metric("dfkv_slab_batched_writes_total", "counter",
+           "Payload writes that rode a batched store visit", ss.batched_writes);
+    metric("dfkv_slab_uring_write_batches_total", "counter",
+           "io_uring one-submit rounds on the batched write path", ss.uring_write_batches);
     metric("dfkv_slab_rebalanced_total", "counter",
            "Extents moved from cold classes to hot ones by the reclaimer", ss.rebalanced_extents);
   }

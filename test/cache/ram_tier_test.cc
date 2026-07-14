@@ -300,3 +300,39 @@ TEST(RamTier, ReclaimTickGrowsHotClassFromColdDonor) {
   EXPECT_GT(rt.Rebalanced(), 0u) << "growth never kicked in";
   EXPECT_GE(resident, 250u) << "hot class must absorb capacity, not eat itself";
 }
+
+// Batched flush sink: a worker drains multiple queued items into ONE batch
+// call; per-item retry/drop semantics survive partial batch failure.
+TEST(RamTier, BatchFlushDrainsQueueAndRetriesPerItem) {
+  std::mutex m;
+  std::vector<size_t> batch_sizes;
+  std::atomic<int> fail_key{-1};
+  RamTier::Options o = Opts(256 * 4096);
+  o.flush_threads = 1;  // single worker => deterministic batching
+  RamTier rt(o, nullptr);
+  rt.set_flush_batch([&](const std::vector<RamTier::FlushItem>& items) {
+    std::lock_guard<std::mutex> lk(m);
+    batch_sizes.push_back(items.size());
+    std::vector<bool> ok(items.size(), true);
+    for (size_t i = 0; i < items.size(); ++i)
+      if (fail_key >= 0 && items[i].key.id == static_cast<uint64_t>(fail_key.load())) ok[i] = false;
+    return ok;
+  });
+  ASSERT_TRUE(rt.ok());
+  std::string v(4000, 'b');
+  for (uint64_t i = 0; i < 40; ++i) ASSERT_TRUE(rt.Put(K(700 + i), v.data(), v.size()));
+  ASSERT_TRUE(WaitFor([&] { return rt.Flushed() == 40u; }));
+  {
+    std::lock_guard<std::mutex> lk(m);
+    size_t mx = 0; for (size_t b : batch_sizes) mx = std::max(mx, b);
+    EXPECT_GT(mx, 1u) << "worker never batched";
+  }
+  // Partial failure: one key keeps failing -> retried then dropped; others flush.
+  fail_key = 900;
+  ASSERT_TRUE(rt.Put(K(900), v.data(), v.size()));
+  ASSERT_TRUE(rt.Put(K(901), v.data(), v.size()));
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushDropped() == 1u; }));
+  EXPECT_TRUE(WaitFor([&] { return rt.Flushed() >= 41u; }));
+  EXPECT_FALSE(rt.Contains(K(900))) << "dropped after retries";
+  EXPECT_TRUE(rt.Contains(K(901)));
+}

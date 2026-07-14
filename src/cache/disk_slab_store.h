@@ -81,6 +81,8 @@ class DiskSlabStore : public StoreEngine {
     uint64_t prep_holds = 0;           // outstanding async-prep slot holds
     uint64_t reclaimed_slots = 0;      // slots freed by the background reclaimer
     uint64_t rebalanced_extents = 0;   // extents moved hot<-cold by the reclaimer
+    uint64_t batched_writes = 0;       // payload writes that rode a batch submit
+    uint64_t uring_write_batches = 0;  // io_uring one-submit rounds (0 = loop path)
   };
 
   // Opens (or creates) the store under Options::dir, pre-allocating extents and
@@ -95,6 +97,10 @@ class DiskSlabStore : public StoreEngine {
   Status Cache(const BlockKey& key, const void* data, size_t len) override;
   // Buffered engine: the aligned direct-PUT buffer is just written as bytes.
   Status CacheDirect(const BlockKey& key, char* data, size_t len, size_t cap) override;
+  // Batched CacheDirect: ONE lock hold allocates every slot, payloads go out
+  // unlocked (io_uring one-submit when built+enabled, else a sequential loop),
+  // ONE lock hold commits. Per-item semantics identical to CacheDirect.
+  std::vector<Status> CacheDirectBatch(const std::vector<CacheBatchItem>& items) override;
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
                std::string* out) override;
   Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
@@ -206,6 +212,11 @@ class DiskSlabStore : public StoreEngine {
   static constexpr size_t kGrowExtentsPerTick = 2;
   std::atomic<uint64_t> reclaimed_{0};
   std::atomic<uint64_t> rebalanced_{0};
+  std::atomic<uint64_t> batched_writes_{0};
+  std::atomic<uint64_t> uring_write_batches_{0};
+  bool uring_write_enabled_ = false;   // DFKV_SLAB_URING_WRITE (needs DFKV_WITH_URING build)
+  void* uring_w_ = nullptr;            // io_uring* (lazily created, guarded by uring_w_mu_)
+  std::mutex uring_w_mu_;
   std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
   std::thread reclaim_thread_;
   std::condition_variable reclaim_cv_;

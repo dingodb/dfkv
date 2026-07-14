@@ -1,5 +1,9 @@
 #include "cache/disk_slab_store.h"
 
+#ifdef DFKV_WITH_URING
+#include <liburing.h>
+#endif
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -108,6 +112,14 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
       }
     });
   }
+  // Batched-write submit path (io_uring). Only meaningful with a DFKV_WITH_URING
+  // build AND direct mode; DFKV_SLAB_URING_WRITE=0 is the kill switch.
+#ifdef DFKV_WITH_URING
+  {
+    const char* v = std::getenv("DFKV_SLAB_URING_WRITE");
+    uring_write_enabled_ = !(v && *v == '0');
+  }
+#endif
   if (ok_ && opt_.reclaim_interval_ms > 0) {
     reclaim_thread_ = std::thread([this] {
       std::unique_lock<std::mutex> lk(reclaim_mu_);
@@ -125,6 +137,13 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
 }
 
 DiskSlabStore::~DiskSlabStore() {
+#ifdef DFKV_WITH_URING
+  if (uring_w_) {
+    io_uring_queue_exit(static_cast<io_uring*>(uring_w_));
+    delete static_cast<io_uring*>(uring_w_);
+    uring_w_ = nullptr;
+  }
+#endif
   if (reclaim_thread_.joinable()) {
     { std::lock_guard<std::mutex> lk(reclaim_mu_); reclaim_stop_ = true; }
     reclaim_cv_.notify_all();
@@ -370,6 +389,133 @@ Status DiskSlabStore::CacheDirect(const BlockKey& key, char* data, size_t len,
       dio_write_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     return WritePayload(r, data, len);
   });
+}
+
+
+// Batched CacheDirect. Three phases mirror CacheImpl exactly, amortized:
+//   L1 (one mu_): dedup + allocate + write-pin + inflight for every item;
+//   IO (unlocked): zero-pad + payload writes -- ONE io_uring submit when the
+//     build has uring and DFKV_SLAB_URING_WRITE isn't 0 (small-object flushing
+//     is IOPS-bound at one synchronous DIO write per key), else a loop; then
+//     the 64 B records (buffered pwrites, cheap) in a loop;
+//   L2 (one mu_): per-item deferred-remove check, inflight release, failure
+//     rollback, payload_len_ commit.
+std::vector<Status> DiskSlabStore::CacheDirectBatch(
+    const std::vector<CacheBatchItem>& items) {
+  const size_t N = items.size();
+  std::vector<Status> out(N, Status::kIOError);
+  if (!ok_ || N == 0) return out;  // already N x kIOError / empty
+  struct Slot { std::string fn; SlabAllocator::SlotRef ref; bool active = false; bool io_ok = false; bool direct = false; };
+  std::vector<Slot> st(N);
+  // -- L1: allocate under one lock --
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (size_t i = 0; i < N; ++i) {
+      const auto& it = items[i];
+      if (it.data == nullptr && it.len != 0) { out[i] = Status::kInvalid; continue; }
+      st[i].fn = it.key.Filename();
+      if (alloc_->Contains(st[i].fn)) { out[i] = Status::kOk; continue; }  // idempotent (incl. batch-internal dup)
+      std::vector<std::string> evicted;
+      if (!alloc_->Put(st[i].fn, it.len, &st[i].ref, &evicted)) { out[i] = Status::kIOError; continue; }
+      alloc_->Pin(st[i].fn);
+      inflight_[st[i].fn]++;
+      for (const auto& ev : evicted) {
+        auto pit = payload_len_.find(ev);
+        if (pit != payload_len_.end()) { evicted_bytes_ += pit->second; payload_len_.erase(pit); }
+      }
+      st[i].active = true;
+      // Same eligibility test as CacheDirect: aligned buffer + padded cap.
+      const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
+      st[i].direct = !extent_dio_fds_.empty() && it.len != 0 &&
+                     (reinterpret_cast<uintptr_t>(it.data) & 4095) == 0 &&
+                     alen <= it.cap && alen <= st[i].ref.slot_size;
+    }
+  }
+  // -- IO: payloads (uring one-submit when possible), then records --
+  size_t direct_n = 0;
+  for (size_t i = 0; i < N; ++i) if (st[i].active && st[i].direct) direct_n++;
+#ifdef DFKV_WITH_URING
+  bool did_uring = false;
+  if (uring_write_enabled_ && direct_n >= 2) {
+    std::lock_guard<std::mutex> ulk(uring_w_mu_);
+    if (!uring_w_) {
+      auto* r = new io_uring;
+      if (io_uring_queue_init(256, r, 0) == 0) uring_w_ = r; else delete r;
+    }
+    if (uring_w_) {
+      auto* ring = static_cast<io_uring*>(uring_w_);
+      size_t submitted = 0;
+      for (size_t i = 0; i < N; ++i) {
+        if (!st[i].active || !st[i].direct) continue;
+        const auto& it = items[i];
+        const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
+        std::memset(it.data + it.len, 0, alen - it.len);
+        io_uring_sqe* sqe = io_uring_get_sqe(ring);
+        if (!sqe) break;  // SQ full: leave the rest to the loop path
+        io_uring_prep_write(sqe, extent_dio_fds_[st[i].ref.extent], it.data,
+                            static_cast<unsigned>(alen), st[i].ref.offset);
+        io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(i));
+        st[i].io_ok = false;  // set true on CQE
+        ++submitted;
+      }
+      if (submitted) {
+        int rc = io_uring_submit(ring);
+        size_t done = 0;
+        while (rc > 0 && done < submitted) {
+          io_uring_cqe* cqe = nullptr;
+          if (io_uring_wait_cqe(ring, &cqe) != 0) break;
+          const size_t i = static_cast<size_t>(io_uring_cqe_get_data64(cqe));
+          const auto& it = items[i];
+          const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
+          if (i < N && cqe->res == static_cast<int>(alen)) st[i].io_ok = true;
+          io_uring_cqe_seen(ring, cqe);
+          ++done;
+        }
+        did_uring = true;
+        uring_write_batches_.fetch_add(1, std::memory_order_relaxed);
+        batched_writes_.fetch_add(submitted, std::memory_order_relaxed);
+        // A submitted-but-failed (or unsubmitted, SQ-full) item keeps
+        // io_ok=false and falls through to the sequential path below, which
+        // retries it once (direct first, then the buffered fallback inside).
+      }
+    }
+  }
+  (void)did_uring;
+#endif
+  for (size_t i = 0; i < N; ++i) {
+    if (!st[i].active) continue;
+    const auto& it = items[i];
+    if (!st[i].io_ok) {  // not written by uring (loop path / fallback / uring failure)
+      bool w;
+      if (st[i].direct) {
+        w = WritePayloadDirect(st[i].ref, it.data, it.len);
+      } else {
+        if (!extent_dio_fds_.empty() && it.len != 0)
+          dio_write_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+        w = WritePayload(st[i].ref, it.data, it.len);
+      }
+      st[i].io_ok = w;
+    }
+    if (st[i].io_ok)
+      st[i].io_ok = WriteRecord(st[i].ref, it.key, static_cast<uint32_t>(it.len), /*valid=*/true);
+  }
+  // -- L2: commit under one lock --
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (size_t i = 0; i < N; ++i) {
+      if (!st[i].active) continue;
+      const bool removed = deferred_remove_.count(st[i].fn) > 0;
+      ReleaseInflightLocked(items[i].key, st[i].fn);
+      if (!st[i].io_ok) {
+        if (!removed) alloc_->Remove(st[i].fn);
+        out[i] = Status::kIOError;
+        continue;
+      }
+      if (!removed) payload_len_[st[i].fn] = static_cast<uint32_t>(items[i].len);
+      out[i] = Status::kOk;
+    }
+  }
+  return out;
 }
 
 Status DiskSlabStore::RangeDirect(const BlockKey& key, uint64_t offset,
@@ -704,6 +850,8 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.prep_holds = prep_holds_.size();
   st.reclaimed_slots = reclaimed_.load(std::memory_order_relaxed);
   st.rebalanced_extents = rebalanced_.load(std::memory_order_relaxed);
+  st.batched_writes = batched_writes_.load(std::memory_order_relaxed);
+  st.uring_write_batches = uring_write_batches_.load(std::memory_order_relaxed);
   return st;
 }
 

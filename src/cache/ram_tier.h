@@ -78,6 +78,14 @@ class RamTier {
   // can ignore cap.
   using FlushFn =
       std::function<bool(const BlockKey& key, char* data, size_t len, size_t cap)>;
+  // Batched flush sink (optional). One arena slot per item, same contract as
+  // FlushFn; the server wires this to the disk group's CacheDirectBatch so a
+  // worker's whole dequeue rides one lock-amortized (and, with uring, one-
+  // submit) store visit -- small-object flushing is IOPS-bound at one
+  // synchronous DIO write per key otherwise. Unset = per-item FlushFn.
+  struct FlushItem { BlockKey key; char* data; size_t len; size_t cap; };
+  using FlushBatchFn = std::function<std::vector<bool>(const std::vector<FlushItem>&)>;
+  void set_flush_batch(FlushBatchFn fn) { flush_batch_ = std::move(fn); }
 
   // A pinned arena location handed to the RDMA send path. `token` must be passed
   // back to Release() once the send completes (releases the send-pin).
@@ -139,6 +147,10 @@ class RamTier {
   struct QItem { std::string fn; BlockKey key; uint32_t tries = 0; };
 
   void FlushLoop();
+  // Max items one flush worker drains per store visit. Big enough to amortize
+  // the two store-lock hops + reach a useful uring submit width, small enough
+  // that a batch's slots stay flush-pinned only briefly.
+  static constexpr size_t kFlushBatchMax = 16;
   void ReclaimTick();  // one background grow + free-slot top-up pass (see Options)
   // Rebalance rate cap: extents moved per tick per hot class (32 MiB default
   // extents; converges in well under a second at the 10 ms tick).
@@ -147,6 +159,7 @@ class RamTier {
 
   Options opt_;
   FlushFn flush_;
+  FlushBatchFn flush_batch_;
   char* arena_ = nullptr;
   void* arena_mr_ = nullptr;
   uint64_t extent_bytes_ = 0;   // SlabAllocator extent size; global arena offset
