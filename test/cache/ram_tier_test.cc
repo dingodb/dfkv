@@ -250,3 +250,25 @@ TEST(RamTier, ConcurrentPutGetReleaseIsRaceFree) {
   for (auto& th : ts) th.join();
   EXPECT_GT(hits.load(), 0);
 }
+
+// Background reclaimer wiring: once the arena is full of DURABLE slots and new
+// writes keep coming, the reclaimer (not the Put path) pre-frees slots, so
+// admission rides pop-free-slot and never hits backpressure bypass.
+TEST(RamTier, BackgroundReclaimerPreFreesDurableSlots) {
+  FlushSink sink;
+  auto o = Opts(16 * 4096);  // 16 slots, one extent (pool exhausted at first bind)
+  o.reclaim_interval_ms = 1;
+  RamTier rt(o, sink.fn());
+  ASSERT_TRUE(rt.ok());
+  std::string v(4000, 'r');
+  for (uint64_t i = 0; i < 16; ++i) ASSERT_TRUE(rt.Put(K(100 + i), v.data(), v.size()));
+  ASSERT_TRUE(WaitFor([&] { return rt.FlushBacklog() == 0; }));  // all durable
+  // Sustained new-key writes: demand makes the reclaimer top up free slots.
+  for (uint64_t i = 0; i < 32; ++i) {
+    EXPECT_TRUE(rt.Put(K(200 + i), v.data(), v.size()));
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_TRUE(WaitFor([&] { return rt.Reclaimed() > 0; }))
+      << "reclaimer never pre-freed a slot";
+  EXPECT_EQ(rt.PutBypass(), 0u);
+}

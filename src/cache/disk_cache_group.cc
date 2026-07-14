@@ -36,6 +36,10 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   uint32_t sync_ms = 100;
   if (const char* t = std::getenv("DFKV_SLAB_TABLE_SYNC_MS"))
     sync_ms = static_cast<uint32_t>(std::strtoul(t, nullptr, 10));
+  // Background free-slot reclaimer cadence override (ms; 0 disables). Default 50.
+  uint32_t reclaim_ms = 50;
+  if (const char* r = std::getenv("DFKV_SLAB_RECLAIM_MS"))
+    reclaim_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
   for (const auto& dir : opt.cache_dirs) {
     std::unique_ptr<StoreEngine> store;
     if (use_slab) {
@@ -45,6 +49,7 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
       so.direct_writes = slab_direct;
       if (slab_gran) so.slot_granularity = slab_gran;
       so.table_sync_ms = sync_ms;
+      so.reclaim_interval_ms = reclaim_ms;
       auto slab = std::make_unique<DiskSlabStore>(so);
       slabs_.push_back(slab.get());
       // Resolved truth (an fs that rejects O_DIRECT demotes to buffered).
@@ -140,6 +145,7 @@ DiskSlabStore::Stats DiskCacheGroup::SlabStats() const {
     sum.deferred_removes += st.deferred_removes;
     sum.inflight += st.inflight;
     sum.prep_holds += st.prep_holds;
+    sum.reclaimed_slots += st.reclaimed_slots;
   }
   return sum;
 }

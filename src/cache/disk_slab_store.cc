@@ -108,10 +108,28 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
       }
     });
   }
+  if (ok_ && opt_.reclaim_interval_ms > 0) {
+    reclaim_thread_ = std::thread([this] {
+      std::unique_lock<std::mutex> lk(reclaim_mu_);
+      for (;;) {
+        reclaim_cv_.wait_for(lk, std::chrono::milliseconds(opt_.reclaim_interval_ms),
+                             [this] { return reclaim_stop_; });
+        if (reclaim_stop_) return;
+        lk.unlock();
+        ReclaimTick();
+        lk.lock();
+      }
+    });
+  }
   if (ok) *ok = ok_;
 }
 
 DiskSlabStore::~DiskSlabStore() {
+  if (reclaim_thread_.joinable()) {
+    { std::lock_guard<std::mutex> lk(reclaim_mu_); reclaim_stop_ = true; }
+    reclaim_cv_.notify_all();
+    reclaim_thread_.join();
+  }
   if (sync_thread_.joinable()) {
     { std::lock_guard<std::mutex> lk(sync_mu_); sync_stop_ = true; }
     sync_cv_.notify_all();
@@ -576,6 +594,51 @@ uint64_t DiskSlabStore::EvictedBytes() const {
   return evicted_bytes_;
 }
 
+// One reclaimer pass: for every class with new inserts since the last pass,
+// top its free-slot pool up to a demand-driven watermark (enough headroom for
+// ~2 intervals of the observed insert rate, capped at 1/4 of the class's bound
+// capacity so an idle-then-bursty class is never hollowed out). Eviction runs
+// in bounded batches per store-lock hold, so a Put never waits behind a long
+// sweep -- the sweep Put used to run inline now happens here.
+void DiskSlabStore::ReclaimTick() {
+  const auto classes = alloc_->Classes();
+  if (reclaim_last_puts_.size() < classes.size())
+    reclaim_last_puts_.resize(classes.size(), 0);
+  for (size_t i = 0; i < classes.size(); ++i) {
+    const auto& c = classes[i];
+    const uint64_t delta = c.puts - reclaim_last_puts_[i];
+    reclaim_last_puts_[i] = c.puts;
+    if (delta == 0) continue;  // no write demand on this class
+    const size_t capacity = c.resident + c.free_slots;
+    size_t target = std::max<size_t>(64, static_cast<size_t>(2 * delta));
+    target = std::min(target, capacity / 4);
+    if (c.free_slots >= target) continue;
+    size_t budget = 4096;  // per-tick per-class bound
+    for (;;) {
+      std::vector<std::string> evicted;
+      const size_t batch = std::min<size_t>(128, budget);
+      size_t got;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        got = alloc_->ReclaimClass(i, target, batch, &evicted);
+        for (const auto& ev : evicted) {
+          auto pit = payload_len_.find(ev);
+          if (pit != payload_len_.end()) {
+            evicted_bytes_ += pit->second;
+            payload_len_.erase(pit);
+          }
+        }
+      }
+      if (got > 0) reclaimed_.fetch_add(got, std::memory_order_relaxed);
+      budget -= std::min(budget, got);
+      // A partial batch means ReclaimClass stopped for an internal reason --
+      // target reached, everything pinned, or an extent went back to the pool
+      // (its cascade-shrink guard). Re-invoking would defeat that guard.
+      if (got < batch || budget == 0) break;
+    }
+  }
+}
+
 DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   Stats st;
   st.dio_write_fallbacks = dio_write_fallbacks_.load(std::memory_order_relaxed);
@@ -588,6 +651,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.deferred_removes = deferred_remove_total_;
   st.inflight = inflight_.size();
   st.prep_holds = prep_holds_.size();
+  st.reclaimed_slots = reclaimed_.load(std::memory_order_relaxed);
   return st;
 }
 

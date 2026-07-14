@@ -85,9 +85,27 @@ RamTier::RamTier(Options opt, FlushFn flush)
   flushers_.reserve(nf);
   for (uint32_t i = 0; i < nf; ++i)
     flushers_.emplace_back([this] { FlushLoop(); });
+  if (opt_.reclaim_interval_ms > 0) {
+    reclaim_thread_ = std::thread([this] {
+      std::unique_lock<std::mutex> lk(reclaim_mu_);
+      for (;;) {
+        reclaim_cv_.wait_for(lk, std::chrono::milliseconds(opt_.reclaim_interval_ms),
+                             [this] { return reclaim_stop_; });
+        if (reclaim_stop_) return;
+        lk.unlock();
+        ReclaimTick();
+        lk.lock();
+      }
+    });
+  }
 }
 
 RamTier::~RamTier() {
+  if (reclaim_thread_.joinable()) {
+    { std::lock_guard<std::mutex> lk(reclaim_mu_); reclaim_stop_ = true; }
+    reclaim_cv_.notify_all();
+    reclaim_thread_.join();
+  }
   {
     std::lock_guard<std::mutex> lk(mu_);
     stop_ = true;
@@ -95,6 +113,45 @@ RamTier::~RamTier() {
   flush_cv_.notify_all();
   for (auto& f : flushers_) if (f.joinable()) f.join();
   if (arena_) std::free(arena_);
+}
+
+// One reclaimer pass (mirror of DiskSlabStore::ReclaimTick, arena flavor): for
+// every class with new inserts since the last pass, top its free slots up to a
+// demand-driven watermark, in small batches per mu_ hold. Victims are unpinned
+// (== durable, no send in flight), so dropping them from index_ is the same
+// operation Put performs for its own inline evictions. This keeps Put's
+// allocator call on the pop-free-slot fast path; without it a full arena runs
+// the CLOCK sweep inline under mu_ on every admission.
+void RamTier::ReclaimTick() {
+  const auto classes = alloc_->Classes();
+  if (reclaim_last_puts_.size() < classes.size())
+    reclaim_last_puts_.resize(classes.size(), 0);
+  for (size_t i = 0; i < classes.size(); ++i) {
+    const auto& c = classes[i];
+    const uint64_t delta = c.puts - reclaim_last_puts_[i];
+    reclaim_last_puts_[i] = c.puts;
+    if (delta == 0) continue;  // no write demand on this class
+    const size_t capacity = c.resident + c.free_slots;
+    size_t target = std::max<size_t>(64, static_cast<size_t>(2 * delta));
+    target = std::min(target, capacity / 4);
+    if (c.free_slots >= target) continue;
+    size_t budget = 4096;  // per-tick per-class bound
+    for (;;) {
+      std::vector<std::string> evicted;
+      const size_t batch = std::min<size_t>(64, budget);
+      size_t got;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        got = alloc_->ReclaimClass(i, target, batch, &evicted);
+        for (const auto& ev : evicted) index_.erase(ev);
+      }
+      if (got > 0) reclaimed_.fetch_add(got, std::memory_order_relaxed);
+      budget -= std::min(budget, got);
+      // Partial batch = ReclaimClass stopped early (target reached, everything
+      // pinned, or its cascade-shrink guard fired) -- don't re-invoke.
+      if (got < batch || budget == 0) break;
+    }
+  }
 }
 
 void RamTier::SetArenaMr(void* mr) {

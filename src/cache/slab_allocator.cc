@@ -23,6 +23,7 @@ void SlabAllocator::PushFreeLocked(Class& C, uint32_t ext, uint32_t slot) {
   auto& v = C.free_by_ext[ext];
   if (v.empty()) C.ext_rr.push_back(ext);
   v.push_back(slot);
+  C.free_count++;
 }
 
 bool SlabAllocator::PopFreeLocked(Class& C, Slot* out) {
@@ -33,6 +34,7 @@ bool SlabAllocator::PopFreeLocked(Class& C, Slot* out) {
   auto& v = vit->second;
   const uint32_t slot = v.back();
   v.pop_back();
+  C.free_count--;
   if (v.empty()) {
     C.free_by_ext.erase(vit);
     // Swap-erase keeps rr_next pointing at the moved-in extent: no skip, no advance.
@@ -63,12 +65,17 @@ bool SlabAllocator::TakeFreeSlotLocked(Class& C, uint32_t ext, uint32_t slot) {
   if (it == v.end()) return false;
   *it = v.back();
   v.pop_back();
+  C.free_count--;
   if (v.empty()) { C.free_by_ext.erase(vit); DropFromRotationLocked(C, ext); }
   return true;
 }
 
 void SlabAllocator::DropExtentFreeLocked(Class& C, uint32_t ext) {
-  if (C.free_by_ext.erase(ext)) DropFromRotationLocked(C, ext);
+  auto vit = C.free_by_ext.find(ext);
+  if (vit == C.free_by_ext.end()) return;
+  C.free_count -= vit->second.size();
+  C.free_by_ext.erase(vit);
+  DropFromRotationLocked(C, ext);
 }
 
 size_t SlabAllocator::ClassForLen(size_t aligned_len) {
@@ -129,7 +136,9 @@ bool SlabAllocator::Restore(const std::string& key, uint32_t slot_size,
   e.ring_it = C.ring.begin();
   m.free_slots--;
   used_bytes_ += slot_size;
-  index_.emplace(key, std::move(e));
+  auto res = index_.emplace(key, std::move(e));
+  m.residents.push_front(&res.first->first);
+  res.first->second.ext_it = m.residents.begin();
   return true;
 }
 
@@ -159,6 +168,7 @@ void SlabAllocator::FreeSlotLocked(const std::string& key, Entry& e) {
   Class& C = *classes_[cls];
   if (C.hand != C.ring.end() && C.hand == e.ring_it) C.hand = std::next(C.hand);
   C.ring.erase(e.ring_it);
+  extents_[ext].residents.erase(e.ext_it);
   PushFreeLocked(C, ext, slot);
   extents_[ext].free_slots++;
   if (e.refs > 0 && extents_[ext].pinned > 0) extents_[ext].pinned--;
@@ -234,22 +244,30 @@ bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted
   }
   if (best < 0) return false;
   const uint32_t E = static_cast<uint32_t>(best);
-  const int old_cls = extents_[E].cls;
-  // Evict every resident key living in extent E (scan the index -- steal is rare).
-  std::vector<std::string> victims;
-  for (const auto& kv : index_)
-    if (kv.second.ref.extent == E) victims.push_back(kv.first);
-  for (const auto& v : victims) {
-    auto it = index_.find(v);
-    if (it != index_.end()) { FreeSlotLocked(v, it->second); evicted->push_back(v); evictions_++; }
+  ExtentMeta& m = extents_[E];
+  const int old_cls = m.cls;
+  // Evict every resident key living in extent E, walked off its resident list:
+  // O(residents in E), not O(whole index) -- steal happens on every extent
+  // hand-off during a size-class mix shift, so it must not scan the store.
+  while (!m.residents.empty()) {
+    const std::string victim = *m.residents.front();
+    auto it = index_.find(victim);
+    if (it == index_.end()) { m.residents.pop_front(); continue; }  // stale node (defensive)
+    FreeSlotLocked(victim, it->second);  // erases the front resident node
+    evicted->push_back(victim);
+    evictions_++;
+    // The last eviction can auto-return E to the pool (FreeSlotLocked's
+    // fully-free unbind); residents is empty then, so the loop just ends.
   }
-  // Drop E's now-free slots from the old class's bookkeeping, then unbind E.
-  DropExtentFreeLocked(*classes_[old_cls], E);
-  extents_[E].cls = kUnbound;
-  extents_[E].total_slots = 0;
-  extents_[E].free_slots = 0;
-  extents_[E].pinned = 0;
-  ++unbound_;
+  // Unbind E unless FreeSlotLocked's return-to-pool already did.
+  if (m.cls != kUnbound) {
+    DropExtentFreeLocked(*classes_[old_cls], E);
+    m.cls = kUnbound;
+    m.total_slots = 0;
+    m.free_slots = 0;
+    m.pinned = 0;
+    ++unbound_;
+  }
   ++steals_;
   return BindFreeExtent(cls);  // now picks the freshly-unbound E
 }
@@ -292,9 +310,13 @@ bool SlabAllocator::Put(const std::string& key, size_t len, SlotRef* out,
   Class& C = *classes_[cls];
   C.ring.push_front(key);
   e.ring_it = C.ring.begin();
+  C.puts++;
   extents_[got.extent].free_slots--;
   used_bytes_ += e.ref.slot_size;
   auto res = index_.emplace(key, std::move(e));
+  ExtentMeta& m = extents_[got.extent];
+  m.residents.push_front(&res.first->first);
+  res.first->second.ext_it = m.residents.begin();
   if (out) *out = res.first->second.ref;
   return true;
 }
@@ -354,6 +376,47 @@ bool SlabAllocator::Unpin(const std::string& key) {
   if (it->second.refs == 0 && extents_[it->second.ref.extent].pinned > 0)
     extents_[it->second.ref.extent].pinned--;
   return true;
+}
+
+std::vector<SlabAllocator::ClassStat> SlabAllocator::Classes() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  std::vector<ClassStat> out;
+  out.reserve(classes_.size());
+  for (const auto& c : classes_) {
+    ClassStat s;
+    s.slot_size = c->slot_size;
+    s.free_slots = c->free_count;
+    s.resident = c->ring.size();
+    s.puts = c->puts;
+    out.push_back(s);
+  }
+  return out;
+}
+
+size_t SlabAllocator::ReclaimClass(size_t cls_index, size_t target_free,
+                                   size_t max_victims,
+                                   std::vector<std::string>* evicted) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (cls_index >= classes_.size()) return 0;
+  Class& C = *classes_[cls_index];
+  size_t n = 0;
+  while (n < max_victims && C.free_count < target_free) {
+    // While the shared pool still has extents, Put grows the class by binding
+    // one (cheap, no residency loss) -- evicting now would only shrink the
+    // cache for headroom the pool provides for free. Reclaim earns its keep
+    // exactly when the pool is exhausted and Put's only inline recourse is the
+    // CLOCK sweep this thread exists to pre-run.
+    if (unbound_ > 0) break;
+    const size_t before = C.free_count;
+    if (!EvictOneFrom(cls_index, evicted)) break;  // all pinned / empty
+    ++n;
+    // An eviction normally gains one free slot. If free_count did NOT grow, the
+    // freed slot's extent went back to the shared pool (fully-free unbind):
+    // stop -- more reclaiming would cascade-shrink this class, and the pool
+    // just gained a whole extent for whoever needs it.
+    if (C.free_count <= before) break;
+  }
+  return n;
 }
 
 size_t SlabAllocator::Count() const {

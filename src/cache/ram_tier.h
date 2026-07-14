@@ -60,6 +60,12 @@ class RamTier {
     // workers keep ~K devices busy). Same-key flushes can't run concurrently
     // (one queued item per key at a time), so workers need no extra ordering.
     uint32_t flush_threads = 1;
+    // Background free-slot reclaimer cadence (ms; 0 = off). Keeps demand-driven
+    // free-slot headroom per class so Put's allocator call stays pop-free-slot;
+    // without it a full arena runs the CLOCK eviction sweep inline under mu_ on
+    // every admission -- with tens of ingest threads that sweep is the measured
+    // write-path serialization point.
+    uint32_t reclaim_interval_ms = 10;
   };
 
   // Persists a slot to disk. Returns true on success (slot -> DURABLE). Called
@@ -114,6 +120,7 @@ class RamTier {
   uint64_t PutBypass() const { return put_bypass_.load(std::memory_order_relaxed); }
   uint64_t Flushed() const { return flushed_.load(std::memory_order_relaxed); }
   uint64_t FlushDropped() const { return flush_dropped_.load(std::memory_order_relaxed); }
+  uint64_t Reclaimed() const { return reclaimed_.load(std::memory_order_relaxed); }
   uint64_t Evictions() const { return alloc_->Evictions(); }
   uint64_t UsedBytes() const { return alloc_->UsedBytes(); }  // resident slot bytes
   size_t Count() const;
@@ -129,6 +136,7 @@ class RamTier {
   struct QItem { std::string fn; BlockKey key; uint32_t tries = 0; };
 
   void FlushLoop();
+  void ReclaimTick();  // one background free-slot top-up pass (see Options)
   void DropLocked(const std::string& fn);  // remove key from index_ + alloc + unpin
 
   Options opt_;
@@ -151,9 +159,16 @@ class RamTier {
   std::condition_variable flush_cv_;
   bool stop_ = false;
   std::vector<std::thread> flushers_;
+  // Background free-slot reclaimer (own cv/mutex so shutdown never races the
+  // flushers' flush_cv_ protocol).
+  std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
+  std::thread reclaim_thread_;
+  std::condition_variable reclaim_cv_;
+  std::mutex reclaim_mu_;
+  bool reclaim_stop_ = false;
 
   std::atomic<uint64_t> hits_{0}, misses_{0}, puts_{0}, put_bypass_{0};
-  std::atomic<uint64_t> flushed_{0}, flush_dropped_{0};
+  std::atomic<uint64_t> flushed_{0}, flush_dropped_{0}, reclaimed_{0};
 };
 
 }  // namespace dfkv

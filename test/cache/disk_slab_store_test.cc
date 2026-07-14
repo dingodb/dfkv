@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -422,4 +423,22 @@ TEST_F(DiskSlabTest, RebindWipesStaleRecordsNoResurrectionAcrossRestart) {
   std::string out;
   ASSERT_EQ(s2.Range(K(500), 0, 0, &out), Status::kOk);
   EXPECT_EQ(out, bval);
+}
+
+// Background reclaimer wiring: on a full store with ongoing writes, slots get
+// freed ahead of demand by the reclaim thread and show up in Stats.
+TEST_F(DiskSlabTest, BackgroundReclaimerFreesSlotsOnFullStore) {
+  bool ok = false;
+  auto o = Opts(2 << 20, 1 << 20, 4096);  // 2 extents x 256 slots of 4 KiB
+  o.reclaim_interval_ms = 1;
+  DiskSlabStore s(o, &ok);
+  ASSERT_TRUE(ok);
+  std::string v(4000, 'x');
+  for (uint64_t i = 0; i < 512; ++i)
+    ASSERT_EQ(s.Cache(K(1000 + i), v.data(), v.size()), Status::kOk);  // fill
+  for (uint64_t i = 0; i < 128; ++i) {  // sustained demand on the full store
+    ASSERT_EQ(s.Cache(K(2000 + i), v.data(), v.size()), Status::kOk);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_GT(s.GetStats().reclaimed_slots, 0u) << "reclaimer never ran";
 }
