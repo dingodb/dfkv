@@ -10,6 +10,7 @@
 #ifndef DFKV_KV_CLIENT_H_
 #define DFKV_KV_CLIENT_H_
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <map>
@@ -31,6 +32,15 @@
 #include "common/value_header.h"
 
 namespace dfkv {
+
+// Batch fan-out worker sizing: explicit bc wins; 0 = one worker per node group
+// capped at 32 (a fixed small default serializes a wide ring's groups into
+// waves, multiplying the batch tail for single-threaded callers).
+inline size_t AutoBatchWorkers(size_t bc, size_t groups) {
+  constexpr size_t kMaxAutoBatchWorkers = 32;
+  if (bc) return bc;
+  return std::min(std::max<size_t>(groups, 1), kMaxAutoBatchWorkers);
+}
 
 struct KvPutItem { std::string key; const void* value; size_t n; };
 struct KvGetItem { std::string key; void* out; size_t n; };
@@ -106,8 +116,14 @@ class KVClient {
   std::vector<bool> BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                    std::vector<size_t>* out_lens);
 
+  // Batch fan-out worker count. 0 (the default) = auto: one worker per node
+  // group, capped at kMaxAutoBatchWorkers -- with the old fixed default of 8, a
+  // 64-key batch over a 47..61-node ring ran its groups in 6-8 serial WAVES,
+  // multiplying the batch tail by the wave count for single-threaded callers
+  // (the production connector shape). Explicit n keeps the old fixed behavior
+  // (dfkv_bench passes --bc 1 so its external threads stay the only load).
   void set_batch_concurrency(size_t n) {
-    batch_concurrency_.store(n ? n : 1, std::memory_order_relaxed);
+    batch_concurrency_.store(n, std::memory_order_relaxed);
   }
 
   // Register a large caller memory region (e.g. the whole SGLang host KV pool) for
@@ -177,7 +193,10 @@ class KVClient {
   Transport* t_;
   std::string transport_reason_ = "unknown";
   // Atomic: configurable via the C ABI; reads on the batch path are relaxed.
-  std::atomic<size_t> batch_concurrency_{8};
+  std::atomic<size_t> batch_concurrency_{0};  // 0 = auto (see set_batch_concurrency)
+  size_t BatchWorkers(size_t groups) const {
+    return AutoBatchWorkers(batch_concurrency_.load(std::memory_order_relaxed), groups);
+  }
   std::unique_ptr<MdsMemberPoller> poller_;
   std::unique_ptr<MdsRegistrar> client_registrar_;  // consumer identity lease (best-effort)
   PeerHealth health_;

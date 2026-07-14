@@ -3,6 +3,7 @@
 // against a discovery-only client (empty member list => empty ring), so they
 // need no server: routing fails fast and every slot reports miss/failure.
 #include "client/dfkv_c_api.h"
+#include "client/kv_client.h"
 
 #include <gtest/gtest.h>
 
@@ -138,4 +139,14 @@ TEST(CApiGuard, ZeroLengthBatchIsOk) {
   EXPECT_EQ(dfkv_batch_get(c, nullptr, nullptr, nullptr, 0, nullptr), 0);
   EXPECT_EQ(dfkv_batch_exist(c, nullptr, 0, nullptr), 0);
   dfkv_close(c);
+}
+
+TEST(AutoBatchWorkers, ExplicitWinsAutoScalesCapped) {
+  using dfkv::AutoBatchWorkers;
+  EXPECT_EQ(AutoBatchWorkers(8, 47), 8u);    // explicit bc: old fixed behavior
+  EXPECT_EQ(AutoBatchWorkers(1, 47), 1u);    // bench --bc 1
+  EXPECT_EQ(AutoBatchWorkers(0, 1), 1u);     // auto, single node
+  EXPECT_EQ(AutoBatchWorkers(0, 8), 8u);     // auto, one worker per group
+  EXPECT_EQ(AutoBatchWorkers(0, 47), 32u);   // auto, capped at 32
+  EXPECT_EQ(AutoBatchWorkers(0, 0), 1u);     // degenerate: at least one
 }

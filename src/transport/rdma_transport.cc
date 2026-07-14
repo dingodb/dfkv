@@ -127,6 +127,10 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       long x = std::strtol(v, nullptr, 10);
       op_timeout_ms_ = (x == 0) ? -1 : (x > 0 ? static_cast<int>(x) : 5000);
     }
+  {
+    const char* v = std::getenv("DFKV_RDMA_BATCH_OP_TIMEOUT_MS");
+    if (v && *v) { long x = std::strtol(v, nullptr, 10); if (x > 0) batch_op_timeout_ms_ = static_cast<int>(x); }
+  }
   }
   // Idle-connection pool cap. The pool naturally bounds at peak concurrency
   // (each thread holds <=1 conn); this only guards against a thread-count spike
@@ -543,7 +547,7 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
       std::vector<uint32_t> rbytes(w, 0);
       int need = static_cast<int>(2 * w);
       while (need > 0) {
-        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), op_timeout_ms_);
+        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), BatchTimeout());
         if (g <= 0) { conn_ok = false; break; }
         for (int i = 0; i < g; ++i) {
           if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
@@ -633,7 +637,7 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
       std::vector<uint32_t> rbytes(w, 0);
       int need = static_cast<int>(2 * w);
       while (need > 0) {
-        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), op_timeout_ms_);
+        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), BatchTimeout());
         if (g <= 0) { conn_ok = false; break; }
         for (int i = 0; i < g; ++i) {
           if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
@@ -737,7 +741,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
       std::vector<uint32_t> rbytes(w, 0);
       int need = static_cast<int>(2 * posted);
       while (need > 0) {
-        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), op_timeout_ms_);
+        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), BatchTimeout());
         if (g <= 0) { conn_ok = false; break; }
         for (int i = 0; i < g; ++i) {
           if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
@@ -844,7 +848,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       std::vector<uint32_t> rbytes(w, 0);
       int need = static_cast<int>(2 * posted);
       while (need > 0) {
-        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), op_timeout_ms_);
+        int g = ep.WaitComp(wcs.data(), static_cast<int>(2 * w), BatchTimeout());
         if (g <= 0) { conn_ok = false; break; }
         for (int i = 0; i < g; ++i) {
           if (wcs[i].status != IBV_WC_SUCCESS) { conn_ok = false; break; }
