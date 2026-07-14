@@ -80,6 +80,7 @@ class DiskSlabStore : public StoreEngine {
     uint64_t inflight = 0;             // keys with an unlocked read/write in flight
     uint64_t prep_holds = 0;           // outstanding async-prep slot holds
     uint64_t reclaimed_slots = 0;      // slots freed by the background reclaimer
+    uint64_t rebalanced_extents = 0;   // extents moved hot<-cold by the reclaimer
   };
 
   // Opens (or creates) the store under Options::dir, pre-allocating extents and
@@ -196,9 +197,15 @@ class DiskSlabStore : public StoreEngine {
   std::mutex sync_mu_;
   bool sync_stop_ = false;
   // Background free-slot reclaimer (see Options::reclaim_interval_ms): runs
-  // ReclaimTick every interval, evicting ahead of demand in bounded batches.
+  // ReclaimTick every interval, evicting ahead of demand in bounded batches
+  // and rebalancing extents from cold classes to hot ones on a full store.
   void ReclaimTick();
+  // Rebalance rate cap: extents moved per tick per hot class. Each move evicts
+  // a donor extent's residents + wipes its table region under the lock, so it
+  // is deliberately slow-drip (converges in seconds at the 50 ms tick).
+  static constexpr size_t kGrowExtentsPerTick = 2;
   std::atomic<uint64_t> reclaimed_{0};
+  std::atomic<uint64_t> rebalanced_{0};
   std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
   std::thread reclaim_thread_;
   std::condition_variable reclaim_cv_;

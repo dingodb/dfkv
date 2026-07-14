@@ -434,3 +434,76 @@ TEST(SlabAllocator, StealAfterRestoreEvictsRestoredResidents) {
   for (int i = 0; i < 4; ++i)
     EXPECT_FALSE(a.Contains("k" + std::to_string(i)));
 }
+
+// ---- class rebalance additions (StealFrom mechanism) ----
+
+// StealFrom moves exactly one extent: the donor's residents on that extent are
+// evicted, the target class gains its capacity, everything else survives.
+TEST(SlabAllocator, StealFromMovesOneExtentDonorToTarget) {
+  SlabAllocator a(Opts(4 * 4096, 3));  // 3 extents x 4 slots
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 12; ++i)
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));  // class 0 owns all
+  // Make a second class by exact size via Restore? No pool extent left, so
+  // create it through StealFrom itself: class must pre-exist -> use Put of a
+  // 16 KiB value, which steals inline and creates class 1.
+  ev.clear();
+  ASSERT_TRUE(a.Put("big0", 16 * 1024, &r, &ev));  // class 1, inline steal
+  ASSERT_EQ(a.ClassCount(), 2u);
+  const size_t evicted_inline = ev.size();
+  ASSERT_EQ(evicted_inline, 4u);
+  auto cs = a.Classes();
+  ASSERT_EQ(cs[0].extents, 2u);
+  ASSERT_EQ(cs[1].extents, 1u);
+  // Now the mechanism under test: move one more extent 0 -> 1.
+  ev.clear();
+  ASSERT_TRUE(a.StealFrom(0, 1, &ev));
+  EXPECT_EQ(ev.size(), 4u) << "exactly the donor extent's residents";
+  cs = a.Classes();
+  EXPECT_EQ(cs[0].extents, 1u);
+  EXPECT_EQ(cs[1].extents, 2u);
+  EXPECT_EQ(cs[0].resident, 4u);
+  EXPECT_EQ(cs[1].free_slots, 1u);  // class 1: 2 extents x 1 slot, 1 resident
+  // Survivors intact.
+  size_t alive = 0;
+  for (int i = 0; i < 12; ++i) alive += a.Contains("k" + std::to_string(i));
+  EXPECT_EQ(alive, 4u);
+  EXPECT_TRUE(a.Contains("big0"));
+}
+
+// StealFrom refuses: donor == target, bad indices, oversized target class, and
+// a donor whose every extent holds a pin.
+TEST(SlabAllocator, StealFromRefusalCases) {
+  SlabAllocator a(Opts(4 * 4096, 2));
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 8; ++i)
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  ASSERT_TRUE(a.Put("big", 16 * 1024, &r, &ev));  // class 1 via inline steal
+  EXPECT_FALSE(a.StealFrom(0, 0, &ev));
+  EXPECT_FALSE(a.StealFrom(7, 1, &ev));
+  EXPECT_FALSE(a.StealFrom(0, 7, &ev));
+  // Pin one resident on class 0's remaining extent: no eligible donor extent.
+  for (int i = 0; i < 8; ++i)
+    if (a.Contains("k" + std::to_string(i))) { ASSERT_TRUE(a.Pin("k" + std::to_string(i))); break; }
+  ev.clear();
+  EXPECT_FALSE(a.StealFrom(0, 1, &ev));
+  EXPECT_TRUE(ev.empty());
+}
+
+// ClassStat.extents stays truthful across bind, inline steal, StealFrom, and
+// fully-free extent returns (the rebalance policy reads it every tick).
+TEST(SlabAllocator, ClassStatsExtentsTracksHandoffs) {
+  SlabAllocator a(Opts(4096, 12));  // 12 extents x 1 slot
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 12; ++i)
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  EXPECT_EQ(a.Classes()[0].extents, 12u);
+  EXPECT_EQ(a.PoolExtents(), 0u);
+  for (int i = 0; i < 9; ++i) a.Remove("k" + std::to_string(i));  // returns fire past 8
+  const uint32_t bound_after = a.Classes()[0].extents;
+  EXPECT_EQ(bound_after + a.PoolExtents(), 12u) << "bind accounting must balance";
+  EXPECT_GT(a.PoolExtents(), 0u);
+}

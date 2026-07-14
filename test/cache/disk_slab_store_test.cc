@@ -442,3 +442,30 @@ TEST_F(DiskSlabTest, BackgroundReclaimerFreesSlotsOnFullStore) {
   }
   EXPECT_GT(s.GetStats().reclaimed_slots, 0u) << "reclaimer never ran";
 }
+
+// Class rebalance regression (the "new value size retains only a sliver of its
+// writes" failure): fill the store with class A, then write a burst of class B
+// larger than B's first extent. Stock behavior self-evicts B forever (B ends
+// with one extent's worth of survivors); the reclaim tick must instead grow B
+// from the idle A donor so the whole burst stays readable.
+TEST_F(DiskSlabTest, ReclaimTickGrowsHotClassFromColdDonor) {
+  bool ok = false;
+  auto o = Opts(16 << 20, 1 << 20, 4096);  // 16 extents x 1 MiB
+  o.reclaim_interval_ms = 1;
+  DiskSlabStore s(o, &ok);
+  ASSERT_TRUE(ok);
+  std::string a(4000, 'a');
+  for (uint64_t i = 0; i < 4096; ++i)  // 16 extents x 256 slots: fill class A
+    ASSERT_EQ(s.Cache(K(10000 + i), a.data(), a.size()), Status::kOk);
+  // Class B: 16 KiB values, 64 slots/extent. Burst of 256 = 4 extents' worth,
+  // written slowly enough for the 1 ms tick to grow B between writes.
+  std::string b(16000, 'b');
+  for (uint64_t i = 0; i < 256; ++i) {
+    ASSERT_EQ(s.Cache(K(20000 + i), b.data(), b.size()), Status::kOk);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  size_t retained = 0;
+  for (uint64_t i = 0; i < 256; ++i) retained += s.IsCached(K(20000 + i));
+  EXPECT_GT(s.GetStats().rebalanced_extents, 0u) << "growth never kicked in";
+  EXPECT_GE(retained, 250u) << "hot class must absorb capacity, not eat itself";
+}

@@ -594,25 +594,76 @@ uint64_t DiskSlabStore::EvictedBytes() const {
   return evicted_bytes_;
 }
 
-// One reclaimer pass: for every class with new inserts since the last pass,
-// top its free-slot pool up to a demand-driven watermark (enough headroom for
-// ~2 intervals of the observed insert rate, capped at 1/4 of the class's bound
-// capacity so an idle-then-bursty class is never hollowed out). Eviction runs
-// in bounded batches per store-lock hold, so a Put never waits behind a long
-// sweep -- the sweep Put used to run inline now happens here.
+// One reclaimer pass, two phases per hot class (new inserts since last pass):
+//
+// GROW: on a demand shift over a full store, the hot class should absorb
+// capacity from cold classes instead of eating itself -- Put's inline order
+// (EvictOneFrom before StealExtentFor) keeps a new class at its current size
+// forever (self-eviction always succeeds once it has any unpinned resident),
+// so a workload's new value size retains only a sliver of its writes. Move up
+// to kGrowExtentsPerTick extents per tick from the coldest donors (no recent
+// inserts, or 4x less demand) whose capacity stays above the kStripeWays
+// striping floor -- that floor is the per-class quota protection.
+//
+// RECLAIM: then top free slots up to the demand-driven watermark (~2 intervals
+// of the insert rate, capped at 1/4 of bound capacity) in bounded batches per
+// lock hold, so Put never waits behind an inline CLOCK sweep.
 void DiskSlabStore::ReclaimTick() {
   const auto classes = alloc_->Classes();
   if (reclaim_last_puts_.size() < classes.size())
     reclaim_last_puts_.resize(classes.size(), 0);
+  std::vector<uint64_t> delta(classes.size(), 0);
+  std::vector<uint32_t> extents(classes.size(), 0);
   for (size_t i = 0; i < classes.size(); ++i) {
+    delta[i] = classes[i].puts - reclaim_last_puts_[i];
+    reclaim_last_puts_[i] = classes[i].puts;
+    extents[i] = classes[i].extents;
+  }
+  for (size_t i = 0; i < classes.size(); ++i) {
+    if (delta[i] == 0) continue;  // no write demand on this class
     const auto& c = classes[i];
-    const uint64_t delta = c.puts - reclaim_last_puts_[i];
-    reclaim_last_puts_[i] = c.puts;
-    if (delta == 0) continue;  // no write demand on this class
-    const size_t capacity = c.resident + c.free_slots;
-    size_t target = std::max<size_t>(64, static_cast<size_t>(2 * delta));
-    target = std::min(target, capacity / 4);
-    if (c.free_slots >= target) continue;
+    size_t free_now = c.free_slots;
+    const size_t want = std::max<size_t>(64, static_cast<size_t>(2 * delta[i]));
+    // -- GROW --
+    if (free_now < want && c.slots_per_extent > 0 && alloc_->PoolExtents() == 0) {
+      size_t need_ext =
+          (want - free_now + c.slots_per_extent - 1) / c.slots_per_extent;
+      need_ext = std::min<size_t>(need_ext, kGrowExtentsPerTick);
+      while (need_ext > 0) {
+        size_t donor = classes.size();
+        for (size_t d = 0; d < classes.size(); ++d) {  // coldest, then biggest
+          if (d == i || extents[d] <= SlabAllocator::kStripeWays) continue;
+          if (delta[d] != 0 && delta[d] * 4 > delta[i]) continue;  // not cold enough
+          if (donor == classes.size() ||
+              std::make_pair(delta[d], ~uint64_t(extents[d])) <
+                  std::make_pair(delta[donor], ~uint64_t(extents[donor])))
+            donor = d;
+        }
+        if (donor == classes.size()) break;
+        std::vector<std::string> evicted;
+        bool ok;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          ok = alloc_->StealFrom(donor, i, &evicted);
+          for (const auto& ev : evicted) {
+            auto pit = payload_len_.find(ev);
+            if (pit != payload_len_.end()) {
+              evicted_bytes_ += pit->second;
+              payload_len_.erase(pit);
+            }
+          }
+        }
+        if (!ok) { extents[donor] = 0; continue; }  // donor all pinned: try next
+        extents[donor]--;
+        rebalanced_.fetch_add(1, std::memory_order_relaxed);
+        free_now += c.slots_per_extent;
+        --need_ext;
+      }
+    }
+    // -- RECLAIM --
+    const size_t capacity = c.resident + free_now;
+    const size_t target = std::min(want, capacity / 4);
+    if (free_now >= target) continue;
     size_t budget = 4096;  // per-tick per-class bound
     for (;;) {
       std::vector<std::string> evicted;
@@ -652,6 +703,7 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.inflight = inflight_.size();
   st.prep_holds = prep_holds_.size();
   st.reclaimed_slots = reclaimed_.load(std::memory_order_relaxed);
+  st.rebalanced_extents = rebalanced_.load(std::memory_order_relaxed);
   return st;
 }
 

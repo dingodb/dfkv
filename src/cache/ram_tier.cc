@@ -123,26 +123,71 @@ RamTier::~RamTier() {
 // allocator call on the pop-free-slot fast path; without it a full arena runs
 // the CLOCK sweep inline under mu_ on every admission.
 void RamTier::ReclaimTick() {
+  const auto classes = alloc_->Classes();
+  if (reclaim_last_puts_.size() < classes.size())
+    reclaim_last_puts_.resize(classes.size(), 0);
+  std::vector<uint64_t> delta(classes.size(), 0);
+  std::vector<uint32_t> extents(classes.size(), 0);
+  for (size_t i = 0; i < classes.size(); ++i) {
+    delta[i] = classes[i].puts - reclaim_last_puts_[i];
+    reclaim_last_puts_[i] = classes[i].puts;
+    extents[i] = classes[i].extents;
+  }
+  // -- GROW -- (mirror of DiskSlabStore::ReclaimTick; see its comment)
+  // Runs even while flush-gated, ON PURPOSE: a cold donor's extents hold
+  // DURABLE residents, so moving them to the hot class frees admission
+  // capacity precisely when the flusher can't -- the arena's pinned mass is
+  // the hot class's own unflushed writes, not the donors'.
+  for (size_t i = 0; i < classes.size(); ++i) {
+    if (delta[i] == 0) continue;
+    const auto& c = classes[i];
+    size_t free_now = c.free_slots;
+    const size_t want = std::max<size_t>(64, static_cast<size_t>(2 * delta[i]));
+    if (free_now >= want || c.slots_per_extent == 0 || alloc_->PoolExtents() > 0)
+      continue;
+    size_t need_ext =
+        (want - free_now + c.slots_per_extent - 1) / c.slots_per_extent;
+    need_ext = std::min<size_t>(need_ext, kGrowExtentsPerTick);
+    while (need_ext > 0) {
+      size_t donor = classes.size();
+      for (size_t d = 0; d < classes.size(); ++d) {  // coldest, then biggest
+        if (d == i || extents[d] <= SlabAllocator::kStripeWays) continue;
+        if (delta[d] != 0 && delta[d] * 4 > delta[i]) continue;  // not cold enough
+        if (donor == classes.size() ||
+            std::make_pair(delta[d], ~uint64_t(extents[d])) <
+                std::make_pair(delta[donor], ~uint64_t(extents[donor])))
+          donor = d;
+      }
+      if (donor == classes.size()) break;
+      std::vector<std::string> evicted;
+      bool ok;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        ok = alloc_->StealFrom(donor, i, &evicted);
+        for (const auto& ev : evicted) index_.erase(ev);
+      }
+      if (!ok) { extents[donor] = 0; continue; }  // donor all pinned: try next
+      extents[donor]--;
+      rebalanced_.fetch_add(1, std::memory_order_relaxed);
+      --need_ext;
+    }
+  }
   // Flush-gated regime: when the flush queue is deep, the arena is mostly
   // PINNED (not-yet-durable) slots -- free slots are not the admission
   // constraint, and a CLOCK sweep over a pinned-heavy ring just burns lock
-  // time skipping entries. Sit the tick out; reclaim resumes as the flusher
-  // catches up. 4096 = the per-tick eviction budget: below it one pass could
-  // plausibly matter, above it admission is flusher-bound by definition.
+  // time skipping entries. Skip the self-eviction phase; it resumes as the
+  // flusher catches up. 4096 = the per-tick eviction budget: below it one
+  // pass could plausibly matter, above it admission is flusher-bound.
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (flushq_.size() > 4096) return;
   }
-  const auto classes = alloc_->Classes();
-  if (reclaim_last_puts_.size() < classes.size())
-    reclaim_last_puts_.resize(classes.size(), 0);
+  // -- RECLAIM --
   for (size_t i = 0; i < classes.size(); ++i) {
+    if (delta[i] == 0) continue;  // no write demand on this class
     const auto& c = classes[i];
-    const uint64_t delta = c.puts - reclaim_last_puts_[i];
-    reclaim_last_puts_[i] = c.puts;
-    if (delta == 0) continue;  // no write demand on this class
     const size_t capacity = c.resident + c.free_slots;
-    size_t target = std::max<size_t>(64, static_cast<size_t>(2 * delta));
+    size_t target = std::max<size_t>(64, static_cast<size_t>(2 * delta[i]));
     target = std::min(target, capacity / 4);
     if (c.free_slots >= target) continue;
     size_t budget = 4096;  // per-tick per-class bound
