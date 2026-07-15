@@ -155,6 +155,9 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
     t_ = owned_.get();
     DFKV_LOG_INFO("dfkv client transport=" + transport_reason_);
   }
+  // Same-host GET rendezvous (phase 5). Off unless DFKV_CLIENT_NODE_DEDUP=1;
+  // namespaced by model_hash so distinct keyspaces never share entries.
+  dedup_ = NodeDedup::FromEnv(self_hdr_.model_hash);
   // Batch fan-out workers override (0/unset = auto; see set_batch_concurrency).
   if (const char* bc = std::getenv("DFKV_BATCH_CONCURRENCY")) {
     long x = std::strtol(bc, nullptr, 10);
@@ -594,6 +597,53 @@ std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
 }
 
 std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
+  if (!dedup_) return BatchGetDirect(items);
+  // Same-host rendezvous (phase 5): first arrival fetches a key, peers copy
+  // the published payload from shm — TP-replicated KV otherwise multiplies
+  // every load by the rank count. Every dedup outcome degrades to the plain
+  // remote path, so correctness never depends on the shm state.
+  const size_t N = items.size();
+  std::vector<bool> res(N, false);
+  std::vector<BlockKey> bks(N);
+  std::vector<KvGetItem> fetch_items;
+  std::vector<size_t> fetch_map, wait_list;
+  fetch_items.reserve(N);
+  for (size_t i = 0; i < N; ++i) {
+    bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
+    switch (dedup_->Claim(bks[i], items[i].n, static_cast<char*>(items[i].out))) {
+      case NodeDedup::Role::kHit:
+        res[i] = true;
+        break;
+      case NodeDedup::Role::kFetch:
+        fetch_map.push_back(i);
+        fetch_items.push_back(items[i]);
+        break;
+      case NodeDedup::Role::kWait:
+        wait_list.push_back(i);
+        break;
+    }
+  }
+  if (!fetch_items.empty()) {
+    auto r = BatchGetDirect(fetch_items);
+    for (size_t m = 0; m < fetch_map.size(); ++m) {
+      const size_t i = fetch_map[m];
+      res[i] = r[m];
+      if (r[m])
+        dedup_->Publish(bks[i], static_cast<const char*>(items[i].out), items[i].n);
+      else
+        dedup_->Abort(bks[i], items[i].n);
+    }
+  }
+  for (size_t i : wait_list) {
+    if (dedup_->WaitCopy(bks[i], items[i].n, static_cast<char*>(items[i].out)))
+      res[i] = true;
+    else  // fetcher failed/slow: bounded fallback to a direct read
+      res[i] = Get(items[i].key, items[i].out, items[i].n);
+  }
+  return res;
+}
+
+std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) {
   auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> hit(N, 0);

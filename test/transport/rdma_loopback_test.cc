@@ -13,6 +13,8 @@
 #include "common/value_header.h"
 
 #include <gtest/gtest.h>
+#include <sys/mman.h>  // shm_unlink (node-dedup test)
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -182,6 +184,54 @@ TEST(RdmaLoopback, BatchPutOversizedFailsOnlyOffender) {
   EXPECT_TRUE(c.Exist("bpo_a"));
   EXPECT_FALSE(c.Exist("bpo_big"));
   EXPECT_TRUE(c.Exist("bpo_c"));
+}
+
+// Same-host GET rendezvous (phase 5): with DFKV_CLIENT_NODE_DEDUP=1, a second
+// client reading the SAME keys must be served from the shm rendezvous, not the
+// server — server-side completions stay ~flat while the data stays correct.
+TEST(RdmaLoopback, NodeDedupCollapsesSameHostGets) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  char nm[128];
+  std::snprintf(nm, sizeof(nm), "/dfkv-dedup-%u-%016llx",
+                ::getuid(), static_cast<unsigned long long>(SelfHdr().model_hash));
+  ::shm_unlink(nm);
+  ::setenv("DFKV_CLIENT_NODE_DEDUP", "1", 1);
+  {
+    RdmaNode node("ndd");
+    RdmaTransport rt1(kMaxMsg), rt2(kMaxMsg);
+    KVClient c1({{"n", node.addr}}, SelfHdr(), &rt1);
+    KVClient c2({{"n", node.addr}}, SelfHdr(), &rt2);
+
+    const int N = 32;
+    std::vector<std::string> vals(N);
+    for (int i = 0; i < N; ++i) {
+      vals[i].assign(8192, '\0');
+      for (size_t b = 0; b < vals[i].size(); ++b)
+        vals[i][b] = static_cast<char>((i * 131 + b * 7) & 0xFF);
+      ASSERT_TRUE(c1.Put("ndd" + std::to_string(i), vals[i].data(), vals[i].size())) << i;
+    }
+
+    auto get_all = [&](KVClient& c, std::vector<std::string>* out) {
+      std::vector<KvGetItem> items(N);
+      out->assign(N, std::string(8192, '\0'));
+      for (int i = 0; i < N; ++i)
+        items[i] = {"ndd" + std::to_string(i), &(*out)[i][0], 8192};
+      return c.BatchGet(items);
+    };
+
+    std::vector<std::string> o1, o2;
+    auto r1 = get_all(c1, &o1);  // first reader: remote fetch + publish
+    for (int i = 0; i < N; ++i) { ASSERT_TRUE(r1[i]) << i; EXPECT_EQ(o1[i], vals[i]); }
+    const long mid = CounterVal(node.rsrv->MetricsText(), "dfkv_rdma_completions_total");
+    auto r2 = get_all(c2, &o2);  // peer: rendezvous hits, no server traffic
+    for (int i = 0; i < N; ++i) { ASSERT_TRUE(r2[i]) << i; EXPECT_EQ(o2[i], vals[i]); }
+    const long after = CounterVal(node.rsrv->MetricsText(), "dfkv_rdma_completions_total");
+    EXPECT_LE(after - mid, N / 4)
+        << "peer reads reached the server (" << (after - mid)
+        << " completions); rendezvous not deduplicating";
+  }
+  ::unsetenv("DFKV_CLIENT_NODE_DEDUP");
+  ::shm_unlink(nm);
 }
 
 TEST(RdmaLoopback, PutGetExistMissOverRdma) {

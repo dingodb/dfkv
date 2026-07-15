@@ -235,6 +235,13 @@ class DfkvHiCache(HiCacheStorage):
                       "rail selection in the client.", file=_sys.stderr, flush=True)
             if cfg.get("rdma_numa"):
                 os.environ.setdefault("DFKV_RDMA_NUMA", "1")
+            # Same-host GET rendezvous (phase 5): dedups TP-replicated L3 loads
+            # across the rank processes of one node. SAFE here because the
+            # HiCache pools are HOST memory (this connector's destinations are
+            # host KV pool pages); GPUDirect connectors must NOT enable it.
+            if _truthy(cfg.get("node_dedup",
+                               os.environ.get("DFKV_CLIENT_NODE_DEDUP", "0"))):
+                os.environ["DFKV_CLIENT_NODE_DEDUP"] = "1"
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
             flags = _FLAG_IS_MLA if self.is_mla else 0
