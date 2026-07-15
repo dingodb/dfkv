@@ -156,6 +156,31 @@ TEST(RdmaLoopback, BatchExistReusesPooledConn) {
       << " new conns; pipelined path should reuse the pooled connection";
 }
 
+// Non-SG batch PUT: one oversized item must fail ONLY itself, not poison the
+// whole same-node batch. Previously any item over the per-op payload bound
+// filled every sibling's status with kInvalid — all lost their cache write.
+TEST(RdmaLoopback, BatchPutOversizedFailsOnlyOffender) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  RdmaNode node("bpo");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  std::string small(4096, 's');
+  std::string big(kMaxMsg + 4096, 'b');  // exceeds the per-op payload bound
+  std::vector<KvPutItem> items = {
+      {"bpo_a", small.data(), small.size()},
+      {"bpo_big", big.data(), big.size()},
+      {"bpo_c", small.data(), small.size()},
+  };
+  auto pr = c.BatchPut(items);
+  ASSERT_EQ(pr.size(), 3u);
+  EXPECT_TRUE(pr[0]) << "sibling poisoned by the oversized item";
+  EXPECT_FALSE(pr[1]);
+  EXPECT_TRUE(pr[2]) << "sibling poisoned by the oversized item";
+  EXPECT_TRUE(c.Exist("bpo_a"));
+  EXPECT_FALSE(c.Exist("bpo_big"));
+  EXPECT_TRUE(c.Exist("bpo_c"));
+}
+
 TEST(RdmaLoopback, PutGetExistMissOverRdma) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device (load rdma_rxe for Soft-RoCE)";
   RdmaNode node("pgem");

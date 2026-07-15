@@ -3,9 +3,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -34,20 +38,102 @@ namespace {
 // constant so even those keys cache.
 constexpr size_t kSgMaxPayloadSegs = 29;
 
-// Run fn(i) for i in [0,n) across up to `workers` threads (atomic work-steal).
-void RunParallel(size_t n, size_t workers, const std::function<void(size_t)>& fn) {
-  if (n == 0) return;
-  if (workers > n) workers = n;
-  if (workers <= 1) { for (size_t i = 0; i < n; ++i) fn(i); return; }
-  std::atomic<size_t> next{0};
-  std::vector<std::thread> ts;
-  ts.reserve(workers);
-  for (size_t w = 0; w < workers; ++w) {
-    ts.emplace_back([&] {
-      for (size_t i = next.fetch_add(1); i < n; i = next.fetch_add(1)) fn(i);
-    });
+// Shared fan-out pool for the Batch* paths. The old RunParallel created and
+// joined up to 32 std::threads PER CALL; a connector issuing batches at high
+// rate paid ~10-30 us of thread create/teardown per worker on every batch,
+// plus the scheduler churn. Workers here are created lazily once (cap 32,
+// process lifetime) and assist parallel-for jobs; the caller thread always
+// participates, so a job never waits on pool availability to start.
+class FanoutPool {
+ public:
+  // Leaky singleton: workers block in cv-wait at process exit; a static
+  // destructor joining them would hang shutdown, so the pool is never
+  // destroyed (threads are detached and die with the process).
+  static FanoutPool& Instance() {
+    static FanoutPool* p = new FanoutPool();
+    return *p;
   }
-  for (auto& t : ts) t.join();
+
+  void Run(size_t n, size_t workers, const std::function<void(size_t)>& fn) {
+    if (n == 0) return;
+    if (workers > n) workers = n;
+    if (workers > kMaxThreads) workers = kMaxThreads;
+    if (workers <= 1) {  // serial path: exceptions propagate as before
+      for (size_t i = 0; i < n; ++i) fn(i);
+      return;
+    }
+    auto job = std::make_shared<Job>();
+    job->n = n;
+    job->fn = fn;  // one std::function copy per batch (vs a thread per worker)
+    const size_t helpers = workers - 1;
+    EnsureThreads(helpers);
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (size_t i = 0; i < helpers; ++i) queue_.push_back(job);
+    }
+    cv_.notify_all();
+    Work(*job);  // caller participates; late helpers find no indices and drop out
+    std::unique_lock<std::mutex> lk(job->m);
+    job->done_cv.wait(lk, [&] { return job->done.load(std::memory_order_acquire) == job->n; });
+  }
+
+ private:
+  struct Job {
+    size_t n = 0;
+    std::function<void(size_t)> fn;
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> done{0};
+    std::mutex m;
+    std::condition_variable done_cv;
+  };
+
+  static void Work(Job& j) {
+    for (size_t i = j.next.fetch_add(1); i < j.n; i = j.next.fetch_add(1)) {
+      // An escaping exception previously hit the std::thread entry and called
+      // std::terminate (while the serial path propagated it) — a cache client
+      // must degrade the ITEM, not kill the process. The item's slot keeps its
+      // pre-initialized failure value (miss/failed-put), which the connector
+      // already handles.
+      try { j.fn(i); } catch (...) {}
+      if (j.done.fetch_add(1, std::memory_order_acq_rel) + 1 == j.n) {
+        std::lock_guard<std::mutex> lk(j.m);  // pairs with the waiter's wait
+        j.done_cv.notify_all();
+      }
+    }
+  }
+
+  void EnsureThreads(size_t want) {
+    std::lock_guard<std::mutex> lk(mu_);
+    while (threads_ < want && threads_ < kMaxThreads) {
+      std::thread([this] { Loop(); }).detach();
+      ++threads_;
+    }
+  }
+
+  void Loop() {
+    for (;;) {
+      std::shared_ptr<Job> j;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this] { return !queue_.empty(); });
+        j = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      Work(*j);
+    }
+  }
+
+  static constexpr size_t kMaxThreads = 32;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::shared_ptr<Job>> queue_;
+  size_t threads_ = 0;  // guarded by mu_
+};
+
+// Run fn(i) for i in [0,n) across up to `workers` threads (atomic work-steal,
+// shared persistent pool).
+void RunParallel(size_t n, size_t workers, const std::function<void(size_t)>& fn) {
+  FanoutPool::Instance().Run(n, workers, fn);
 }
 }  // namespace
 
