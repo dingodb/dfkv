@@ -106,6 +106,23 @@ std::unique_ptr<NodeDedup> NodeDedup::Open(const Options& opt) {
     ::close(fd);
     return nullptr;
   }
+  if (creator) {
+    // Eagerly back the whole segment with pages. tmpfs allocates lazily on
+    // first write: with /dev/shm full (other tenants), ftruncate+mmap succeed
+    // and the process later takes a SIGBUS on a page fault mid-publish —
+    // a crash, not a degrade. posix_fallocate converts that into a clean
+    // ENOSPC HERE, where returning nullptr just runs without dedup. Cost:
+    // the segment occupies its full size from creation (bounded, documented).
+    const int frc = ::posix_fallocate(fd, 0, static_cast<off_t>(len));
+    if (frc != 0) {
+      DFKV_LOG_INFO("node-dedup: cannot pre-reserve " +
+                    std::to_string(len >> 20) + " MiB in /dev/shm (" +
+                    std::to_string(frc) + "), running without");
+      ::close(fd);
+      ::shm_unlink(opt.name.c_str());  // don't leave a half-backed segment
+      return nullptr;
+    }
+  }
   if (!creator && static_cast<size_t>(st.st_size) != len) {
     DFKV_LOG_INFO("node-dedup: existing segment layout mismatch, running without");
     ::close(fd);

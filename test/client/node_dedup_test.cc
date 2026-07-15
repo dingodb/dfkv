@@ -4,7 +4,9 @@
 #include "client/node_dedup.h"
 
 #include <gtest/gtest.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -232,4 +234,21 @@ TEST(NodeDedup, EnvSegmentNameCarriesLayoutVersion) {
   const std::string nm = NodeDedup::EnvSegmentName(0xABCD);
   EXPECT_NE(nm.find("/dfkv-dedup-v2-"), std::string::npos) << nm;
   EXPECT_NE(nm.find("000000000000abcd"), std::string::npos) << nm;
+}
+
+TEST(NodeDedup, SegmentIsEagerlyBackedNotSparse) {
+  // tmpfs allocates lazily on write: a full /dev/shm would SIGBUS a publisher
+  // mid-copy instead of degrading. Open() posix_fallocates the whole segment
+  // at creation, converting that into a clean attach-time ENOSPC (nullptr).
+  // Verify the backing is real: allocated blocks cover the full length.
+  ShmGuard g("backed");
+  auto a = NodeDedup::Open(Opts(g.name, /*arena=*/4 << 20));
+  ASSERT_TRUE(a);
+  int fd = ::shm_open(g.name.c_str(), O_RDONLY, 0600);
+  ASSERT_GE(fd, 0);
+  struct stat st{};
+  ASSERT_EQ(::fstat(fd, &st), 0);
+  ::close(fd);
+  EXPECT_GE(static_cast<uint64_t>(st.st_blocks) * 512, static_cast<uint64_t>(st.st_size))
+      << "segment is sparse: a full tmpfs would SIGBUS at publish time";
 }
