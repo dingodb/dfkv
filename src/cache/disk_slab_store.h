@@ -215,8 +215,8 @@ class DiskSlabStore : public StoreEngine {
   std::atomic<uint64_t> batched_writes_{0};
   std::atomic<uint64_t> uring_write_batches_{0};
   bool uring_write_enabled_ = false;   // DFKV_SLAB_URING_WRITE (needs DFKV_WITH_URING build)
-  void* uring_w_ = nullptr;            // io_uring* (lazily created, guarded by uring_w_mu_)
-  std::mutex uring_w_mu_;
+  // The batched-write submission ring is thread_local (see disk_slab_store.cc):
+  // one per flush worker, no shared lock across the blocking CQE wait.
   std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
   std::thread reclaim_thread_;
   std::condition_variable reclaim_cv_;

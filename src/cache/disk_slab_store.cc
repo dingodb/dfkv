@@ -58,6 +58,14 @@ bool PreadAll(int fd, void* buf, size_t n, uint64_t off) {
   }
   return true;
 }
+
+#ifdef DFKV_WITH_URING
+// Per-thread batched-write submission ring (see the long comment at the use
+// site in CacheDirectBatch). Store-agnostic: fds ride in the SQEs. Leaked at
+// thread exit by design (flush workers are process-lifetime; retiring on the
+// hygiene path recreates it lazily).
+thread_local io_uring* tls_uring_w = nullptr;
+#endif
 }  // namespace
 
 DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
@@ -137,13 +145,6 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
 }
 
 DiskSlabStore::~DiskSlabStore() {
-#ifdef DFKV_WITH_URING
-  if (uring_w_) {
-    io_uring_queue_exit(static_cast<io_uring*>(uring_w_));
-    delete static_cast<io_uring*>(uring_w_);
-    uring_w_ = nullptr;
-  }
-#endif
   if (reclaim_thread_.joinable()) {
     { std::lock_guard<std::mutex> lk(reclaim_mu_); reclaim_stop_ = true; }
     reclaim_cv_.notify_all();
@@ -437,13 +438,22 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
 #ifdef DFKV_WITH_URING
   bool did_uring = false;
   if (uring_write_enabled_ && direct_n >= 2) {
-    std::lock_guard<std::mutex> ulk(uring_w_mu_);
-    if (!uring_w_) {
+    // One submission ring PER THREAD: the previous single shared ring + mutex
+    // serialized every flush worker behind one lock held ACROSS the blocking
+    // CQE wait — at any instant only one worker was doing uring IO, which
+    // capped the batched path's gain over plain pwrite at ~10% (measured
+    // 45.0k -> 50.6k ops/s saturated 64 KiB PUT, 16 workers, B200 3xNVMe). A
+    // ring is only a submission channel (the fds ride in each SQE), so it can
+    // be thread-local and store-agnostic: no lock, no cross-worker convoy.
+    // The batch-hygiene invariant is per-ring and unchanged (a batch fully
+    // reaps its completions or the ring is retired). Rings leak at thread
+    // exit by design — flush workers live for the process.
+    if (!tls_uring_w) {
       auto* r = new io_uring;
-      if (io_uring_queue_init(256, r, 0) == 0) uring_w_ = r; else delete r;
+      if (io_uring_queue_init(256, r, 0) == 0) tls_uring_w = r; else delete r;
     }
-    if (uring_w_) {
-      auto* ring = static_cast<io_uring*>(uring_w_);
+    if (tls_uring_w) {
+      auto* ring = tls_uring_w;
       size_t submitted = 0;
       for (size_t i = 0; i < N; ++i) {
         if (!st[i].active || !st[i].direct) continue;
@@ -491,13 +501,13 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         }
         if (!reap_ok || expect != submitted) {
           // Unreaped CQEs or unsubmitted SQEs remain: retire the ring so they
-          // die with it; the next batch re-inits a fresh one. The affected
-          // items keep io_ok=false and are rewritten by the sequential path
-          // below (their slots are exclusively owned by this flush, so the
-          // rewrite is idempotent).
+          // die with it; this thread's next batch re-inits a fresh one. The
+          // affected items keep io_ok=false and are rewritten by the
+          // sequential path below (their slots are exclusively owned by this
+          // flush, so the rewrite is idempotent).
           io_uring_queue_exit(ring);
           delete ring;
-          uring_w_ = nullptr;
+          tls_uring_w = nullptr;
         }
         did_uring = true;
         size_t batch_ok = 0;
