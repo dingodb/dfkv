@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "utils/con_hash.h"
+#include "client/node_dedup.h"
 #include "common/membership.h"
 #include "mds/mds_member_poller.h"
 #include "mds/mds_registrar.h"
@@ -179,6 +180,9 @@ class KVClient {
   std::string Route(const std::string& key) const;
   uint64_t NowMs() const;
   void ProbeLoop();
+  // The plain (no-dedup) BatchGet body; BatchGet wraps it with the same-host
+  // rendezvous when DFKV_CLIENT_NODE_DEDUP=1 (see node_dedup.h).
+  std::vector<bool> BatchGetDirect(const std::vector<KvGetItem>& items);
   // Record a batch op (hits = count of true flags) into op_stats_ and return the
   // per-item result vector. Called at each batch method's return point.
   std::vector<bool> RecordBatch(OpMetrics::Op op,
@@ -198,6 +202,9 @@ class KVClient {
     return AutoBatchWorkers(batch_concurrency_.load(std::memory_order_relaxed), groups);
   }
   std::unique_ptr<MdsMemberPoller> poller_;
+  // Same-host GET rendezvous (phase 5, DFKV_CLIENT_NODE_DEDUP=1; host-memory
+  // destinations only). nullptr = feature off.
+  std::unique_ptr<NodeDedup> dedup_;
   std::unique_ptr<MdsRegistrar> client_registrar_;  // consumer identity lease (best-effort)
   PeerHealth health_;
   OpMetrics op_stats_;  // per-op (put/get/exist) counters + latency, snapshot'd
