@@ -74,6 +74,24 @@ Status RdmaServer::Start(int port) {
   socklen_t sl = sizeof(sa);
   ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&sa), &sl);
   port_ = ntohs(sa.sin_port);
+  // Anchor the pool regions' MRs for the server's lifetime. The shared-device
+  // registry is refcounted by live endpoints: without an anchor, the moment
+  // the LAST client connection is torn down (disconnect or idle reclaim) the
+  // device closes and the pool MRs — arena-scale, seconds to pin — are
+  // deregistered, so the NEXT client's first op stalls ~5 s re-registering
+  // 128 GiB (observed on B200). The anchor endpoint holds one device ref and
+  // performs the registration once, HERE, where the cost is expected and
+  // reported. Only the configured device is anchored; a client requesting a
+  // different rail still pays that rail's first registration
+  // (SharedAddPoolMr logs slow ones).
+  if (!user_regions_.empty()) {
+    anchor_ep_ = std::make_unique<rdma::RcEndpoint>();
+    if (anchor_ep_->Open(dev_name_.empty() ? nullptr : dev_name_.c_str(), 4096, 1)) {
+      anchor_ep_->EnsurePoolMrs(user_regions_);
+    } else {
+      anchor_ep_.reset();  // no usable device: Serve would fail the same way
+    }
+  }
   running_ = true;
   accept_thread_ = std::thread([this] { AcceptLoop(); });
   return Status::kOk;
@@ -93,6 +111,7 @@ void RdmaServer::Stop() {
     conns.swap(conns_);
   }
   for (auto& c : conns) if (c.th.joinable()) c.th.join();
+  anchor_ep_.reset();  // drop the lifetime device ref (frees pool MRs last)
 }
 
 // Join and drop any Serve threads that have already finished. Called from
