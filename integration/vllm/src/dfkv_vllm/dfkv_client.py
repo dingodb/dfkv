@@ -137,6 +137,13 @@ class DfkvDeviceClient:
     def transport_mode(self) -> str:
         return self._lib.dfkv_transport_mode(self._h).decode()
 
+    def max_sg_segs(self) -> int:
+        """Max payload segments one scatter-gather key may carry on the live
+        transport (RDMA: negotiated max_sge - 1; TCP: 29). Raises
+        AttributeError on an older libdfkv without the export — callers fall
+        back to the historical 29 (see worker._sg_segs_of)."""
+        return int(self._lib.dfkv_max_sg_segs(self._h))
+
     def register_memory(self, base: int, size: int) -> None:
         """Register a (host or GPU device) region as an RDMA MR. One call per
         contiguous KV-cache storage region; later put/get reference offsets."""

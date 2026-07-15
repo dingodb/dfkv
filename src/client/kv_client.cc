@@ -22,22 +22,13 @@
 namespace dfkv {
 
 namespace {
-// Max payload segments per scatter-gather key. The RDMA QP carries max_sge SGEs
-// per work request; SGE0 is the header, leaving max_sge-1 payload SGEs. The
-// device cap on hd04 ConnectX is 30 -> 29 payload segments. The connector
-// guarantees <=29; a key over this is reported failed instead of corrupted.
-//
-// KNOWN LIMITATION (heterogeneous hardware): this is a fixed 29, not the live
-// negotiated ep.max_sge()-1. On an HCA reporting max_sge < 30, a key whose seg
-// count is between (max_sge-1) and 29 passes this client guard but trips the
-// transport's per-window check (CacheFromMulti/RangeIntoMulti). That now fails
-// only the OFFENDING item (per-item kInvalid), not the whole node batch, so it
-// is graceful fail-soft (the connector recomputes just those blocks; siblings
-// still hit; no data corruption) — it only costs the cache benefit for the
-// oversized keys on small-max_sge devices. Remaining TODO for full cross-HCA
-// efficiency: derive the SG chunk size from the live max_sge instead of this
-// constant so even those keys cache.
-constexpr size_t kSgMaxPayloadSegs = 29;
+// Max payload segments per scatter-gather key: the guards below use the LIVE
+// Transport::MaxSgPayloadSegs() (negotiated max_sge - 1 on RDMA; 29 on TCP),
+// and the connector reads the same value through dfkv_max_sg_segs, so its
+// chunking matches whatever HCA the client actually opened. A key exceeding
+// the guard is reported failed up front instead of corrupted; a stale caller
+// still hard-coding 29 on a smaller-max_sge device degrades per-item (the
+// transport's window check fails only the offending key), never per-batch.
 
 // Shared fan-out pool for the Batch* paths. The old RunParallel created and
 // joined up to 32 std::threads PER CALL; a connector issuing batches at high
@@ -1020,7 +1011,7 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   for (size_t i = 0; i < N; ++i) {
     if (items[i].key.empty() ||  // null/empty key: skip (no header-only blob written)
         items[i].ptrs.size() != items[i].sizes.size() ||
-        items[i].ptrs.size() > kSgMaxPayloadSegs)
+        items[i].ptrs.size() > t_->MaxSgPayloadSegs())
       over[i] = 1;
   }
 
@@ -1188,7 +1179,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
   for (size_t i = 0; i < N; ++i) {
     if (items[i].key.empty() ||  // null/empty key: skip (no wasted GET issued)
         items[i].dsts.size() != items[i].caps.size() ||
-        items[i].dsts.size() > kSgMaxPayloadSegs)
+        items[i].dsts.size() > t_->MaxSgPayloadSegs())
       over[i] = 1;
   }
 

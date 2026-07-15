@@ -351,7 +351,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             save_exists_start = time.perf_counter()
             try:
                 exists_states = self.client.batch_exist(
-                    [f"{k}@sg0" for k in keys]
+                    [_sg_group_key(k, 0, _sg_segs_of(self.client)) for k in keys]
                 )
             except Exception:
                 self._record_operation(
@@ -429,7 +429,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # suffixed "@sg{n}" -- one RDMA multi-SGE op + one server blob per key
             # instead of one tiny key per segment. This cuts the key count ~20x
             # (25392 -> ~1242) so the load is bandwidth-bound, not per-key-bound.
-            sg_keys, sg_ptrs, sg_sizes, _ = _group_segments_sg(keys, addrs, sizes)
+            sg_keys, sg_ptrs, sg_sizes, _ = _group_segments_sg(
+                keys, addrs, sizes, _sg_segs_of(self.client)
+            )
             batch_bytes = sum(sum(s) for s in sg_sizes)
             put_start = time.perf_counter()
             try:
@@ -577,8 +579,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             # Flatten per-key scatter-gather to one (ptr, cap) per dfkv key, then
             # map each flattened result back to its originating block id for error
             # reporting (see _group_segments_sg / seg_owner).
+            # Resolve the client BEFORE grouping: the SG width (and with it the
+            # on-wire key names) comes from the live transport.
+            client = self.client
+            if client is None and self.client_provider is not None:
+                client = self.client_provider()  # lazy un-elide
+                if client is not None:
+                    self.client = client
             sg_keys, sg_ptrs, sg_caps, sg_owner = _group_segments_sg(
-                key_list_c, addr_list_c, size_list_c
+                key_list_c, addr_list_c, size_list_c, _sg_segs_of(client)
             )
             sg_totals = [sum(c) for c in sg_caps]
             batch_bytes = sum(sg_totals)
@@ -590,11 +599,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 # into this chunk's per-layer segments. hit == 1 + len == sum(caps)
                 # means the chunk loaded; a miss or short read marks the originating
                 # block as a load error so vLLM recomputes that span (never fatal).
-                client = self.client
-                if client is None and self.client_provider is not None:
-                    client = self.client_provider()  # lazy un-elide
-                    if client is not None:
-                        self.client = client
                 if client is None:  # no client (un-elide failed): miss -> recompute
                     hits, lens = [False] * len(sg_keys), [0] * len(sg_keys)
                 else:
@@ -660,12 +664,42 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
 
 # dfkv: max payload segments gathered into one scatter-gather key. The HCA
-# max_sge is 30; SGE[0] is the request/value header, leaving 29 for payload.
+# Historical/default SG width: ConnectX-era max_sge=30, SGE[0] is the
+# request/value header, leaving 29 for payload. The LIVE width comes from
+# dfkv_max_sg_segs (negotiated per HCA); this constant is the fallback and the
+# compatibility anchor for key naming (see _sg_group_key).
 SG_MAX_SEGS = 29
 
 
+# Live SG width of a client's transport, cached on the client object (device
+# caps don't change under a running process). None / old libs => the default.
+def _sg_segs_of(client: Any) -> int:
+    if client is None:
+        return SG_MAX_SEGS
+    v = getattr(client, "_sg_segs_cache", None)
+    if v is None:
+        try:
+            v = int(client.max_sg_segs()) or SG_MAX_SEGS
+        except Exception:  # older libdfkv without dfkv_max_sg_segs
+            v = SG_MAX_SEGS
+        client._sg_segs_cache = v
+    return v
+
+
+# SG group key name. The grouping WIDTH is part of a key's identity: the same
+# "@sg1" under different widths would carry different segment spans, and a
+# variable-size GET whose total cap happens to fit would scatter the WRONG
+# bytes without any error. Non-default widths therefore get their own key
+# namespace ("@sgw{W}.{n}"); the default width keeps the historical "@sg{n}"
+# so existing cached data stays reachable across this upgrade.
+def _sg_group_key(key: str, grp: int, max_segs: int) -> str:
+    if max_segs == SG_MAX_SEGS:
+        return f"{key}@sg{grp}"
+    return f"{key}@sgw{max_segs}.{grp}"
+
+
 # dfkv scatter-gather grouping: coalesce each chunk's per-layer segments
-# (addrs[i]/sizes[i]) into "<key>@sg{n}" groups of <= SG_MAX_SEGS segments. Each
+# (addrs[i]/sizes[i]) into "<key>@sg{n}" groups of <= max_segs segments. Each
 # group is ONE dfkv key carrying all its segments via a single RDMA multi-SGE op
 # (one @sg key per chunk). owner[i] maps each @sg key back to
 # its originating chunk index for per-block load-error attribution.
@@ -673,6 +707,7 @@ def _group_segments_sg(
     keys: list[str],
     addrs: list[list[int]],
     sizes: list[list[int]],
+    max_segs: int = SG_MAX_SEGS,
 ) -> tuple[list[str], list[list[int]], list[list[int]], list[int]]:
     sg_keys: list[str] = []
     sg_ptrs: list[list[int]] = []
@@ -680,10 +715,10 @@ def _group_segments_sg(
     sg_owner: list[int] = []
     for key_idx, (key, addr, size) in enumerate(zip(keys, addrs, sizes, strict=True)):
         grp = 0
-        for off in range(0, len(addr), SG_MAX_SEGS):
-            sg_keys.append(f"{key}@sg{grp}")
-            sg_ptrs.append(list(addr[off:off + SG_MAX_SEGS]))
-            sg_sizes.append(list(size[off:off + SG_MAX_SEGS]))
+        for off in range(0, len(addr), max_segs):
+            sg_keys.append(_sg_group_key(key, grp, max_segs))
+            sg_ptrs.append(list(addr[off:off + max_segs]))
+            sg_sizes.append(list(size[off:off + max_segs]))
             sg_owner.append(key_idx)
             grp += 1
     return sg_keys, sg_ptrs, sg_sizes, sg_owner
@@ -1337,7 +1372,8 @@ class DfkvStoreWorker:
                         # block-present proxy so the lookup agrees with the
                         # SAVE/LOAD on-wire key.
                         candidate_keys.append(
-                            PoolKey(md, h.hex()).to_string() + "@sg0"
+                            _sg_group_key(PoolKey(md, h.hex()).to_string(), 0,
+                                          _sg_segs_of(self.client))
                         )
                         candidate_meta.append((g_idx, bytes(h)))
 
