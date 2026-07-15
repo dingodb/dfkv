@@ -37,13 +37,18 @@ bool CudaLib::Resolve() {
       ::dlsym(h, "cuIpcCloseMemHandle"));
   ctx_get_current_ = reinterpret_cast<CUresult (*)(CUcontext*)>(
       SymV2(h, "cuCtxGetCurrent_v2", "cuCtxGetCurrent"));
+  ctx_set_current_ = reinterpret_cast<CUresult (*)(CUcontext)>(
+      SymV2(h, "cuCtxSetCurrent_v2", "cuCtxSetCurrent"));
   ctx_get_device_ = reinterpret_cast<CUresult (*)(int*)>(
       SymV2(h, "cuCtxGetDevice_v2", "cuCtxGetDevice"));
+  primary_ctx_retain_ = reinterpret_cast<CUresult (*)(CUcontext*, int)>(
+      SymV2(h, "cuDevicePrimaryCtxRetain_v2", "cuDevicePrimaryCtxRetain"));
   pointer_get_attribute_ = reinterpret_cast<CUresult (*)(void*, int, CUdeviceptr)>(
       ::dlsym(h, "cuPointerGetAttribute"));
   if (!init || !MemAlloc || !MemFree || !Memcpy || !IpcGetMemHandle ||
       !IpcOpenMemHandle || !IpcCloseMemHandle || !ctx_get_current_ ||
-      !ctx_get_device_ || !pointer_get_attribute_)
+      !ctx_set_current_ || !ctx_get_device_ || !primary_ctx_retain_ ||
+      !pointer_get_attribute_)
     return false;
   // cuInit is idempotent; the host framework normally beat us to it. A
   // failure here (no device, driver/library mismatch) disables the surface.
@@ -77,6 +82,21 @@ int CudaLib::CurrentDevice() const {
   int dev = -1;
   if (ctx_get_device_(&dev) != kCudaSuccess) return -1;
   return dev;
+}
+
+int CudaLib::DeviceOf(const void* p) const {
+  int dev = -1;
+  if (pointer_get_attribute_(&dev, kCuPointerAttributeDeviceOrdinal,
+                             reinterpret_cast<CUdeviceptr>(p)) != kCudaSuccess)
+    return -1;
+  return dev;
+}
+
+bool CudaLib::BindPrimaryCtx(int dev) const {
+  if (dev < 0) return false;
+  CUcontext ctx = nullptr;
+  if (primary_ctx_retain_(&ctx, dev) != kCudaSuccess || !ctx) return false;
+  return ctx_set_current_(ctx) == kCudaSuccess;
 }
 
 }  // namespace dfkv

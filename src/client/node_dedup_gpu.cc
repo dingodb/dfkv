@@ -102,7 +102,8 @@ std::string GpuNodeDedup::EnvSegmentName(uint64_t model_hash) {
   return name;
 }
 
-std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(uint64_t model_hash) {
+std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(uint64_t model_hash,
+                                                    const void* device_dst_hint) {
   const char* on = std::getenv("DFKV_CLIENT_NODE_DEDUP");
   if (!on || std::strcmp(on, "1") != 0) return nullptr;
   const char* gpu = std::getenv("DFKV_CLIENT_NODE_DEDUP_GPU");
@@ -113,8 +114,13 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(uint64_t model_hash) {
     return nullptr;
   }
   if (!cu->HasCurrentCtx()) {
-    DFKV_LOG_INFO("gpu-dedup: no current CUDA context on this thread, running without");
-    return nullptr;
+    // The connectors' transfer threads are fresh pthreads that never touched
+    // CUDA: bind the primary context of the device the caller is about to
+    // scatter into (already alive — the framework holds it).
+    if (!device_dst_hint || !cu->BindPrimaryCtx(cu->DeviceOf(device_dst_hint))) {
+      DFKV_LOG_INFO("gpu-dedup: no CUDA context and no bindable device, running without");
+      return nullptr;
+    }
   }
   Options o;
   o.arena_bytes = EnvU64("DFKV_NODE_DEDUP_GPU_ARENA_MB", 512) << 20;
@@ -215,6 +221,7 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
     e.alloc_cursor.store(0, std::memory_order_relaxed);
     e.arena_bytes = opt.arena_bytes;
     e.device = cu->CurrentDevice();
+    d->self_device_ = e.device;
     std::memcpy(&e.handle, &handle, sizeof(handle));
     e.owner_va = static_cast<uint64_t>(d->arena_base_);
     e.ready.store(1, std::memory_order_release);
@@ -249,6 +256,12 @@ GpuNodeDedup::~GpuNodeDedup() {
     if (arena_base_) cu_->MemFree(arena_base_);
   }
   if (map_base_) ::munmap(map_base_, map_len_);
+}
+
+void GpuNodeDedup::EnsureThreadCtx() const {
+  // First bind on a thread retains the primary ctx once (bounded by thread
+  // count); afterwards HasCurrentCtx short-circuits.
+  if (!cu_->HasCurrentCtx()) cu_->BindPrimaryCtx(self_device_);
 }
 
 GpuNodeDedup::Slot* GpuNodeDedup::Find(const BlockKey& key) const {
@@ -382,6 +395,7 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
                                          size_t nsegs, size_t total_cap,
                                          size_t* got) {
   if (total_cap == 0 || total_cap > arena_bytes_ / 2) return Role::kFetch;
+  EnsureThreadCtx();
   const uint64_t now = NowMs();
   if (Slot* s = Find(key)) {
     const uint32_t st = s->state.load(std::memory_order_acquire);
@@ -413,6 +427,7 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
 
 void GpuNodeDedup::PublishSg(const BlockKey& key, const Seg* segs, size_t nsegs,
                              size_t len) {
+  EnsureThreadCtx();
   Slot* s = Find(key);
   if (!s || s->state.load(std::memory_order_acquire) != kStateFetching) return;
   const size_t n = len;
@@ -467,6 +482,7 @@ void GpuNodeDedup::Abort(const BlockKey& key) {
 
 bool GpuNodeDedup::WaitSg(const BlockKey& key, const Seg* segs, size_t nsegs,
                           size_t total_cap, size_t* got) {
+  EnsureThreadCtx();
   const uint64_t deadline = NowMs() + static_cast<uint64_t>(wait_ms_);
   int backoff_us = 50;
   for (;;) {

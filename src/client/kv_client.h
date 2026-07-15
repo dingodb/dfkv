@@ -194,10 +194,11 @@ class KVClient {
   std::vector<bool> BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
                                          std::vector<size_t>* out_lens);
   std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys);
-  // Lazily opens the GPU rendezvous on the FIRST SG batch (the ctor thread may
-  // not hold a CUDA context yet; the data-path caller always does). nullptr =
-  // feature off. Init is once-only; metrics readers use gpu_dedup_raw_.
-  GpuNodeDedup* GpuDedup();
+  // Lazily opens the GPU rendezvous on the first SG batch carrying a device
+  // destination; the hint pointer selects the primary context to bind when
+  // the calling (transfer) thread has none. nullptr = feature off. Init is
+  // once-only; metrics readers use gpu_dedup_raw_.
+  GpuNodeDedup* GpuDedup(const void* device_dst_hint);
   // Record a batch op (hits = count of true flags) into op_stats_ and return the
   // per-item result vector. Called at each batch method's return point.
   std::vector<bool> RecordBatch(OpMetrics::Op op,

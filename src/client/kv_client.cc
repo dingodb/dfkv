@@ -1064,9 +1064,9 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   return RecordBatch(OpMetrics::kPut, t0, ok, bytes);
 }
 
-GpuNodeDedup* KVClient::GpuDedup() {
-  std::call_once(gpu_dedup_once_, [this] {
-    gpu_dedup_ = GpuNodeDedup::FromEnv(self_hdr_.model_hash);
+GpuNodeDedup* KVClient::GpuDedup(const void* device_dst_hint) {
+  std::call_once(gpu_dedup_once_, [this, device_dst_hint] {
+    gpu_dedup_ = GpuNodeDedup::FromEnv(self_hdr_.model_hash, device_dst_hint);
     gpu_dedup_raw_.store(gpu_dedup_.get(), std::memory_order_release);
   });
   return gpu_dedup_.get();
@@ -1074,7 +1074,16 @@ GpuNodeDedup* KVClient::GpuDedup() {
 
 std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                            std::vector<size_t>* out_lens) {
-  GpuNodeDedup* gd = GpuDedup();
+  // Init the GPU rendezvous only once a DEVICE destination shows up: its
+  // pointer picks the primary context to bind when this (transfer) thread
+  // has none, and host-only callers never pay for an arena.
+  GpuNodeDedup* gd = nullptr;
+  if (const CudaLib* cu0 = CudaLib::Get()) {
+    const void* hint = nullptr;
+    for (const auto& it : items)
+      if (!it.dsts.empty() && cu0->IsDevicePtr(it.dsts[0])) { hint = it.dsts[0]; break; }
+    if (hint) gd = GpuDedup(hint);
+  }
   if (!gd || items.empty()) return BatchGetAutoSgDirect(items, out_lens);
   // Same-host rendezvous for GPU destinations (phase 2b, see node_dedup_gpu.h):
   // the vLLM connector's SG gets land in device memory, where lockstep TP

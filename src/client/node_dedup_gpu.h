@@ -64,10 +64,14 @@ class GpuNodeDedup {
 
   enum class Role { kHit, kFetch, kWait };  // same contract as NodeDedup::Role
 
-  // nullptr unless BOTH env switches are set AND the CUDA driver resolves AND
-  // the calling thread holds a CUDA context (the arena must live on the
-  // caller's device — never create contexts behind the framework's back).
-  static std::unique_ptr<GpuNodeDedup> FromEnv(uint64_t model_hash);
+  // nullptr unless BOTH env switches are set AND the CUDA driver resolves.
+  // device_dst_hint is a device pointer the caller is about to scatter into:
+  // when the calling thread has no current CUDA context (the connectors'
+  // pure-Python transfer threads never touched CUDA), the hint's device
+  // selects which PRIMARY context to bind — the framework already holds it,
+  // so this never creates a context, only makes it current here.
+  static std::unique_ptr<GpuNodeDedup> FromEnv(uint64_t model_hash,
+                                               const void* device_dst_hint);
   static std::string EnvSegmentName(uint64_t model_hash);
   static std::unique_ptr<GpuNodeDedup> Open(const Options& opt);
   ~GpuNodeDedup();
@@ -101,6 +105,10 @@ class GpuNodeDedup {
   struct Header;
   GpuNodeDedup() = default;
 
+  // Threads that never touched CUDA (fresh pthreads) lack a current context;
+  // bind our device's primary context on demand so every entry point works
+  // from any caller thread.
+  void EnsureThreadCtx() const;
   Slot* Find(const BlockKey& key) const;
   Slot* Reserve(const BlockKey& key);
   bool CopyOutSg(Slot* s, const Seg* segs, size_t nsegs, size_t total_cap,
@@ -125,6 +133,7 @@ class GpuNodeDedup {
   CUdeviceptr arena_base_ = 0;  // this process' staging arena (device memory)
   uint32_t self_idx_ = kMaxProcs;
   uint64_t self_gen_ = 0;
+  int self_device_ = -1;  // arena's device (EnsureThreadCtx re-binds to it)
 
   std::mutex peer_mu_;  // guards peer_map_
   struct PeerMap {

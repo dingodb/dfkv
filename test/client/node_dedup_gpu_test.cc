@@ -112,9 +112,9 @@ TEST(GpuNodeDedup, EnvSegmentNameCarriesLayoutVersion) {
 TEST(GpuNodeDedup, FromEnvNeedsBothSwitches) {
   ::unsetenv("DFKV_CLIENT_NODE_DEDUP");
   ::unsetenv("DFKV_CLIENT_NODE_DEDUP_GPU");
-  EXPECT_EQ(GpuNodeDedup::FromEnv(1), nullptr);
+  EXPECT_EQ(GpuNodeDedup::FromEnv(1, nullptr), nullptr);
   ::setenv("DFKV_CLIENT_NODE_DEDUP", "1", 1);
-  EXPECT_EQ(GpuNodeDedup::FromEnv(1), nullptr);  // GPU flag still off
+  EXPECT_EQ(GpuNodeDedup::FromEnv(1, nullptr), nullptr);  // GPU flag still off
   ::unsetenv("DFKV_CLIENT_NODE_DEDUP");
 }
 
@@ -175,6 +175,31 @@ TEST(GpuNodeDedup, WaiterCopiesAfterPublish) {
   EXPECT_EQ(got, v.size());
   EXPECT_EQ(dst.Down(65536), v);
   EXPECT_EQ(b->wait_hits(), 1u);
+}
+
+// The vLLM transfer threads are fresh pthreads with NO current CUDA context
+// (the phase-8 PD A/B found the feature silently off because of exactly
+// this); every entry point must self-bind the arena device's primary ctx.
+TEST(GpuNodeDedup, ThreadWithoutCtxIsServed) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("noctx");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a);
+  const std::string v = Val(9, 32768);
+  DevBuf src(32768), dst(32768);
+  src.Up(v);
+  GpuNodeDedup::Seg ss{reinterpret_cast<void*>(src.p), 32768};
+  GpuNodeDedup::Seg ds{reinterpret_cast<void*>(dst.p), 32768};
+  std::thread t([&] {  // deliberately NO EnsureCudaCtx here
+    size_t got = 0;
+    ASSERT_EQ(a->ClaimSg(K(9), &ss, 1, 32768, &got), GpuNodeDedup::Role::kFetch);
+    a->PublishSg(K(9), &ss, 1, v.size());
+  });
+  t.join();
+  size_t got = 0;
+  ASSERT_EQ(a->ClaimSg(K(9), &ds, 1, 32768, &got), GpuNodeDedup::Role::kHit);
+  EXPECT_EQ(got, v.size());
+  EXPECT_EQ(dst.Down(32768), v);
 }
 
 TEST(GpuNodeDedup, AbortFreesSlotForWaiterFallback) {

@@ -25,8 +25,9 @@ struct CUipcMemHandle {
 };
 constexpr CUresult kCudaSuccess = 0;
 constexpr unsigned kCuIpcMemLazyEnablePeerAccess = 0x1;
-constexpr int kCuPointerAttributeMemoryType = 2;  // CU_POINTER_ATTRIBUTE_MEMORY_TYPE
-constexpr unsigned kCuMemoryTypeDevice = 2;       // CU_MEMORYTYPE_DEVICE
+constexpr int kCuPointerAttributeMemoryType = 2;    // CU_POINTER_ATTRIBUTE_MEMORY_TYPE
+constexpr int kCuPointerAttributeDeviceOrdinal = 9; // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
+constexpr unsigned kCuMemoryTypeDevice = 2;         // CU_MEMORYTYPE_DEVICE
 
 class CudaLib {
  public:
@@ -36,11 +37,17 @@ class CudaLib {
 
   // True iff p is a CUDA device pointer (UVA query; host/unknown => false).
   bool IsDevicePtr(const void* p) const;
-  // True iff the calling thread has a current CUDA context (GPU dedup runs on
-  // the caller's context — vLLM worker threads always carry one; we never
-  // create contexts behind a framework's back).
+  // Device ordinal owning device pointer p; -1 on failure.
+  int DeviceOf(const void* p) const;
+  // True iff the calling thread has a current CUDA context. Framework compute
+  // threads always do; the connectors' pure-Python transfer threads (ctypes ->
+  // C ABI, never touched CUDA) do NOT — those must BindPrimaryCtx first.
   bool HasCurrentCtx() const;
   int CurrentDevice() const;  // -1 without a context
+  // Make device dev's PRIMARY context current on the calling thread (retains
+  // it once per process — the framework already holds it; this only bumps a
+  // refcount, it never creates a fresh context behind the framework's back).
+  bool BindPrimaryCtx(int dev) const;
 
   CUresult (*MemAlloc)(CUdeviceptr*, size_t) = nullptr;
   CUresult (*MemFree)(CUdeviceptr) = nullptr;
@@ -55,7 +62,9 @@ class CudaLib {
   bool Resolve();
 
   CUresult (*ctx_get_current_)(CUcontext*) = nullptr;
+  CUresult (*ctx_set_current_)(CUcontext) = nullptr;
   CUresult (*ctx_get_device_)(int*) = nullptr;
+  CUresult (*primary_ctx_retain_)(CUcontext*, int) = nullptr;
   CUresult (*pointer_get_attribute_)(void*, int, CUdeviceptr) = nullptr;
 };
 
