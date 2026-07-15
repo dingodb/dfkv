@@ -284,6 +284,20 @@ std::string KVClient::MetricsSnapshot() const {
   s += health_.Render();
   s += peer_lat_.Render();
   s += op_stats_.Render();
+  if (dedup_) {
+    s += "# HELP dfkv_client_dedup_hits_total Rendezvous results served from shm\n";
+    s += "# TYPE dfkv_client_dedup_hits_total counter\n";
+    s += "dfkv_client_dedup_hits_total " + std::to_string(dedup_->hits()) + "\n";
+    s += "# HELP dfkv_client_dedup_fetches_total Keys this process fetched for the rendezvous\n";
+    s += "# TYPE dfkv_client_dedup_fetches_total counter\n";
+    s += "dfkv_client_dedup_fetches_total " + std::to_string(dedup_->fetches()) + "\n";
+    s += "# HELP dfkv_client_dedup_wait_hits_total Waits resolved by a peer's publish\n";
+    s += "# TYPE dfkv_client_dedup_wait_hits_total counter\n";
+    s += "dfkv_client_dedup_wait_hits_total " + std::to_string(dedup_->wait_hits()) + "\n";
+    s += "# HELP dfkv_client_dedup_wait_timeouts_total Waits that fell back to a direct fetch\n";
+    s += "# TYPE dfkv_client_dedup_wait_timeouts_total counter\n";
+    s += "dfkv_client_dedup_wait_timeouts_total " + std::to_string(dedup_->wait_timeouts()) + "\n";
+  }
   if (t_) s += t_->MetricsText();
   return s;
 }
@@ -629,9 +643,10 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
       if (r[m])
-        dedup_->Publish(bks[i], static_cast<const char*>(items[i].out), items[i].n);
+        dedup_->Publish(bks[i], NodeDedup::Kind::kData,
+                        static_cast<const char*>(items[i].out), items[i].n);
       else
-        dedup_->Abort(bks[i], items[i].n);
+        dedup_->Abort(bks[i], NodeDedup::Kind::kData);
     }
   }
   for (size_t i : wait_list) {
@@ -703,6 +718,65 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
 
 std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
                                          std::vector<size_t>* out_lens) {
+  if (!dedup_) return BatchGetAutoDirect(items, out_lens);
+  // Same-host rendezvous, variable-size flavor: identity is the key; a
+  // published payload hits any reader whose cap fits it (see node_dedup.h).
+  const size_t N = items.size();
+  std::vector<bool> res(N, false);
+  std::vector<size_t> lens(N, 0);
+  std::vector<BlockKey> bks(N);
+  std::vector<KvGetItem> fetch_items;
+  std::vector<size_t> fetch_map, wait_list;
+  fetch_items.reserve(N);
+  for (size_t i = 0; i < N; ++i) {
+    bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
+    size_t got = 0;
+    switch (dedup_->ClaimAuto(bks[i], items[i].n, static_cast<char*>(items[i].out), &got)) {
+      case NodeDedup::Role::kHit:
+        res[i] = true;
+        lens[i] = got;
+        break;
+      case NodeDedup::Role::kFetch:
+        fetch_map.push_back(i);
+        fetch_items.push_back(items[i]);
+        break;
+      case NodeDedup::Role::kWait:
+        wait_list.push_back(i);
+        break;
+    }
+  }
+  if (!fetch_items.empty()) {
+    std::vector<size_t> flens;
+    auto r = BatchGetAutoDirect(fetch_items, &flens);
+    for (size_t m = 0; m < fetch_map.size(); ++m) {
+      const size_t i = fetch_map[m];
+      res[i] = r[m];
+      if (r[m]) {
+        lens[i] = flens[m];
+        dedup_->Publish(bks[i], NodeDedup::Kind::kData,
+                        static_cast<const char*>(items[i].out), flens[m]);
+      } else {
+        dedup_->Abort(bks[i], NodeDedup::Kind::kData);
+      }
+    }
+  }
+  for (size_t i : wait_list) {
+    size_t got = 0;
+    if (dedup_->WaitCopyAuto(bks[i], items[i].n, static_cast<char*>(items[i].out), &got)) {
+      res[i] = true;
+      lens[i] = got;
+    } else {  // fetcher failed/slow: bounded fallback to a direct read
+      size_t got2 = 0;
+      res[i] = GetAuto(items[i].key, items[i].out, items[i].n, &got2);
+      if (res[i]) lens[i] = got2;
+    }
+  }
+  if (out_lens) *out_lens = std::move(lens);
+  return res;
+}
+
+std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& items,
+                                         std::vector<size_t>* out_lens) {
   auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> hit(N, 0);
@@ -766,6 +840,51 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
 }
 
 std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
+  if (!dedup_) return BatchExistDirect(keys);
+  // Exist probes ride the rendezvous with a 1-byte answer. NEGATIVE answers
+  // are published too (a valid result, unlike a failed GET); staleness is
+  // bounded by the TTL and safe both ways (stale absent -> recompute, stale
+  // present -> the GET misses and recomputes).
+  const size_t N = keys.size();
+  std::vector<bool> res(N, false);
+  std::vector<BlockKey> bks(N);
+  std::vector<std::string> fetch_keys;
+  std::vector<size_t> fetch_map, wait_list;
+  fetch_keys.reserve(N);
+  for (size_t i = 0; i < N; ++i) {
+    bks[i] = ToBlockKey(keys[i], self_hdr_.model_hash);
+    bool val = false;
+    switch (dedup_->ClaimExist(bks[i], &val)) {
+      case NodeDedup::Role::kHit:
+        res[i] = val;
+        break;
+      case NodeDedup::Role::kFetch:
+        fetch_map.push_back(i);
+        fetch_keys.push_back(keys[i]);
+        break;
+      case NodeDedup::Role::kWait:
+        wait_list.push_back(i);
+        break;
+    }
+  }
+  if (!fetch_keys.empty()) {
+    auto r = BatchExistDirect(fetch_keys);
+    for (size_t m = 0; m < fetch_map.size(); ++m) {
+      const size_t i = fetch_map[m];
+      res[i] = r[m];
+      const char b = r[m] ? 1 : 0;
+      dedup_->Publish(bks[i], NodeDedup::Kind::kExist, &b, 1);
+    }
+  }
+  for (size_t i : wait_list) {
+    bool val = false;
+    if (dedup_->WaitExist(bks[i], &val)) res[i] = val;
+    else res[i] = Exist(keys[i]);  // bounded fallback
+  }
+  return res;
+}
+
+std::vector<bool> KVClient::BatchExistDirect(const std::vector<std::string>& keys) {
   auto t0 = std::chrono::steady_clock::now();
   const size_t N = keys.size();
   std::vector<char> e(N, 0);

@@ -59,7 +59,7 @@ TEST(NodeDedup, FetchPublishThenPeersHit) {
   std::string dst(v.size(), '\0');
 
   ASSERT_EQ(a->Claim(K(1), v.size(), &dst[0]), NodeDedup::Role::kFetch);
-  a->Publish(K(1), v.data(), v.size());
+  a->Publish(K(1), NodeDedup::Kind::kData, v.data(), v.size());
   ASSERT_EQ(b->Claim(K(1), v.size(), &dst[0]), NodeDedup::Role::kHit);
   EXPECT_EQ(dst, v);
   EXPECT_EQ(b->hits(), 1u);
@@ -77,7 +77,7 @@ TEST(NodeDedup, WaiterCopiesAfterPublish) {
   ASSERT_EQ(b->Claim(K(2), v.size(), &dst_b[0]), NodeDedup::Role::kWait);
   std::thread pub([&] {
     std::this_thread::sleep_for(50ms);
-    a->Publish(K(2), v.data(), v.size());
+    a->Publish(K(2), NodeDedup::Kind::kData, v.data(), v.size());
   });
   EXPECT_TRUE(b->WaitCopy(K(2), v.size(), &dst_b[0]));
   pub.join();
@@ -93,7 +93,7 @@ TEST(NodeDedup, AbortLetsWaiterFallBack) {
   std::string dst(4096, '\0');
   ASSERT_EQ(a->Claim(K(3), dst.size(), &dst[0]), NodeDedup::Role::kFetch);
   ASSERT_EQ(b->Claim(K(3), dst.size(), &dst[0]), NodeDedup::Role::kWait);
-  a->Abort(K(3), dst.size());
+  a->Abort(K(3), NodeDedup::Kind::kData);
   // The waiter's bounded poll must return false (fall back to a direct fetch),
   // never hang.
   EXPECT_FALSE(b->WaitCopy(K(3), dst.size(), &dst[0]));
@@ -122,7 +122,7 @@ TEST(NodeDedup, TtlExpiryRecyclesEntry) {
   const std::string v = Val(5, 4096);
   std::string dst(v.size(), '\0');
   ASSERT_EQ(a->Claim(K(5), v.size(), &dst[0]), NodeDedup::Role::kFetch);
-  a->Publish(K(5), v.data(), v.size());
+  a->Publish(K(5), NodeDedup::Kind::kData, v.data(), v.size());
   ASSERT_EQ(a->Claim(K(5), v.size(), &dst[0]), NodeDedup::Role::kHit);
   std::this_thread::sleep_for(150ms);  // > ttl
   // Expired: a new arrival re-fetches instead of serving stale bytes.
@@ -136,13 +136,13 @@ TEST(NodeDedup, LappedArenaNeverServesOverwrittenBytes) {
   const std::string v = Val(6, 128 * 1024);
   std::string dst(v.size(), '\0');
   ASSERT_EQ(a->Claim(K(6), v.size(), &dst[0]), NodeDedup::Role::kFetch);
-  a->Publish(K(6), v.data(), v.size());
+  a->Publish(K(6), NodeDedup::Kind::kData, v.data(), v.size());
   // Lap the ring: publish > arena_bytes of other payloads.
   for (uint64_t i = 100; i < 100 + 12; ++i) {
     const std::string w = Val(i, 128 * 1024);
     std::string tmp(w.size(), '\0');
     if (a->Claim(K(i), w.size(), &tmp[0]) == NodeDedup::Role::kFetch)
-      a->Publish(K(i), w.data(), w.size());
+      a->Publish(K(i), NodeDedup::Kind::kData, w.data(), w.size());
   }
   // K(6)'s payload region has been overwritten: the entry must NOT hit with
   // stale bytes — any non-kHit outcome (re-fetch) is correct; a kHit MUST
@@ -160,7 +160,7 @@ TEST(NodeDedup, CrossProcessRendezvous) {
   ASSERT_TRUE(parent);
   std::string dst(v.size(), '\0');
   ASSERT_EQ(parent->Claim(K(7), v.size(), &dst[0]), NodeDedup::Role::kFetch);
-  parent->Publish(K(7), v.data(), v.size());
+  parent->Publish(K(7), NodeDedup::Kind::kData, v.data(), v.size());
 
   pid_t pid = ::fork();
   ASSERT_GE(pid, 0);
@@ -181,4 +181,46 @@ TEST(NodeDedup, CrossProcessRendezvous) {
 TEST(NodeDedup, DisabledByDefaultFromEnv) {
   ::unsetenv("DFKV_CLIENT_NODE_DEDUP");
   EXPECT_EQ(NodeDedup::FromEnv(0x51), nullptr);
+}
+
+TEST(NodeDedup, AutoAcceptsFittingPayloadStrictDoesNot) {
+  ShmGuard g("auto");
+  auto a = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a);
+  const std::string v = Val(8, 5000);  // "unfull" payload
+  std::string dst(8192, '\0');
+  ASSERT_EQ(a->Claim(K(8), v.size(), &dst[0]), NodeDedup::Role::kFetch);
+  a->Publish(K(8), NodeDedup::Kind::kData, v.data(), v.size());
+  // Auto with a larger cap hits and reports the true length.
+  size_t got = 0;
+  ASSERT_EQ(a->ClaimAuto(K(8), 8192, &dst[0], &got), NodeDedup::Role::kHit);
+  EXPECT_EQ(got, v.size());
+  EXPECT_EQ(std::string(dst.data(), got), v);
+  // Auto with a too-small cap must NOT hit (falls back to fetch/reserve path).
+  std::string small(1024, '\0');
+  EXPECT_NE(a->ClaimAuto(K(8), 1024, &small[0], &got), NodeDedup::Role::kHit);
+  // Strict with a different n must NOT hit either.
+  EXPECT_NE(a->Claim(K(8), 8192, &dst[0]), NodeDedup::Role::kHit);
+}
+
+TEST(NodeDedup, ExistRendezvousBothAnswers) {
+  ShmGuard g("exist");
+  auto a = NodeDedup::Open(Opts(g.name));
+  auto b = NodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  bool val = false;
+  ASSERT_EQ(a->ClaimExist(K(9), &val), NodeDedup::Role::kFetch);
+  const char yes = 1;
+  a->Publish(K(9), NodeDedup::Kind::kExist, &yes, 1);
+  ASSERT_EQ(b->ClaimExist(K(9), &val), NodeDedup::Role::kHit);
+  EXPECT_TRUE(val);
+  // Negative answers are published too (valid result, unlike a failed GET).
+  ASSERT_EQ(a->ClaimExist(K(10), &val), NodeDedup::Role::kFetch);
+  const char no = 0;
+  a->Publish(K(10), NodeDedup::Kind::kExist, &no, 1);
+  ASSERT_EQ(b->ClaimExist(K(10), &val), NodeDedup::Role::kHit);
+  EXPECT_FALSE(val);
+  // The exist namespace never collides with the data namespace of the same key.
+  std::string dst(4096, '\0');
+  EXPECT_EQ(a->Claim(K(9), dst.size(), &dst[0]), NodeDedup::Role::kFetch);
 }

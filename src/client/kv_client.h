@@ -180,9 +180,12 @@ class KVClient {
   std::string Route(const std::string& key) const;
   uint64_t NowMs() const;
   void ProbeLoop();
-  // The plain (no-dedup) BatchGet body; BatchGet wraps it with the same-host
-  // rendezvous when DFKV_CLIENT_NODE_DEDUP=1 (see node_dedup.h).
+  // The plain (no-dedup) batch bodies; the public methods wrap them with the
+  // same-host rendezvous when DFKV_CLIENT_NODE_DEDUP=1 (see node_dedup.h).
   std::vector<bool> BatchGetDirect(const std::vector<KvGetItem>& items);
+  std::vector<bool> BatchGetAutoDirect(const std::vector<KvGetItem>& items,
+                                       std::vector<size_t>* out_lens);
+  std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys);
   // Record a batch op (hits = count of true flags) into op_stats_ and return the
   // per-item result vector. Called at each batch method's return point.
   std::vector<bool> RecordBatch(OpMetrics::Op op,

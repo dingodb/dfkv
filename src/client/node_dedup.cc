@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -15,10 +16,11 @@
 namespace dfkv {
 
 namespace {
-constexpr uint32_t kMagic = 0x44445631u;  // "DDV1"
+constexpr uint32_t kMagic = 0x44445632u;  // "DDV2" (v2: identity = key+kind)
 constexpr uint32_t kStateEmpty = 0;
 constexpr uint32_t kStateFetching = 1;
 constexpr uint32_t kStateReady = 2;
+constexpr size_t kAnyLen = SIZE_MAX;  // CopyOut strict_n wildcard
 
 uint64_t EnvU64(const char* name, uint64_t dflt) {
   const char* v = std::getenv(name);
@@ -34,20 +36,20 @@ uint32_t Pow2AtLeast(uint32_t v) {
 }
 }  // namespace
 
-// 64-byte slot. gen is a seqlock over {key identity, payload location}: odd
-// while a writer mutates, +1 to even when coherent. state transitions are CAS
-// (only EMPTY->FETCHING, expired-READY->FETCHING, FETCHING->READY/EMPTY).
+// 64-byte slot. gen is a seqlock over {identity, payload location}: odd while
+// a writer mutates, +1 to even when coherent. state transitions are CAS-only
+// (EMPTY->FETCHING, expired-READY->FETCHING, FETCHING->READY/EMPTY).
 struct NodeDedup::Slot {
   std::atomic<uint64_t> gen;
   std::atomic<uint32_t> state;
-  uint32_t len;                        // payload byte count (== every peer's n)
+  uint32_t len;                        // payload byte count (attribute, not identity)
   uint64_t key_id;
   uint32_t key_index;
-  uint32_t pad0;
+  uint32_t kind;                       // Kind: data vs exist namespace
   std::atomic<uint64_t> fetch_start_ms;
   uint64_t payload_off;                // absolute offset into the arena
   uint64_t alloc_seq;                  // arena cursor value at allocation (lap check)
-  uint64_t pad1;                       // -> 64 B (cache-line / cross-process ABI)
+  uint64_t pad1;                       // -> 64 B (cache line / cross-process ABI)
 };
 
 struct NodeDedup::Header {
@@ -89,8 +91,6 @@ std::unique_ptr<NodeDedup> NodeDedup::Open(const Options& opt) {
                      opt.arena_bytes;
   int fd = ::shm_open(opt.name.c_str(), O_RDWR | O_CREAT, 0600);
   if (fd < 0) return nullptr;
-  // Every opener ftruncates to ITS computed size; a config mismatch is caught
-  // by the header check below (first writer wins the layout).
   struct stat st{};
   if (::fstat(fd, &st) != 0) { ::close(fd); return nullptr; }
   const bool creator = (st.st_size == 0);
@@ -121,7 +121,7 @@ std::unique_ptr<NodeDedup> NodeDedup::Open(const Options& opt) {
 
   if (creator) {
     // Fresh (ftruncate zero-fills): stamp the header last so concurrent
-    // openers either see a zero magic (spin briefly) or a finished layout.
+    // openers either spin briefly on init_done or see a finished layout.
     d->hdr_->nslots = nslots;
     d->hdr_->arena_bytes = opt.arena_bytes;
     d->hdr_->alloc_cursor.store(0, std::memory_order_relaxed);
@@ -148,21 +148,25 @@ NodeDedup::~NodeDedup() {
   // and a later process re-attaches. Bounded size; no growth over time.
 }
 
-NodeDedup::Slot* NodeDedup::Find(const BlockKey& key, size_t n) const {
+NodeDedup::Slot* NodeDedup::Find(const BlockKey& key, Kind kind) const {
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index) & mask;
+  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index ^
+                                       (static_cast<uint32_t>(kind) << 13)) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     if (s.state.load(std::memory_order_acquire) == kStateEmpty) continue;
-    if (s.key_id == key.id && s.key_index == key.index && s.len == n) return &s;
+    if (s.key_id == key.id && s.key_index == key.index &&
+        s.kind == static_cast<uint32_t>(kind))
+      return &s;
   }
   return nullptr;
 }
 
-NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, size_t n) {
+NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, Kind kind) {
   const uint64_t now = NowMs();
   const uint32_t mask = nslots_ - 1;
-  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index) & mask;
+  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index ^
+                                       (static_cast<uint32_t>(kind) << 13)) & mask;
   for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
     Slot& s = slots_[idx];
     uint32_t st = s.state.load(std::memory_order_acquire);
@@ -182,7 +186,8 @@ NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, size_t n) {
     s.gen.fetch_add(1, std::memory_order_acq_rel);  // -> odd
     s.key_id = key.id;
     s.key_index = key.index;
-    s.len = static_cast<uint32_t>(n);
+    s.kind = static_cast<uint32_t>(kind);
+    s.len = 0;
     s.payload_off = 0;
     s.alloc_seq = 0;
     s.fetch_start_ms.store(now, std::memory_order_relaxed);
@@ -192,11 +197,14 @@ NodeDedup::Slot* NodeDedup::Reserve(const BlockKey& key, size_t n) {
   return nullptr;  // probe window full: run without dedup for this key
 }
 
-bool NodeDedup::CopyOut(Slot* s, size_t n, char* dst) const {
+bool NodeDedup::CopyOut(Slot* s, size_t cap, size_t strict_n, char* dst,
+                        size_t* got) const {
   const uint64_t g0 = s->gen.load(std::memory_order_acquire);
   if (g0 & 1) return false;  // writer active
   if (s->state.load(std::memory_order_acquire) != kStateReady) return false;
-  if (s->len != n) return false;
+  const size_t n = s->len;
+  if (strict_n != kAnyLen && n != strict_n) return false;
+  if (n > cap) return false;
   const uint64_t off = s->payload_off;
   const uint64_t seq = s->alloc_seq;
   if (off + n > arena_bytes_) return false;  // torn metadata: bail
@@ -209,27 +217,30 @@ bool NodeDedup::CopyOut(Slot* s, size_t n, char* dst) const {
   // the slot generation did not move during the copy.
   if (hdr_->alloc_cursor.load(std::memory_order_acquire) - seq > arena_bytes_ - n)
     return false;
-  return s->gen.load(std::memory_order_acquire) == g0;
+  if (s->gen.load(std::memory_order_acquire) != g0) return false;
+  if (got) *got = n;
+  return true;
 }
 
-NodeDedup::Role NodeDedup::Claim(const BlockKey& key, size_t n, char* dst) {
-  if (n == 0 || n > arena_bytes_ / 2) return Role::kFetch;  // oversize: no dedup
+NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
+                                     size_t strict_n, char* dst, size_t* got) {
+  if (cap == 0 || cap > arena_bytes_ / 2) return Role::kFetch;  // oversize: no dedup
   const uint64_t now = NowMs();
-  if (Slot* s = Find(key, n)) {
+  if (Slot* s = Find(key, kind)) {
     const uint32_t st = s->state.load(std::memory_order_acquire);
     if (st == kStateReady) {
       if (now - s->fetch_start_ms.load(std::memory_order_relaxed) <=
               static_cast<uint64_t>(ttl_ms_) &&
-          CopyOut(s, n, dst)) {
+          CopyOut(s, cap, strict_n, dst, got)) {
         hits_.fetch_add(1, std::memory_order_relaxed);
         return Role::kHit;
       }
-      // Expired/torn: fall through to Reserve (may recycle this very slot).
+      // Expired/torn/size-mismatch: fall through to Reserve (may recycle it).
     } else if (st == kStateFetching) {
       const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
       if (now - started <= static_cast<uint64_t>(takeover_ms_)) return Role::kWait;
       // Fetcher looks dead: take the fetch over (CAS on fetch_start_ms so
-      // exactly one waiter wins; the loser just waits on the winner).
+      // exactly one waiter wins; the losers keep waiting on the winner).
       uint64_t expect = started;
       if (s->fetch_start_ms.compare_exchange_strong(expect, now,
                                                     std::memory_order_acq_rel)) {
@@ -239,15 +250,31 @@ NodeDedup::Role NodeDedup::Claim(const BlockKey& key, size_t n, char* dst) {
       return Role::kWait;
     }
   }
-  if (Reserve(key, n)) {
+  if (Reserve(key, kind)) {
     fetches_.fetch_add(1, std::memory_order_relaxed);
     return Role::kFetch;
   }
   return Role::kFetch;  // no slot available: plain fetch, nothing to publish
 }
 
-void NodeDedup::Publish(const BlockKey& key, const char* data, size_t n) {
-  Slot* s = Find(key, n);
+NodeDedup::Role NodeDedup::Claim(const BlockKey& key, size_t n, char* dst) {
+  return ClaimImpl(key, Kind::kData, n, n, dst, nullptr);
+}
+
+NodeDedup::Role NodeDedup::ClaimAuto(const BlockKey& key, size_t cap, char* dst,
+                                     size_t* got) {
+  return ClaimImpl(key, Kind::kData, cap, kAnyLen, dst, got);
+}
+
+NodeDedup::Role NodeDedup::ClaimExist(const BlockKey& key, bool* val) {
+  char b = 0;
+  const Role r = ClaimImpl(key, Kind::kExist, 1, 1, &b, nullptr);
+  if (r == Role::kHit && val) *val = (b != 0);
+  return r;
+}
+
+void NodeDedup::Publish(const BlockKey& key, Kind kind, const char* data, size_t n) {
+  Slot* s = Find(key, kind);
   if (!s || s->state.load(std::memory_order_acquire) != kStateFetching) return;
   // Ring-allocate: reserve [cur, cur+n) contiguously; skip the tail remainder
   // when a lap boundary would split the payload.
@@ -258,13 +285,14 @@ void NodeDedup::Publish(const BlockKey& key, const char* data, size_t n) {
     const uint64_t need = (in_lap + n > arena_bytes_) ? (arena_bytes_ - in_lap) + n : n;
     if (hdr_->alloc_cursor.compare_exchange_weak(cur, cur + need,
                                                  std::memory_order_acq_rel)) {
-      seq = cur + need;              // cursor AFTER this allocation
+      seq = cur + need;                       // cursor AFTER this allocation
       off = (cur + need - n) % arena_bytes_;  // payload sits at the end of the grab
       break;
     }
   }
   std::memcpy(arena_ + off, data, n);
   s->gen.fetch_add(1, std::memory_order_acq_rel);   // odd: mutating
+  s->len = static_cast<uint32_t>(n);
   s->payload_off = off;
   s->alloc_seq = seq;
   s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);  // TTL from publish
@@ -272,23 +300,24 @@ void NodeDedup::Publish(const BlockKey& key, const char* data, size_t n) {
   s->state.store(kStateReady, std::memory_order_release);
 }
 
-void NodeDedup::Abort(const BlockKey& key, size_t n) {
-  Slot* s = Find(key, n);
+void NodeDedup::Abort(const BlockKey& key, Kind kind) {
+  Slot* s = Find(key, kind);
   if (!s) return;
   // Only the fetcher aborts. Freeing the slot immediately (instead of letting
-  // it age into a takeover) lets a waiter that falls back re-claim at once;
-  // CAS so a concurrent takeover winner isn't clobbered.
+  // it age into a takeover) lets a falling-back waiter re-claim at once; CAS
+  // so a concurrent takeover winner isn't clobbered.
   uint32_t st = kStateFetching;
   s->state.compare_exchange_strong(st, kStateEmpty, std::memory_order_acq_rel);
 }
 
-bool NodeDedup::WaitCopy(const BlockKey& key, size_t n, char* dst) {
+bool NodeDedup::WaitImpl(const BlockKey& key, Kind kind, size_t cap,
+                         size_t strict_n, char* dst, size_t* got) {
   const uint64_t deadline = NowMs() + static_cast<uint64_t>(wait_ms_);
   int backoff_us = 50;
   for (;;) {
-    Slot* s = Find(key, n);
+    Slot* s = Find(key, kind);
     if (s && s->state.load(std::memory_order_acquire) == kStateReady &&
-        CopyOut(s, n, dst)) {
+        CopyOut(s, cap, strict_n, dst, got)) {
       wait_hits_.fetch_add(1, std::memory_order_relaxed);
       return true;
     }
@@ -299,6 +328,21 @@ bool NodeDedup::WaitCopy(const BlockKey& key, size_t n, char* dst) {
     std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
     if (backoff_us < 1000) backoff_us *= 2;
   }
+}
+
+bool NodeDedup::WaitCopy(const BlockKey& key, size_t n, char* dst) {
+  return WaitImpl(key, Kind::kData, n, n, dst, nullptr);
+}
+
+bool NodeDedup::WaitCopyAuto(const BlockKey& key, size_t cap, char* dst, size_t* got) {
+  return WaitImpl(key, Kind::kData, cap, kAnyLen, dst, got);
+}
+
+bool NodeDedup::WaitExist(const BlockKey& key, bool* val) {
+  char b = 0;
+  if (!WaitImpl(key, Kind::kExist, 1, 1, &b, nullptr)) return false;
+  if (val) *val = (b != 0);
+  return true;
 }
 
 }  // namespace dfkv
