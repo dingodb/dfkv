@@ -338,6 +338,20 @@ TEST(RdmaLoopback, UserMrCapTracksDepth) {
       << "cap below depth*max_sge -> in-window MR eviction risk on SG batches";
 }
 
+// Client-side anchor: RegisterMemory must register the pool MRs at
+// DECLARATION time (holding a lifetime device ref), not on the first
+// connection's first op — a 141 GB host pool costs ~4 s to pin, which
+// belongs in engine startup, not the first lookup.
+TEST(RdmaLoopback, RegisterMemoryAnchorsPoolMrBeforeFirstConn) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  const uint64_t before = rdma::RcEndpoint::PoolMrRegistrations();
+  RdmaTransport rt(kMaxMsg);
+  std::vector<char> pool(256 * 1024);
+  rt.RegisterMemory(pool.data(), pool.size());
+  EXPECT_GT(rdma::RcEndpoint::PoolMrRegistrations(), before)
+      << "pool MR not registered at declaration time (anchor missing)";
+}
+
 TEST(RdmaLoopback, PoolMrSharedAcrossBuffers) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   rdma::RcEndpoint ep;

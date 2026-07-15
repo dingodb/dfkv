@@ -22,6 +22,7 @@
 #include "transport/transport.h"
 
 namespace dfkv {
+namespace rdma { class RcEndpoint; }
 
 class RdmaTransport : public Transport {
  public:
@@ -90,6 +91,9 @@ class RdmaTransport : public Transport {
   // Caller memory regions to register on every connection (the host KV pool).
   // Guarded by mu_; snapshotted in Acquire and registered on the connection.
   std::vector<std::pair<void*, size_t>> pools_;
+  // Lifetime per-rail device refs holding the pool MRs registered at
+  // RegisterMemory time (client-side anchor; see RegisterMemory). Filled once.
+  std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
   size_t max_payload_;
   // DCP1 declared max block bytes (DFKV_RDMA_MAX_BLOCK_BYTES, clamped to
   // max_payload_). 0 = undeclared: worst-case buffers both sides, old wire

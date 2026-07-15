@@ -222,12 +222,36 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
 
 void RdmaTransport::RegisterMemory(void* base, size_t size) {
   if (!base || size == 0) return;
-  std::lock_guard<std::mutex> lk(mu_);
-  for (const auto& p : pools_) if (p.first == base) return;  // dedup by base
-  pools_.push_back({base, size});
-  mr_regions_.fetch_add(1, std::memory_order_relaxed);
-  // Connections register this lazily on their next Acquire (EnsurePoolMrs); call
-  // before traffic so every connection's PD has the whole pool registered once.
+  std::vector<std::pair<void*, size_t>> pools;
+  std::vector<rdma::RcEndpoint*> anchor_ptrs;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& p : pools_) if (p.first == base) return;  // dedup by base
+    pools_.push_back({base, size});
+    mr_regions_.fetch_add(1, std::memory_order_relaxed);
+    // Anchor each configured rail: hold a lifetime device ref and register the
+    // pool MRs NOW, at declaration time (inference engines call this during
+    // startup), not on the first connection's first op. Registering a
+    // hundred-GB host KV pool pins every page (~4 s measured for 141 GB) —
+    // without the anchor that cost sat in the first lookup after every client
+    // process start, and the client mirror of the server-side dereg-on-idle
+    // cycle (fixed by the server anchor) could re-charge it. Mirrors
+    // RdmaServer::Start's anchor.
+    if (anchors_.empty()) {
+      for (const auto& d : devs_) {
+        auto ep = std::make_unique<rdma::RcEndpoint>();
+        if (ep->Open(d.empty() ? nullptr : d.c_str(), 4096, 1))
+          anchors_.push_back(std::move(ep));
+      }
+    }
+    pools = pools_;
+    for (auto& ep : anchors_) anchor_ptrs.push_back(ep.get());
+  }
+  // The actual (seconds-scale for huge pools) registration runs outside mu_;
+  // anchors_ itself is only ever filled once under mu_, so the snapshot of raw
+  // pointers stays valid for the transport's lifetime.
+  for (auto* ep : anchor_ptrs) ep->EnsurePoolMrs(pools);
+  // Connections still EnsurePoolMrs on Acquire (no-op once anchored here).
 }
 
 std::string RdmaTransport::MetricsText() const {
