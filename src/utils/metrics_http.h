@@ -33,6 +33,12 @@ class MetricsHttpServer {
   // answers 503 (e.g. MDS reporting etcd unreachable) instead of a blanket
   // 200 "ok"; unset keeps the always-200 behavior. Called on the HTTP thread.
   void set_health_check(std::function<bool()> fn) { health_ = std::move(fn); }
+  // Optional /readyz predicate — READINESS, distinct from liveness: the
+  // process is alive (healthz 200) long before it can serve (arena pre-fault,
+  // pool-MR anchor, RDMA listener, MDS registration: tens of seconds on big
+  // arenas). Rolling upgrades must gate on THIS, not on the port being open.
+  // Unset => mirrors the always-200 behavior.
+  void set_ready_check(std::function<bool()> fn) { ready_ = std::move(fn); }
 
   // port 0 => ephemeral (query with port()). bind_addr empty => all interfaces
   // (back-compat); pass e.g. "127.0.0.1" to restrict /metrics to loopback.
@@ -59,6 +65,7 @@ class MetricsHttpServer {
 
   std::function<std::string()> render_;
   std::function<bool()> health_;  // optional /healthz predicate (null => always ok)
+  std::function<bool()> ready_;   // optional /readyz predicate (null => always ok)
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};

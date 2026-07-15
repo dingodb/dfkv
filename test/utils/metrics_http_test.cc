@@ -109,3 +109,32 @@ TEST(MetricsHttp, HealthCheckPredicateGates503) {
 
   srv.Stop();
 }
+
+TEST(MetricsHttp, ReadyCheckPredicateGates503) {
+  std::atomic<bool> ready{false};
+  MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+  srv.set_ready_check([&] { return ready.load(); });
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+  int port = srv.port();
+
+  // Startup window: alive (healthz 200) but NOT ready (readyz 503) — rolling
+  // upgrades gate on readiness, not on the port being open.
+  std::string h = HttpGet(port, "/healthz");
+  EXPECT_NE(h.find("200"), std::string::npos) << h;
+  std::string starting = HttpGet(port, "/readyz");
+  EXPECT_NE(starting.find("503"), std::string::npos) << starting;
+  EXPECT_NE(starting.find("starting"), std::string::npos) << starting;
+
+  ready.store(true);
+  std::string ok = HttpGet(port, "/readyz");
+  EXPECT_NE(ok.find("200"), std::string::npos) << ok;
+  EXPECT_NE(ok.find("ready"), std::string::npos) << ok;
+
+  // Unset predicate mirrors the always-200 behavior.
+  MetricsHttpServer plain([] { return std::string(); });
+  ASSERT_EQ(plain.Start(0), Status::kOk);
+  std::string dflt = HttpGet(plain.port(), "/readyz");
+  EXPECT_NE(dflt.find("200"), std::string::npos) << dflt;
+  plain.Stop();
+  srv.Stop();
+}

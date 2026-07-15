@@ -135,6 +135,13 @@ void MetricsHttpServer::Handle(int fd) {
       out = Resp("200 OK", "text/plain", "ok\n");
     else
       out = Resp("503 Service Unavailable", "text/plain", "unavailable\n");
+  } else if (path == "/readyz") {
+    // Readiness (serving-capable), not liveness: 503 while startup work
+    // (arena pre-fault, MR anchor, listeners, MDS registration) is running.
+    if (!ready_ || ready_())
+      out = Resp("200 OK", "text/plain", "ready\n");
+    else
+      out = Resp("503 Service Unavailable", "text/plain", "starting\n");
   } else {
     out = Resp("404 Not Found", "text/plain", "not found\n");
   }

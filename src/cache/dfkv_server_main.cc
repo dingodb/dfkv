@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -282,6 +283,11 @@ int main(int argc, char** argv) {
 
   // Start /metrics now that the (optional) RDMA server exists: the render
   // callback combines the cache-node metrics with the RDMA server counters.
+  // ready_flag flips once EVERY startup stage below has finished (RDMA
+  // listener + MR anchor are already up at this point; MDS registration is
+  // still ahead) — /readyz answers 503 until then so rolling upgrades wait
+  // for a servable node, not merely an open metrics port.
+  auto ready_flag = std::make_shared<std::atomic<bool>>(false);
   if (metrics_port >= 0) {
     mhttp = std::make_unique<dfkv::MetricsHttpServer>([&] {
       std::string s = srv.MetricsText();
@@ -290,6 +296,7 @@ int main(int argc, char** argv) {
 #endif
       return s;
     });
+    mhttp->set_ready_check([ready_flag] { return ready_flag->load(std::memory_order_acquire); });
     if (mhttp->Start(metrics_port, metrics_bind) == Status::kOk)
       DFKV_LOG_INFO("dfkv_server /metrics on port " + std::to_string(mhttp->port()));
     else
@@ -364,6 +371,9 @@ int main(int argc, char** argv) {
     DFKV_LOG_INFO("dfkv_server registered with MDS group=" + group + " id=" + node_id +
                   " advertise=" + advertise);
   }
+
+  ready_flag->store(true, std::memory_order_release);
+  DFKV_LOG_INFO("dfkv_server ready (all startup stages complete)");
 
   while (!g_stop) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
   DFKV_LOG_INFO("dfkv_server shutting down");
