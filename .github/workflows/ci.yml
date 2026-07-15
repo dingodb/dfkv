@@ -265,4 +265,10 @@ jobs:
       - name: Build
         run: cmake --build build -j 48
       - name: Full ctest on real hardware
+        # Tests place their stores under fs::temp_directory_path()/<fixed name>,
+        # which honors TMPDIR. Point it at the per-run runner temp so CI runs
+        # never collide with root-owned residue from manual ctest runs on the
+        # box (Permission denied on remove_all) or with each other.
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: ctest --test-dir build --output-on-failure -j 8
