@@ -5,15 +5,17 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <atomic>
 #include <mutex>
 #include <random>
 #include <string>
 #include <unordered_map>
 #include <utility>
 
+#include "utils/log.h"        // slow pool-MR registration report
 #include "utils/net_util.h"   // PutU32/GetU32/PutU64 host-endian codec
 #include "utils/numa_util.h"  // best-effort NUMA buffer placement
 
@@ -109,8 +111,18 @@ ibv_mr* SharedAddPoolMr(ibv_context* ctx, ibv_pd* pd, void* base, size_t size) {
     if (d.second.ctx != ctx) continue;
     for (const auto& p : d.second.pool_mrs)
       if (p.base == b && p.size >= size) return p.mr;  // already registered on this PD
+    const auto t0 = std::chrono::steady_clock::now();
     ibv_mr* mr = ibv_reg_mr(pd, base, size, IBV_ACCESS_LOCAL_WRITE);
     if (!mr) return nullptr;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+    // Registering a huge (arena-scale) region pins every page: seconds of
+    // wall time. That must happen at startup (anchor endpoint), never on a
+    // connection's first op — a slow registration HERE at serve time means
+    // the anchor is missing or the region appeared late. Always log slow ones.
+    if (ms > 100)
+      DFKV_LOG_INFO("pool MR registered: " + std::to_string(size >> 20) +
+                    " MiB in " + std::to_string(ms) + " ms");
     g_pool_mr_regs.fetch_add(1, std::memory_order_relaxed);  // one actual registration
     d.second.pool_mrs.push_back(SharedPoolMr{b, size, mr});
     return mr;
