@@ -1,0 +1,471 @@
+#include "client/node_dedup_gpu.h"
+
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+
+#include "utils/log.h"
+
+namespace dfkv {
+
+namespace {
+constexpr uint32_t kMagic = 0x44444731u;  // "DDG1"
+constexpr uint32_t kStateEmpty = 0;
+constexpr uint32_t kStateFetching = 1;
+constexpr uint32_t kStateReady = 2;
+constexpr uint32_t kKindData = 1;  // single namespace (exist rides the host segment)
+
+uint64_t EnvU64(const char* name, uint64_t dflt) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return dflt;
+  unsigned long long x = std::strtoull(v, nullptr, 10);
+  return x > 0 ? static_cast<uint64_t>(x) : dflt;
+}
+
+uint32_t Pow2AtLeast(uint32_t v) {
+  uint32_t p = 1024;
+  while (p < v && p < (1u << 24)) p <<= 1;
+  return p;
+}
+
+bool PidDead(uint32_t pid) {
+  return ::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH;
+}
+}  // namespace
+
+// Same 64-byte seqlock slot as the host flavor, but the payload location is a
+// DESCRIPTOR into a peer's GPU arena: (owner registry index, owner generation,
+// arena offset, arena cursor at allocation).
+struct GpuNodeDedup::Slot {
+  std::atomic<uint64_t> gen;
+  std::atomic<uint32_t> state;
+  uint32_t len;
+  uint64_t key_id;
+  uint32_t key_index;
+  uint32_t kind;
+  std::atomic<uint64_t> fetch_start_ms;
+  uint64_t payload_off;   // offset into the OWNER's GPU arena
+  uint64_t alloc_seq;     // owner's arena cursor value at allocation (lap check)
+  uint32_t owner_idx;     // registry entry of the publishing process
+  uint32_t owner_gen32;   // truncated entry generation at publish time
+};
+
+// One per participating process. pid claims the entry (CAS, dead pids are
+// reclaimable); generation counts claims so descriptors and cached IPC
+// mappings against a previous occupant are detectable. The arena allocation
+// cursor lives HERE (per arena), not in the header.
+struct GpuNodeDedup::ProcEntry {
+  std::atomic<uint32_t> pid;         // 0 = free
+  std::atomic<uint32_t> ready;       // 1 once handle/device/arena_bytes valid
+  std::atomic<uint64_t> generation;  // bumped on every claim
+  std::atomic<uint64_t> alloc_cursor;
+  uint64_t arena_bytes;
+  int32_t device;
+  uint32_t pad0;
+  CUipcMemHandle handle;
+  uint64_t pad1[3];  // -> 128 B (cross-process ABI)
+};
+
+struct GpuNodeDedup::Header {
+  uint32_t magic;
+  uint32_t nslots;
+  uint64_t arena_bytes;  // configured per-process arena size (must match)
+  std::atomic<uint32_t> init_done;
+  uint32_t pad;
+};
+
+uint64_t GpuNodeDedup::NowMs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::string GpuNodeDedup::EnvSegmentName(uint64_t model_hash) {
+  char name[128];
+  // Layout version FIRST in the name (v1.23.0 lesson, see node_dedup.h):
+  // a layout bump must never meet a segment an older lib left behind.
+  std::snprintf(name, sizeof(name), "/dfkv-dedup-gpuv1-%u-%016llx", ::getuid(),
+                static_cast<unsigned long long>(model_hash));
+  return name;
+}
+
+std::unique_ptr<GpuNodeDedup> GpuNodeDedup::FromEnv(uint64_t model_hash) {
+  const char* on = std::getenv("DFKV_CLIENT_NODE_DEDUP");
+  if (!on || std::strcmp(on, "1") != 0) return nullptr;
+  const char* gpu = std::getenv("DFKV_CLIENT_NODE_DEDUP_GPU");
+  if (!gpu || std::strcmp(gpu, "1") != 0) return nullptr;
+  const CudaLib* cu = CudaLib::Get();
+  if (!cu) {
+    DFKV_LOG_INFO("gpu-dedup: no usable CUDA driver, running without");
+    return nullptr;
+  }
+  if (!cu->HasCurrentCtx()) {
+    DFKV_LOG_INFO("gpu-dedup: no current CUDA context on this thread, running without");
+    return nullptr;
+  }
+  Options o;
+  o.arena_bytes = EnvU64("DFKV_NODE_DEDUP_GPU_ARENA_MB", 512) << 20;
+  o.slots = static_cast<uint32_t>(EnvU64("DFKV_NODE_DEDUP_GPU_SLOTS", 16384));
+  o.wait_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_WAIT_MS", 500));
+  o.takeover_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TAKEOVER_MS", 2000));
+  o.ttl_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TTL_MS", 5000));
+  o.name = EnvSegmentName(model_hash);
+  return Open(o);
+}
+
+std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
+  static_assert(sizeof(Slot) == 64, "shm slot layout is cross-process ABI");
+  static_assert(sizeof(ProcEntry) == 128, "shm registry layout is cross-process ABI");
+  const CudaLib* cu = CudaLib::Get();
+  if (!cu || !cu->HasCurrentCtx()) return nullptr;
+
+  const uint32_t nslots = Pow2AtLeast(opt.slots);
+  const size_t len = sizeof(Header) + sizeof(ProcEntry) * kMaxProcs +
+                     static_cast<size_t>(nslots) * sizeof(Slot);
+  int fd = ::shm_open(opt.name.c_str(), O_RDWR | O_CREAT, 0600);
+  if (fd < 0) return nullptr;
+  struct stat st{};
+  if (::fstat(fd, &st) != 0) { ::close(fd); return nullptr; }
+  const bool creator = (st.st_size == 0);
+  if (creator) {
+    // Small segment (~1-2 MiB: descriptors only, payloads live in GPU
+    // memory), but the eager-backing rule from the host flavor still holds:
+    // ENOSPC here beats a SIGBUS mid-publish.
+    if (::ftruncate(fd, static_cast<off_t>(len)) != 0 ||
+        ::posix_fallocate(fd, 0, static_cast<off_t>(len)) != 0) {
+      ::close(fd);
+      ::shm_unlink(opt.name.c_str());
+      return nullptr;
+    }
+  } else if (static_cast<size_t>(st.st_size) != len) {
+    DFKV_LOG_INFO("gpu-dedup: existing segment layout mismatch, running without");
+    ::close(fd);
+    return nullptr;
+  }
+  void* base = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  ::close(fd);
+  if (base == MAP_FAILED) return nullptr;
+
+  auto d = std::unique_ptr<GpuNodeDedup>(new GpuNodeDedup());
+  d->cu_ = cu;
+  d->map_base_ = base;
+  d->map_len_ = len;
+  d->hdr_ = static_cast<Header*>(base);
+  d->reg_ = reinterpret_cast<ProcEntry*>(static_cast<char*>(base) + sizeof(Header));
+  d->slots_ = reinterpret_cast<Slot*>(reinterpret_cast<char*>(d->reg_) +
+                                      sizeof(ProcEntry) * kMaxProcs);
+  d->nslots_ = nslots;
+  d->arena_bytes_ = opt.arena_bytes;
+  d->wait_ms_ = opt.wait_ms;
+  d->takeover_ms_ = opt.takeover_ms;
+  d->ttl_ms_ = opt.ttl_ms;
+
+  if (creator) {
+    d->hdr_->nslots = nslots;
+    d->hdr_->arena_bytes = opt.arena_bytes;
+    d->hdr_->magic = kMagic;
+    d->hdr_->init_done.store(1, std::memory_order_release);
+  } else {
+    for (int spin = 0; spin < 1000 && d->hdr_->init_done.load(std::memory_order_acquire) != 1; ++spin)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (d->hdr_->magic != kMagic || d->hdr_->nslots != nslots ||
+        d->hdr_->arena_bytes != opt.arena_bytes) {
+      DFKV_LOG_INFO("gpu-dedup: segment header mismatch, running without");
+      return nullptr;
+    }
+  }
+
+  // Allocate this process' staging arena on the caller's device and export it.
+  if (cu->MemAlloc(&d->arena_base_, opt.arena_bytes) != kCudaSuccess) {
+    DFKV_LOG_INFO("gpu-dedup: cannot allocate " +
+                  std::to_string(opt.arena_bytes >> 20) +
+                  " MiB GPU staging arena, running without");
+    return nullptr;
+  }
+  CUipcMemHandle handle{};
+  if (cu->IpcGetMemHandle(&handle, d->arena_base_) != kCudaSuccess) {
+    DFKV_LOG_INFO("gpu-dedup: cuIpcGetMemHandle failed, running without");
+    return nullptr;  // dtor frees the arena
+  }
+
+  // Claim a registry entry: a free one, or one whose owner died.
+  const uint32_t mypid = static_cast<uint32_t>(::getpid());
+  for (uint32_t i = 0; i < kMaxProcs && d->self_idx_ == kMaxProcs; ++i) {
+    ProcEntry& e = d->reg_[i];
+    uint32_t cur = e.pid.load(std::memory_order_acquire);
+    if (cur == mypid) continue;  // stale self entry from an exec'd ancestor: skip
+    if (cur != 0 && !PidDead(cur)) continue;
+    if (!e.pid.compare_exchange_strong(cur, mypid, std::memory_order_acq_rel))
+      continue;
+    e.ready.store(0, std::memory_order_release);
+    d->self_gen_ = e.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    e.alloc_cursor.store(0, std::memory_order_relaxed);
+    e.arena_bytes = opt.arena_bytes;
+    e.device = cu->CurrentDevice();
+    std::memcpy(&e.handle, &handle, sizeof(handle));
+    e.ready.store(1, std::memory_order_release);
+    d->self_idx_ = i;
+  }
+  if (d->self_idx_ == kMaxProcs) {
+    DFKV_LOG_INFO("gpu-dedup: registry full (" + std::to_string(kMaxProcs) +
+                  " live processes), running without");
+    return nullptr;
+  }
+  DFKV_LOG_INFO("gpu-dedup: attached " + opt.name + " (slots=" +
+                std::to_string(nslots) + ", arena=" +
+                std::to_string(opt.arena_bytes >> 20) + " MiB on device " +
+                std::to_string(d->reg_[d->self_idx_].device) + ", entry " +
+                std::to_string(d->self_idx_) + ")");
+  return d;
+}
+
+GpuNodeDedup::~GpuNodeDedup() {
+  if (self_idx_ < kMaxProcs && reg_) {
+    ProcEntry& e = reg_[self_idx_];
+    // Invalidate before the arena goes away: readers check generation before
+    // AND after the copy, so a mid-copy free degrades to a miss (the driver
+    // rejects the unmapped VA range; it does not corrupt).
+    e.ready.store(0, std::memory_order_release);
+    e.generation.fetch_add(1, std::memory_order_acq_rel);
+    e.pid.store(0, std::memory_order_release);
+  }
+  if (cu_) {
+    for (auto& pm : peer_map_)
+      if (pm.base) cu_->IpcCloseMemHandle(pm.base);  // best-effort at teardown
+    if (arena_base_) cu_->MemFree(arena_base_);
+  }
+  if (map_base_) ::munmap(map_base_, map_len_);
+}
+
+GpuNodeDedup::Slot* GpuNodeDedup::Find(const BlockKey& key) const {
+  const uint32_t mask = nslots_ - 1;
+  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index) & mask;
+  for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
+    Slot& s = slots_[idx];
+    if (s.state.load(std::memory_order_acquire) == kStateEmpty) continue;
+    if (s.key_id == key.id && s.key_index == key.index && s.kind == kKindData)
+      return &s;
+  }
+  return nullptr;
+}
+
+GpuNodeDedup::Slot* GpuNodeDedup::Reserve(const BlockKey& key) {
+  const uint64_t now = NowMs();
+  const uint32_t mask = nslots_ - 1;
+  uint32_t idx = static_cast<uint32_t>(key.id ^ (key.id >> 32) ^ key.index) & mask;
+  for (int probe = 0; probe < 8; ++probe, idx = (idx + 1) & mask) {
+    Slot& s = slots_[idx];
+    uint32_t st = s.state.load(std::memory_order_acquire);
+    bool claim = false;
+    if (st == kStateEmpty) {
+      claim = s.state.compare_exchange_strong(st, kStateFetching,
+                                              std::memory_order_acq_rel);
+    } else if (st == kStateReady &&
+               now - s.fetch_start_ms.load(std::memory_order_relaxed) >
+                   static_cast<uint64_t>(ttl_ms_)) {
+      claim = s.state.compare_exchange_strong(st, kStateFetching,
+                                              std::memory_order_acq_rel);
+    }
+    if (!claim) continue;
+    s.gen.fetch_add(1, std::memory_order_acq_rel);  // odd: mutating identity
+    s.key_id = key.id;
+    s.key_index = key.index;
+    s.kind = kKindData;
+    s.len = 0;
+    s.payload_off = 0;
+    s.alloc_seq = 0;
+    s.owner_idx = kMaxProcs;
+    s.owner_gen32 = 0;
+    s.fetch_start_ms.store(now, std::memory_order_relaxed);
+    s.gen.fetch_add(1, std::memory_order_release);  // even: coherent
+    return &s;
+  }
+  return nullptr;
+}
+
+CUdeviceptr GpuNodeDedup::PeerBase(uint32_t idx, uint64_t gen) {
+  if (idx == self_idx_)
+    return gen == self_gen_ ? arena_base_ : 0;  // own publishes: no IPC open
+  std::lock_guard<std::mutex> lk(peer_mu_);
+  PeerMap& pm = peer_map_[idx];
+  if (pm.base && pm.gen == gen) return pm.base;
+  if (pm.base) {  // stale mapping of a previous occupant
+    cu_->IpcCloseMemHandle(pm.base);
+    pm.base = 0;
+  }
+  ProcEntry& e = reg_[idx];
+  CUipcMemHandle h;
+  std::memcpy(&h, &e.handle, sizeof(h));
+  // Re-check the generation AFTER snapshotting the handle: a concurrent
+  // re-claim can't have half-written the handle we just validated.
+  if (e.ready.load(std::memory_order_acquire) != 1 ||
+      e.generation.load(std::memory_order_acquire) != gen)
+    return 0;
+  CUdeviceptr base = 0;
+  if (cu_->IpcOpenMemHandle(&base, h, kCuIpcMemLazyEnablePeerAccess) != kCudaSuccess)
+    return 0;
+  pm.gen = gen;
+  pm.base = base;
+  return base;
+}
+
+bool GpuNodeDedup::CopyOutSg(Slot* s, const Seg* segs, size_t nsegs,
+                             size_t total_cap, size_t* got) {
+  const uint64_t g0 = s->gen.load(std::memory_order_acquire);
+  if (g0 & 1) return false;
+  if (s->state.load(std::memory_order_acquire) != kStateReady) return false;
+  const size_t n = s->len;
+  if (n == 0 || n > total_cap) return false;
+  const uint32_t oi = s->owner_idx;
+  const uint32_t og = s->owner_gen32;
+  const uint64_t off = s->payload_off;
+  const uint64_t seq = s->alloc_seq;
+  if (oi >= kMaxProcs) return false;
+  ProcEntry& e = reg_[oi];
+  const uint64_t egen = e.generation.load(std::memory_order_acquire);
+  if (e.ready.load(std::memory_order_acquire) != 1 ||
+      static_cast<uint32_t>(egen) != og)
+    return false;
+  if (off + n > e.arena_bytes) return false;  // torn metadata: bail
+  // Lap check BEFORE the copy (owner's cursor lives in its registry entry).
+  if (e.alloc_cursor.load(std::memory_order_acquire) - seq > e.arena_bytes - n)
+    return false;
+  CUdeviceptr base = PeerBase(oi, egen);
+  if (!base) return false;
+  size_t done = 0;
+  for (size_t j = 0; j < nsegs && done < n; ++j) {
+    const size_t m = std::min(n - done, segs[j].cap);
+    if (m == 0) continue;
+    if (cu_->Memcpy(reinterpret_cast<CUdeviceptr>(segs[j].ptr),
+                    base + off + done, m) != kCudaSuccess)
+      return false;  // unmapped/raced VA: the driver rejects, we miss
+    done += m;
+  }
+  if (done != n) return false;
+  // ... and AFTER: un-lapped payload, same entry generation (arena still the
+  // one we copied from), untouched slot.
+  if (e.alloc_cursor.load(std::memory_order_acquire) - seq > e.arena_bytes - n)
+    return false;
+  if (e.generation.load(std::memory_order_acquire) != egen) return false;
+  if (s->gen.load(std::memory_order_acquire) != g0) return false;
+  if (got) *got = n;
+  return true;
+}
+
+GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
+                                         size_t nsegs, size_t total_cap,
+                                         size_t* got) {
+  if (total_cap == 0 || total_cap > arena_bytes_ / 2) return Role::kFetch;
+  const uint64_t now = NowMs();
+  if (Slot* s = Find(key)) {
+    const uint32_t st = s->state.load(std::memory_order_acquire);
+    if (st == kStateReady) {
+      if (now - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+              static_cast<uint64_t>(ttl_ms_) &&
+          CopyOutSg(s, segs, nsegs, total_cap, got)) {
+        hits_.fetch_add(1, std::memory_order_relaxed);
+        return Role::kHit;
+      }
+    } else if (st == kStateFetching) {
+      const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
+      if (now - started <= static_cast<uint64_t>(takeover_ms_)) return Role::kWait;
+      uint64_t expect = started;
+      if (s->fetch_start_ms.compare_exchange_strong(expect, now,
+                                                    std::memory_order_acq_rel)) {
+        fetches_.fetch_add(1, std::memory_order_relaxed);
+        return Role::kFetch;
+      }
+      return Role::kWait;
+    }
+  }
+  if (Reserve(key)) {
+    fetches_.fetch_add(1, std::memory_order_relaxed);
+    return Role::kFetch;
+  }
+  return Role::kFetch;  // probe window full: plain fetch, nothing to publish
+}
+
+void GpuNodeDedup::PublishSg(const BlockKey& key, const Seg* segs, size_t nsegs,
+                             size_t len) {
+  Slot* s = Find(key);
+  if (!s || s->state.load(std::memory_order_acquire) != kStateFetching) return;
+  const size_t n = len;
+  auto abandon = [&] {  // free the slot so a falling-back waiter can re-claim
+    uint32_t st = kStateFetching;
+    s->state.compare_exchange_strong(st, kStateEmpty, std::memory_order_acq_rel);
+  };
+  if (n == 0 || n > arena_bytes_ / 2) return abandon();
+  ProcEntry& e = reg_[self_idx_];
+  // Ring-allocate on OUR arena cursor; skip the tail remainder when a lap
+  // boundary would split the payload (same scheme as the host flavor).
+  uint64_t cur = e.alloc_cursor.load(std::memory_order_relaxed);
+  uint64_t off, seq;
+  for (;;) {
+    const uint64_t in_lap = cur % arena_bytes_;
+    const uint64_t need = (in_lap + n > arena_bytes_) ? (arena_bytes_ - in_lap) + n : n;
+    if (e.alloc_cursor.compare_exchange_weak(cur, cur + need,
+                                             std::memory_order_acq_rel)) {
+      seq = cur + need;
+      off = (cur + need - n) % arena_bytes_;
+      break;
+    }
+  }
+  // Gather the caller's segments (device VAs, D2D) into the arena.
+  size_t done = 0;
+  for (size_t j = 0; j < nsegs && done < n; ++j) {
+    const size_t m = std::min(n - done, segs[j].cap);
+    if (m == 0) continue;
+    if (cu_->Memcpy(arena_base_ + off + done,
+                    reinterpret_cast<CUdeviceptr>(segs[j].ptr), m) != kCudaSuccess)
+      return abandon();
+    done += m;
+  }
+  if (done != n) return abandon();
+  s->gen.fetch_add(1, std::memory_order_acq_rel);
+  s->len = static_cast<uint32_t>(n);
+  s->payload_off = off;
+  s->alloc_seq = seq;
+  s->owner_idx = self_idx_;
+  s->owner_gen32 = static_cast<uint32_t>(self_gen_);
+  s->fetch_start_ms.store(NowMs(), std::memory_order_relaxed);  // TTL from publish
+  s->gen.fetch_add(1, std::memory_order_release);
+  s->state.store(kStateReady, std::memory_order_release);
+}
+
+void GpuNodeDedup::Abort(const BlockKey& key) {
+  Slot* s = Find(key);
+  if (!s) return;
+  uint32_t st = kStateFetching;
+  s->state.compare_exchange_strong(st, kStateEmpty, std::memory_order_acq_rel);
+}
+
+bool GpuNodeDedup::WaitSg(const BlockKey& key, const Seg* segs, size_t nsegs,
+                          size_t total_cap, size_t* got) {
+  const uint64_t deadline = NowMs() + static_cast<uint64_t>(wait_ms_);
+  int backoff_us = 50;
+  for (;;) {
+    Slot* s = Find(key);
+    if (s && s->state.load(std::memory_order_acquire) == kStateReady &&
+        CopyOutSg(s, segs, nsegs, total_cap, got)) {
+      wait_hits_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    if (NowMs() >= deadline) {
+      wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+    if (backoff_us < 1000) backoff_us *= 2;
+  }
+}
+
+}  // namespace dfkv

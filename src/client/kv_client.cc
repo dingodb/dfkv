@@ -299,6 +299,20 @@ std::string KVClient::MetricsSnapshot() const {
     s += "# TYPE dfkv_client_dedup_wait_timeouts_total counter\n";
     s += "dfkv_client_dedup_wait_timeouts_total " + std::to_string(dedup_->wait_timeouts()) + "\n";
   }
+  if (const GpuNodeDedup* gd = gpu_dedup_raw_.load(std::memory_order_acquire)) {
+    s += "# HELP dfkv_client_gpu_dedup_hits_total GPU rendezvous results served via CUDA IPC\n";
+    s += "# TYPE dfkv_client_gpu_dedup_hits_total counter\n";
+    s += "dfkv_client_gpu_dedup_hits_total " + std::to_string(gd->hits()) + "\n";
+    s += "# HELP dfkv_client_gpu_dedup_fetches_total Keys this process fetched for the GPU rendezvous\n";
+    s += "# TYPE dfkv_client_gpu_dedup_fetches_total counter\n";
+    s += "dfkv_client_gpu_dedup_fetches_total " + std::to_string(gd->fetches()) + "\n";
+    s += "# HELP dfkv_client_gpu_dedup_wait_hits_total Waits resolved by a peer's publish\n";
+    s += "# TYPE dfkv_client_gpu_dedup_wait_hits_total counter\n";
+    s += "dfkv_client_gpu_dedup_wait_hits_total " + std::to_string(gd->wait_hits()) + "\n";
+    s += "# HELP dfkv_client_gpu_dedup_wait_timeouts_total Waits that fell back to a direct fetch\n";
+    s += "# TYPE dfkv_client_gpu_dedup_wait_timeouts_total counter\n";
+    s += "dfkv_client_gpu_dedup_wait_timeouts_total " + std::to_string(gd->wait_timeouts()) + "\n";
+  }
   if (t_) s += t_->MetricsText();
   return s;
 }
@@ -622,8 +636,19 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
   std::vector<BlockKey> bks(N);
   std::vector<KvGetItem> fetch_items;
   std::vector<size_t> fetch_map, wait_list;
+  std::vector<char> fetch_claimed;  // 1 = we own a FETCHING slot
   fetch_items.reserve(N);
+  // Host rendezvous can't serve device destinations (memcpy to a device VA);
+  // route those straight to the fetch list unclaimed instead of crashing when
+  // the env switch is set in a GPUDirect process. cu is null on CPU-only hosts.
+  const CudaLib* cu = CudaLib::Get();
   for (size_t i = 0; i < N; ++i) {
+    if (cu && cu->IsDevicePtr(items[i].out)) {
+      fetch_map.push_back(i);
+      fetch_items.push_back(items[i]);
+      fetch_claimed.push_back(0);
+      continue;
+    }
     bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
     switch (dedup_->Claim(bks[i], items[i].n, static_cast<char*>(items[i].out))) {
       case NodeDedup::Role::kHit:
@@ -632,6 +657,7 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
       case NodeDedup::Role::kFetch:
         fetch_map.push_back(i);
         fetch_items.push_back(items[i]);
+        fetch_claimed.push_back(1);
         break;
       case NodeDedup::Role::kWait:
         wait_list.push_back(i);
@@ -643,6 +669,7 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
+      if (!fetch_claimed[m]) continue;
       if (r[m])
         dedup_->Publish(bks[i], NodeDedup::Kind::kData,
                         static_cast<const char*>(items[i].out), items[i].n);
@@ -728,8 +755,16 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
   std::vector<BlockKey> bks(N);
   std::vector<KvGetItem> fetch_items;
   std::vector<size_t> fetch_map, wait_list;
+  std::vector<char> fetch_claimed;  // 1 = we own a FETCHING slot
   fetch_items.reserve(N);
+  const CudaLib* cu = CudaLib::Get();  // device destinations bypass (see BatchGet)
   for (size_t i = 0; i < N; ++i) {
+    if (cu && cu->IsDevicePtr(items[i].out)) {
+      fetch_map.push_back(i);
+      fetch_items.push_back(items[i]);
+      fetch_claimed.push_back(0);
+      continue;
+    }
     bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
     size_t got = 0;
     switch (dedup_->ClaimAuto(bks[i], items[i].n, static_cast<char*>(items[i].out), &got)) {
@@ -740,6 +775,7 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
       case NodeDedup::Role::kFetch:
         fetch_map.push_back(i);
         fetch_items.push_back(items[i]);
+        fetch_claimed.push_back(1);
         break;
       case NodeDedup::Role::kWait:
         wait_list.push_back(i);
@@ -752,8 +788,9 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
     for (size_t m = 0; m < fetch_map.size(); ++m) {
       const size_t i = fetch_map[m];
       res[i] = r[m];
+      if (r[m]) lens[i] = flens[m];
+      if (!fetch_claimed[m]) continue;
       if (r[m]) {
-        lens[i] = flens[m];
         dedup_->Publish(bks[i], NodeDedup::Kind::kData,
                         static_cast<const char*>(items[i].out), flens[m]);
       } else {
@@ -1036,8 +1073,110 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
   return RecordBatch(OpMetrics::kPut, t0, ok, bytes);
 }
 
+GpuNodeDedup* KVClient::GpuDedup() {
+  std::call_once(gpu_dedup_once_, [this] {
+    gpu_dedup_ = GpuNodeDedup::FromEnv(self_hdr_.model_hash);
+    gpu_dedup_raw_.store(gpu_dedup_.get(), std::memory_order_release);
+  });
+  return gpu_dedup_.get();
+}
+
 std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items,
                                            std::vector<size_t>* out_lens) {
+  GpuNodeDedup* gd = GpuDedup();
+  if (!gd || items.empty()) return BatchGetAutoSgDirect(items, out_lens);
+  // Same-host rendezvous for GPU destinations (phase 2b, see node_dedup_gpu.h):
+  // the vLLM connector's SG gets land in device memory, where lockstep TP
+  // ranks re-fetch identical TP-replicated KV. Payloads rendezvous through
+  // per-process GPU staging arenas (CUDA IPC + NVLink D2D); every outcome
+  // degrades to the plain remote path.
+  const CudaLib* cu = CudaLib::Get();  // non-null: gd exists
+  const size_t N = items.size();
+  std::vector<bool> res(N, false);
+  std::vector<size_t> lens(N, 0);
+  std::vector<BlockKey> bks(N);
+  std::vector<KvGetItemSg> fetch_items;
+  std::vector<size_t> fetch_map, wait_list;
+  std::vector<char> fetch_claimed;  // 1 = we own a FETCHING slot (must publish/abort)
+  std::vector<GpuNodeDedup::Seg> segs;
+  auto segs_of = [&segs](const KvGetItemSg& it) {
+    segs.clear();
+    segs.reserve(it.dsts.size());
+    for (size_t j = 0; j < it.dsts.size(); ++j)
+      segs.push_back(GpuNodeDedup::Seg{it.dsts[j], it.caps[j]});
+  };
+  auto total_cap = [](const KvGetItemSg& it) {
+    size_t c = 0;
+    for (size_t x : it.caps) c += x;
+    return c;
+  };
+  for (size_t i = 0; i < N; ++i) {
+    // Eligible = well-shaped AND device-memory destination. Host-destination
+    // SG items (or malformed ones the Direct guard rejects) skip the
+    // rendezvous entirely — an unclaimed fetch has no publish obligation.
+    const bool eligible = !items[i].key.empty() && !items[i].dsts.empty() &&
+                          items[i].dsts.size() == items[i].caps.size() &&
+                          cu->IsDevicePtr(items[i].dsts[0]);
+    if (!eligible) {
+      fetch_map.push_back(i);
+      fetch_items.push_back(items[i]);
+      fetch_claimed.push_back(0);
+      continue;
+    }
+    bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
+    segs_of(items[i]);
+    size_t got = 0;
+    switch (gd->ClaimSg(bks[i], segs.data(), segs.size(), total_cap(items[i]), &got)) {
+      case GpuNodeDedup::Role::kHit:
+        res[i] = true;
+        lens[i] = got;
+        break;
+      case GpuNodeDedup::Role::kFetch:
+        fetch_map.push_back(i);
+        fetch_items.push_back(items[i]);
+        fetch_claimed.push_back(1);
+        break;
+      case GpuNodeDedup::Role::kWait:
+        wait_list.push_back(i);
+        break;
+    }
+  }
+  if (!fetch_items.empty()) {
+    std::vector<size_t> flens;
+    auto r = BatchGetAutoSgDirect(fetch_items, &flens);
+    for (size_t m = 0; m < fetch_map.size(); ++m) {
+      const size_t i = fetch_map[m];
+      res[i] = r[m];
+      if (r[m]) lens[i] = flens[m];
+      if (!fetch_claimed[m]) continue;
+      if (r[m]) {
+        segs_of(items[i]);
+        gd->PublishSg(bks[i], segs.data(), segs.size(), flens[m]);
+      } else {
+        gd->Abort(bks[i]);
+      }
+    }
+  }
+  for (size_t i : wait_list) {
+    segs_of(items[i]);
+    size_t got = 0;
+    if (gd->WaitSg(bks[i], segs.data(), segs.size(), total_cap(items[i]), &got)) {
+      res[i] = true;
+      lens[i] = got;
+    } else {  // fetcher failed/slow: bounded fallback to a direct read
+      std::vector<KvGetItemSg> one(1, items[i]);
+      std::vector<size_t> ol;
+      auto rr = BatchGetAutoSgDirect(one, &ol);
+      res[i] = rr[0];
+      if (rr[0]) lens[i] = ol[0];
+    }
+  }
+  if (out_lens) *out_lens = std::move(lens);
+  return res;
+}
+
+std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
+                                                 std::vector<size_t>* out_lens) {
   auto t0 = std::chrono::steady_clock::now();
   const size_t N = items.size();
   std::vector<char> hit(N, 0);

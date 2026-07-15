@@ -25,9 +25,10 @@
  *  - Nothing here is load-bearing: every exit path (no slot, timeout, torn
  *    read, size mismatch) degrades to the caller's normal remote op.
  *
- * SCOPE: host-memory destinations only (the SGLang HiCache path). GPUDirect
- * destinations (vLLM connector) must NOT enable this — memcpy to a device VA
- * is invalid; that path needs CUDA IPC and stays with the Phase-2b design.
+ * SCOPE: host-memory destinations (the SGLang HiCache path). GPUDirect
+ * destinations are ROUTED AWAY from this class by the batch wrappers (a
+ * memcpy to a device VA is invalid) and served by the CUDA-IPC flavor in
+ * node_dedup_gpu.h (phase 2b, DFKV_CLIENT_NODE_DEDUP_GPU=1 opts in on top).
  * Off by default (DFKV_CLIENT_NODE_DEDUP=1 opts in). */
 #ifndef DFKV_NODE_DEDUP_H_
 #define DFKV_NODE_DEDUP_H_

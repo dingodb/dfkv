@@ -23,6 +23,7 @@
 
 #include "utils/con_hash.h"
 #include "client/node_dedup.h"
+#include "client/node_dedup_gpu.h"
 #include "common/membership.h"
 #include "mds/mds_member_poller.h"
 #include "mds/mds_registrar.h"
@@ -185,7 +186,13 @@ class KVClient {
   std::vector<bool> BatchGetDirect(const std::vector<KvGetItem>& items);
   std::vector<bool> BatchGetAutoDirect(const std::vector<KvGetItem>& items,
                                        std::vector<size_t>* out_lens);
+  std::vector<bool> BatchGetAutoSgDirect(const std::vector<KvGetItemSg>& items,
+                                         std::vector<size_t>* out_lens);
   std::vector<bool> BatchExistDirect(const std::vector<std::string>& keys);
+  // Lazily opens the GPU rendezvous on the FIRST SG batch (the ctor thread may
+  // not hold a CUDA context yet; the data-path caller always does). nullptr =
+  // feature off. Init is once-only; metrics readers use gpu_dedup_raw_.
+  GpuNodeDedup* GpuDedup();
   // Record a batch op (hits = count of true flags) into op_stats_ and return the
   // per-item result vector. Called at each batch method's return point.
   std::vector<bool> RecordBatch(OpMetrics::Op op,
@@ -208,6 +215,11 @@ class KVClient {
   // Same-host GET rendezvous (phase 5, DFKV_CLIENT_NODE_DEDUP=1; host-memory
   // destinations only). nullptr = feature off.
   std::unique_ptr<NodeDedup> dedup_;
+  // Same-host GET rendezvous for GPU destinations (phase 2b; vLLM SG path).
+  // Lazy-init via GpuDedup(); raw pointer published for lock-free metrics.
+  std::once_flag gpu_dedup_once_;
+  std::unique_ptr<GpuNodeDedup> gpu_dedup_;
+  std::atomic<GpuNodeDedup*> gpu_dedup_raw_{nullptr};
   std::unique_ptr<MdsRegistrar> client_registrar_;  // consumer identity lease (best-effort)
   PeerHealth health_;
   OpMetrics op_stats_;  // per-op (put/get/exist) counters + latency, snapshot'd
