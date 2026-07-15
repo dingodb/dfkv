@@ -41,6 +41,11 @@ class JsonParser {
   explicit JsonParser(const std::string& s) : s_(s) {}
   const std::string& s_;
   size_t i_ = 0;
+  int depth_ = 0;
+  // etcd responses nest a handful of levels; a deeply-nested (malformed or
+  // hostile) document must fail cleanly instead of exhausting the stack via
+  // the value->object/array->value recursion.
+  static constexpr int kMaxDepth = 64;
 
   void ws() {
     while (i_ < s_.size() &&
@@ -51,8 +56,13 @@ class JsonParser {
     if (i_ >= s_.size()) return false;
     char c = s_[i_];
     if (c == '"') { o->type = JsonValue::kString; return str(&o->scalar); }
-    if (c == '{') return object(o);
-    if (c == '[') return array(o);
+    if (c == '{' || c == '[') {
+      if (depth_ >= kMaxDepth) return false;
+      ++depth_;
+      const bool ok = (c == '{') ? object(o) : array(o);
+      --depth_;
+      return ok;
+    }
     if (c == 't' || c == 'f') return boolean(o);
     if (c == 'n') return null(o);
     return number(o);

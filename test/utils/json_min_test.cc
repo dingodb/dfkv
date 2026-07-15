@@ -41,3 +41,18 @@ TEST(JsonMin, RejectsMalformed) {
   EXPECT_FALSE(JsonParser::Parse("{\"a\":1}garbage", &root));
   EXPECT_FALSE(JsonParser::Parse("", &root));
 }
+
+TEST(JsonMin, DeepNestingFailsCleanlyInsteadOfStackOverflow) {
+  // 100k nested arrays previously recursed value->array->value all the way
+  // down and crashed the process; the depth cap must reject it as a parse
+  // error. A document within the cap still parses.
+  JsonValue root;
+  const int kDeep = 100000;
+  std::string deep(kDeep, '[');
+  deep.append(kDeep, ']');
+  EXPECT_FALSE(JsonParser::Parse(deep, &root));
+  std::string shallow(8, '[');
+  shallow += "1";
+  shallow.append(8, ']');
+  EXPECT_TRUE(JsonParser::Parse(shallow, &root));
+}

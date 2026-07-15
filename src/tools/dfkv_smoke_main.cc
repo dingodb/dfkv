@@ -43,7 +43,10 @@ int main(int argc, char** argv) {
   KVClient c(mem, hdr);
   std::string v(size, '\0');
   for (size_t i = 0; i < size; ++i) v[i] = static_cast<char>(i & 0xFF);
-  const char* key = "dfkv-smoke-key";
+  // Salt the key with the payload size: on a persistent write-once ring, a
+  // fixed key re-probed with a different --size read back the OLD payload and
+  // reported a spurious data mismatch (bench avoids the same trap via pid+size).
+  const std::string key = "dfkv-smoke-key-" + std::to_string(size);
 
   if (!c.Put(key, v.data(), v.size())) { std::fprintf(stderr, "PUT failed\n"); return 1; }
   if (!c.Exist(key)) { std::fprintf(stderr, "EXIST failed\n"); return 1; }

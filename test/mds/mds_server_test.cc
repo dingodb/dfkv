@@ -385,3 +385,22 @@ TEST(MdsServer, ClientRejectsPathTraversalGroupAndId) {
   EXPECT_EQ(st, Status::kInvalid);
   mds.Stop();
 }
+
+// No etcd needed: the listener + handler lifecycle is all local. A peer that
+// connects and then goes silent must be released by the I/O timeout instead of
+// pinning its handler thread forever (thread-per-conn with no bound).
+TEST(MdsServer, SilentPeerReleasedByIoTimeout) {
+  ::setenv("DFKV_MDS_IO_TIMEOUT_S", "1", 1);
+  MdsServer srv("127.0.0.1:1");  // etcd never contacted: no requests sent
+  ASSERT_EQ(srv.Start(0), Status::kOk);
+  int fd = net::Dial("127.0.0.1:" + std::to_string(srv.port()), 2000, 2000);
+  ASSERT_GE(fd, 0);
+  // Handler picks the conn up and blocks in ReadAll until the 1 s timeout.
+  for (int i = 0; i < 50 && srv.live_conn_count() == 0; ++i) usleep(20 * 1000);
+  EXPECT_EQ(srv.live_conn_count(), 1u);
+  for (int i = 0; i < 200 && srv.live_conn_count() > 0; ++i) usleep(20 * 1000);
+  EXPECT_EQ(srv.live_conn_count(), 0u) << "silent conn not reaped by timeout";
+  ::close(fd);
+  srv.Stop();
+  ::unsetenv("DFKV_MDS_IO_TIMEOUT_S");
+}
