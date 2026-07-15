@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 #include "utils/log.h"
 
@@ -357,8 +358,8 @@ CUdeviceptr GpuNodeDedup::PeerBase(uint32_t idx, uint64_t gen) {
   return base;
 }
 
-bool GpuNodeDedup::CopyOutSg(Slot* s, const Seg* segs, size_t nsegs,
-                             size_t total_cap, size_t* got) {
+bool GpuNodeDedup::IssueCopySg(Slot* s, const Seg* segs, size_t nsegs,
+                               size_t total_cap, CUstream st, CopySnap* snap) {
   const uint64_t g0 = s->gen.load(std::memory_order_acquire);
   if (g0 & 1) return false;
   if (s->state.load(std::memory_order_acquire) != kStateReady) return false;
@@ -380,8 +381,6 @@ bool GpuNodeDedup::CopyOutSg(Slot* s, const Seg* segs, size_t nsegs,
     return false;
   CUdeviceptr base = PeerBase(oi, egen);
   if (!base) return false;
-  CUstream st = Stream();
-  if (!st) return false;
   size_t done = 0;
   for (size_t j = 0; j < nsegs && done < n; ++j) {
     const size_t m = std::min(n - done, segs[j].cap);
@@ -391,18 +390,99 @@ bool GpuNodeDedup::CopyOutSg(Slot* s, const Seg* segs, size_t nsegs,
       return false;  // unmapped/raced VA: the driver rejects, we miss
     done += m;
   }
+  if (done != n) return false;
+  *snap = CopySnap{s, g0, oi, egen, seq, n};
+  return true;
+}
+
+bool GpuNodeDedup::ValidateCopy(const CopySnap& snap) const {
+  // AFTER the sync: un-lapped payload, same entry generation (arena still the
+  // one we copied from), untouched slot.
+  ProcEntry& e = reg_[snap.oi];
+  if (e.alloc_cursor.load(std::memory_order_acquire) - snap.seq >
+      e.arena_bytes - snap.n)
+    return false;
+  if (e.generation.load(std::memory_order_acquire) != snap.egen) return false;
+  if (snap.s->gen.load(std::memory_order_acquire) != snap.g0) return false;
+  return true;
+}
+
+bool GpuNodeDedup::CopyOutSg(Slot* s, const Seg* segs, size_t nsegs,
+                             size_t total_cap, size_t* got) {
+  CUstream st = Stream();
+  if (!st) return false;
+  CopySnap snap{};
+  if (!IssueCopySg(s, segs, nsegs, total_cap, st, &snap)) return false;
   // The scatter must be ON the device before we declare a hit — async D2D
   // "returns" immediately; the framework would otherwise consume the blocks
   // before the bytes land.
-  if (done != n || cu_->StreamSynchronize(st) != kCudaSuccess) return false;
-  // ... and AFTER: un-lapped payload, same entry generation (arena still the
-  // one we copied from), untouched slot.
-  if (e.alloc_cursor.load(std::memory_order_acquire) - seq > e.arena_bytes - n)
-    return false;
-  if (e.generation.load(std::memory_order_acquire) != egen) return false;
-  if (s->gen.load(std::memory_order_acquire) != g0) return false;
-  if (got) *got = n;
+  if (cu_->StreamSynchronize(st) != kCudaSuccess) return false;
+  if (!ValidateCopy(snap)) return false;
+  if (got) *got = snap.n;
   return true;
+}
+
+void GpuNodeDedup::WaitManySg(WaitItem* items, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    items[i].ok = false;
+    items[i].got = 0;
+  }
+  if (n == 0) return;
+  EnsureThreadCtx();
+  CUstream st = Stream();
+  if (!st) {
+    wait_timeouts_.fetch_add(n, std::memory_order_relaxed);
+    return;
+  }
+  std::vector<size_t> pending(n);
+  for (size_t i = 0; i < n; ++i) pending[i] = i;
+  struct InFlight {
+    size_t idx;
+    CopySnap snap;
+  };
+  std::vector<InFlight> inflight;
+  inflight.reserve(n);
+  const uint64_t deadline = NowMs() + static_cast<uint64_t>(wait_ms_);
+  int backoff_us = 50;
+  size_t failed_final = 0;
+  while (!pending.empty()) {
+    // Issue round: enqueue every key that is READY right now.
+    size_t w = 0;
+    for (size_t r = 0; r < pending.size(); ++r) {
+      const size_t idx = pending[r];
+      WaitItem& it = items[idx];
+      Slot* s = Find(it.key);
+      CopySnap snap{};
+      if (s && s->state.load(std::memory_order_acquire) == kStateReady &&
+          IssueCopySg(s, it.segs, it.nsegs, it.total_cap, st, &snap)) {
+        inflight.push_back(InFlight{idx, snap});
+      } else {
+        pending[w++] = idx;  // not published yet (or torn): retry next round
+      }
+    }
+    pending.resize(w);
+    if (!inflight.empty()) {
+      // ONE sync amortized over the whole round, then post-validation.
+      const bool synced = cu_->StreamSynchronize(st) == kCudaSuccess;
+      for (const InFlight& f : inflight) {
+        if (synced && ValidateCopy(f.snap)) {
+          items[f.idx].ok = true;
+          items[f.idx].got = f.snap.n;
+          wait_hits_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          ++failed_final;  // lapped mid-copy: it will not heal — re-fetch
+        }
+      }
+      inflight.clear();
+      backoff_us = 50;  // publishes are flowing; poll eagerly
+      continue;
+    }
+    if (NowMs() >= deadline) break;
+    std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+    if (backoff_us < 1000) backoff_us *= 2;
+  }
+  wait_timeouts_.fetch_add(pending.size() + failed_final,
+                           std::memory_order_relaxed);
 }
 
 GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,

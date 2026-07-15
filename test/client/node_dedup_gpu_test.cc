@@ -14,6 +14,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -200,6 +201,48 @@ TEST(GpuNodeDedup, ThreadWithoutCtxIsServed) {
   ASSERT_EQ(a->ClaimSg(K(9), &ds, 1, 32768, &got), GpuNodeDedup::Role::kHit);
   EXPECT_EQ(got, v.size());
   EXPECT_EQ(dst.Down(32768), v);
+}
+
+TEST(GpuNodeDedup, WaitManyAmortizedSync) {
+  if (!EnsureCudaCtx()) GTEST_SKIP() << "no CUDA device";
+  ShmGuard g("waitmany");
+  auto a = GpuNodeDedup::Open(Opts(g.name));
+  auto b = GpuNodeDedup::Open(Opts(g.name));
+  ASSERT_TRUE(a && b);
+  constexpr size_t kN = 16;
+  std::vector<std::string> vals;
+  std::vector<std::unique_ptr<DevBuf>> srcs, dsts;
+  std::vector<GpuNodeDedup::Seg> ssegs(kN), dsegs(kN);
+  std::vector<GpuNodeDedup::WaitItem> wits(kN);
+  size_t got = 0;
+  for (size_t i = 0; i < kN; ++i) {
+    vals.push_back(Val(100 + i, 8192));
+    srcs.push_back(std::make_unique<DevBuf>(8192));
+    dsts.push_back(std::make_unique<DevBuf>(8192));
+    srcs[i]->Up(vals[i]);
+    ssegs[i] = {reinterpret_cast<void*>(srcs[i]->p), 8192};
+    dsegs[i] = {reinterpret_cast<void*>(dsts[i]->p), 8192};
+    ASSERT_EQ(a->ClaimSg(K(100 + i), &ssegs[i], 1, 8192, &got),
+              GpuNodeDedup::Role::kFetch);
+    ASSERT_EQ(b->ClaimSg(K(100 + i), &dsegs[i], 1, 8192, &got),
+              GpuNodeDedup::Role::kWait);
+    wits[i] = GpuNodeDedup::WaitItem{K(100 + i), &dsegs[i], 1, 8192, false, 0};
+  }
+  std::thread pub([&] {  // publishes trickle in while the batch wait runs
+    ASSERT_TRUE(EnsureCudaCtx());
+    for (size_t i = 0; i < kN; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      a->PublishSg(K(100 + i), &ssegs[i], 1, vals[i].size());
+    }
+  });
+  b->WaitManySg(wits.data(), kN);
+  pub.join();
+  for (size_t i = 0; i < kN; ++i) {
+    EXPECT_TRUE(wits[i].ok) << "key " << i;
+    EXPECT_EQ(wits[i].got, vals[i].size());
+    EXPECT_EQ(dsts[i]->Down(8192), vals[i]) << "key " << i;
+  }
+  EXPECT_EQ(b->wait_hits(), kN);
 }
 
 TEST(GpuNodeDedup, AbortFreesSlotForWaiterFallback) {

@@ -86,6 +86,26 @@ class GpuNodeDedup {
                size_t total_cap, size_t* got);
   bool WaitSg(const BlockKey& key, const Seg* segs, size_t nsegs,
               size_t total_cap, size_t* got);
+
+  // One wait-item of a WaitManySg batch. segs/nsegs/total_cap mirror the
+  // per-key API; ok/got are outputs (ok=false => caller re-fetches the key).
+  struct WaitItem {
+    BlockKey key;
+    const Seg* segs;
+    size_t nsegs;
+    size_t total_cap;
+    bool ok;
+    size_t got;
+  };
+  // Waits for MANY keys with amortized synchronization: copies are issued
+  // asynchronously the moment each key turns READY, and the stream is
+  // synchronized ONCE per issue round, with post-validation (lap/seqlock)
+  // after the sync. The per-key WaitSg costs a StreamSynchronize per payload
+  // (~ms under load); a lockstep batch of >1000 keys blew straight through
+  // any reasonable wait budget that way (measured 2.3 ms/key in the PD A/B —
+  // the dedup win leaked back out through the fallback re-fetches). wait_ms
+  // bounds how long the batch waits for publishes as a whole.
+  void WaitManySg(WaitItem* items, size_t n);
   // Gathers the fetched segments (total payload = len bytes) into this
   // process' arena and flips the slot READY.
   void PublishSg(const BlockKey& key, const Seg* segs, size_t nsegs, size_t len);
@@ -118,6 +138,21 @@ class GpuNodeDedup {
   CUstream Stream();
   Slot* Find(const BlockKey& key) const;
   Slot* Reserve(const BlockKey& key);
+  // Split copy-out: Issue pre-validates and ENQUEUES the scatter on st (no
+  // sync); Validate re-checks lap/generation AFTER the caller synchronized.
+  // CopyOutSg composes them for the single-key path; WaitManySg amortizes one
+  // sync over a whole issue round.
+  struct CopySnap {
+    Slot* s;
+    uint64_t g0;
+    uint32_t oi;
+    uint64_t egen;
+    uint64_t seq;
+    size_t n;
+  };
+  bool IssueCopySg(Slot* s, const Seg* segs, size_t nsegs, size_t total_cap,
+                   CUstream st, CopySnap* snap);
+  bool ValidateCopy(const CopySnap& snap) const;
   bool CopyOutSg(Slot* s, const Seg* segs, size_t nsegs, size_t total_cap,
                  size_t* got);
   // Cached cuIpcOpenMemHandle of registry entry idx at generation gen;

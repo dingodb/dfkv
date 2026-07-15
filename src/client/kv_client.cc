@@ -1157,25 +1157,32 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       }
     }
   }
-  // Waits are sequential with a per-key deadline; a batch-level budget stops
-  // a slow/failed fetcher from stacking those deadlines (1554 keys x 500 ms
-  // was a 7-minute request, observed live). Everything unresolved when the
-  // budget runs out — and every individual wait miss — falls back through
-  // ONE direct batch, not per-key singles.
+  // One amortized-sync wait for the WHOLE wait list (WaitManySg): copies are
+  // enqueued as keys turn READY and the stream synchronizes per round, not
+  // per key — per-key syncs cost ~ms under load and burned any wait budget
+  // long before the list was through (the dedup win leaked back out through
+  // fallback re-fetches; measured live in the PD A/B). Failures fall back
+  // through ONE direct batch.
   std::vector<size_t> fb;
-  const uint64_t wait_deadline =
-      NowMs() + 2ull * static_cast<uint64_t>(gd->wait_ms());
-  for (size_t i : wait_list) {
-    size_t got = 0;
-    if (NowMs() < wait_deadline) {
-      segs_of(items[i]);
-      if (gd->WaitSg(bks[i], segs.data(), segs.size(), total_cap(items[i]), &got)) {
-        res[i] = true;
-        lens[i] = got;
-        continue;
-      }
+  std::vector<GpuNodeDedup::WaitItem> wits(wait_list.size());
+  std::vector<std::vector<GpuNodeDedup::Seg>> wsegs(wait_list.size());
+  for (size_t m = 0; m < wait_list.size(); ++m) {
+    const size_t i = wait_list[m];
+    wsegs[m].reserve(items[i].dsts.size());
+    for (size_t j = 0; j < items[i].dsts.size(); ++j)
+      wsegs[m].push_back(GpuNodeDedup::Seg{items[i].dsts[j], items[i].caps[j]});
+    wits[m] = GpuNodeDedup::WaitItem{bks[i], wsegs[m].data(), wsegs[m].size(),
+                                     total_cap(items[i]), false, 0};
+  }
+  gd->WaitManySg(wits.data(), wits.size());
+  for (size_t m = 0; m < wait_list.size(); ++m) {
+    const size_t i = wait_list[m];
+    if (wits[m].ok) {
+      res[i] = true;
+      lens[i] = wits[m].got;
+    } else {
+      fb.push_back(i);
     }
-    fb.push_back(i);
   }
   if (!fb.empty()) {
     std::vector<KvGetItemSg> rest;
