@@ -64,6 +64,14 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_register_memory.restype = c_int
     lib.dfkv_register_memory.argtypes = [c_void_p, c_void_p, c_uint64]
 
+    # Live SG width (negotiated max_sge - 1). Older libs lack the symbol;
+    # callers must tolerate AttributeError and fall back to 29.
+    try:
+        lib.dfkv_max_sg_segs.restype = c_uint32
+        lib.dfkv_max_sg_segs.argtypes = [c_void_p]
+    except AttributeError:
+        pass
+
     # Batch primitives (raw void** pointers -> may be GPU device pointers).
     lib.dfkv_batch_put.restype = c_int
     lib.dfkv_batch_put.argtypes = [

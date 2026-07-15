@@ -69,6 +69,14 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]);
 // key may hold up to kMaxSge-1 (=29) non-contiguous buffers. Open() clamps this
 // to the device's reported max_sge (ConnectX-* on hd04 reports 30).
 constexpr size_t kMaxSge = 30;
+
+// The SG width Open() would negotiate on dev_name (min(kMaxSge, device
+// max_sge)) WITHOUT bootstrapping a connection: rides the shared-device cache,
+// so callers can size scatter-gather batches before any peer traffic. Empty
+// dev_name = first device. Returns kMaxSge when no device answers — matching
+// Open()'s "trust the documented cap" fallback keeps the client guard at its
+// historical 29-payload-segs behavior instead of silently shrinking it.
+size_t QueryMaxSge(const char* dev_name);
 // Alignment used for server-side O_DIRECT read buffers. NVMe/xfs are happy with
 // 4096, and it is a safe superset for 512-byte logical-sector devices.
 constexpr size_t kDirectIoAlign = 4096;

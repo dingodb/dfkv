@@ -134,6 +134,11 @@ class KVClient {
   // Call once at startup (after the pool is allocated) before traffic.
   void RegisterMemory(void* base, size_t size) { t_->RegisterMemory(base, size); }
 
+  // Max payload segments per scatter-gather key on the LIVE transport (RDMA:
+  // negotiated max_sge - 1; TCP: 29). Connectors size their SG chunking from
+  // this (via dfkv_max_sg_segs) instead of hard-coding the ConnectX-era 29.
+  size_t MaxSgPayloadSegs() const { return t_->MaxSgPayloadSegs(); }
+
   // Hot-swap the cluster membership (rebuilds the consistent-hash ring).
   // Thread-safe vs concurrent Put/Get/Exist.
   void SetMembers(std::vector<std::pair<std::string, std::string>> members);

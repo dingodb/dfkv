@@ -38,6 +38,11 @@ int dfkv_remove(dfkv_client_t c, const char* key);                           // 
 // region is registered once per connection. No-op on the TCP transport. Call once
 // at startup after the pool is allocated, before traffic. Returns 0 on success.
 int dfkv_register_memory(dfkv_client_t c, const void* base, uint64_t size);
+// Max payload segments one scatter-gather key may carry on this client's live
+// transport (RDMA: negotiated max_sge - 1; TCP: 29). Size batch_put_sg /
+// batch_get_auto_sg grouping from this instead of assuming 29. Returns 0 on a
+// null client.
+uint32_t dfkv_max_sg_segs(dfkv_client_t c);
 // Hot-swap cluster membership ("n1=ip:port,n2=ip:port"). Returns 0 on success.
 int dfkv_set_members(dfkv_client_t c, const char* members);
 // Discovery: query seed ("ip:port") for the cluster member list and apply it.

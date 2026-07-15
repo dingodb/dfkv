@@ -46,6 +46,7 @@ class RdmaTransport : public Transport {
   std::string MetricsText() const override;  // dfkv_rdma_client_* (conns, per-rail)
 
   bool pipelined() const override { return true; }
+  size_t MaxSgPayloadSegs() const override { return sg_payload_segs_; }
   // Pipelined: up to `depth_` requests in flight on a single connection.
   std::vector<Status> CacheMany(const std::string& node,
                                 const std::vector<CacheItem>& items) override;
@@ -94,6 +95,8 @@ class RdmaTransport : public Transport {
   // Lifetime per-rail device refs holding the pool MRs registered at
   // RegisterMemory time (client-side anchor; see RegisterMemory). Filled once.
   std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
+  // min over rails of (negotiated max_sge) - 1; set once in the ctor.
+  size_t sg_payload_segs_ = 29;
   size_t max_payload_;
   // DCP1 declared max block bytes (DFKV_RDMA_MAX_BLOCK_BYTES, clamped to
   // max_payload_). 0 = undeclared: worst-case buffers both sides, old wire

@@ -93,6 +93,11 @@ int dfkv_register_memory(dfkv_client_t c, const void* base, uint64_t size) {
   return 0;
 }
 
+uint32_t dfkv_max_sg_segs(dfkv_client_t c) {
+  if (!c) return 0;
+  return static_cast<uint32_t>(static_cast<KVClient*>(c)->MaxSgPayloadSegs());
+}
+
 // The batch entrypoints take caller-owned C arrays. We validate the array
 // pointers up front (null with n>0 => bad call) and tolerate a null element:
 // a null keys[i] is substituted with an empty item so BatchPut/Get stays index-

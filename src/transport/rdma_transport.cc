@@ -115,6 +115,15 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   if (devs_.empty()) devs_.push_back("");  // first available device
   for (const auto& d : devs_)
     dev_node_.push_back(numa::DeviceNode(d.empty() ? nullptr : d.c_str()));
+  // Live SG width: the tightest rail decides (connections round-robin rails,
+  // and a key must fit whichever rail carries it). Queried once — device caps
+  // don't change under a running process.
+  {
+    size_t msge = rdma::kMaxSge;
+    for (const auto& d : devs_)
+      msge = std::min(msge, rdma::QueryMaxSge(d.empty() ? nullptr : d.c_str()));
+    sg_payload_segs_ = msge - 1;  // SGE0 carries the wire/value header
+  }
   const char* d = std::getenv("DFKV_RDMA_DEPTH");  // pipeline depth (must be <= server's)
   if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
   connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);

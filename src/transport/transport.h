@@ -101,6 +101,13 @@ class Transport {
   // threads instead, since the per-node loop here would be sequential.
   virtual bool pipelined() const { return false; }
 
+  // Max payload segments one scatter-gather key may carry end-to-end. On RDMA
+  // this is the live negotiated max_sge minus the header SGE; the TCP default
+  // keeps the documented ConnectX-era 29 so batches built against it stay
+  // valid everywhere. Callers (connectors, via the C ABI) size their SG
+  // grouping from this instead of hard-coding 29.
+  virtual size_t MaxSgPayloadSegs() const { return 29; }
+
   // Batch variants for one node. Default = sequential loop; RDMA overrides these
   // to pipeline multiple requests in flight on a single connection. All keys in
   // a RangeMany share (offset, length).

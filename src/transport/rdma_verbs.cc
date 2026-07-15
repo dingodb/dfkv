@@ -139,6 +139,19 @@ uint64_t RcEndpoint::PoolMrRegistrations() {
   return g_pool_mr_regs.load(std::memory_order_relaxed);
 }
 
+size_t QueryMaxSge(const char* dev_name) {
+  auto shared = AcquireSharedDevice(dev_name);
+  if (!shared.first) return kMaxSge;
+  ibv_device_attr dev_attr{};
+  size_t r = kMaxSge;
+  if (ibv_query_device(shared.first, &dev_attr) == 0 && dev_attr.max_sge > 0) {
+    r = std::min(kMaxSge, static_cast<size_t>(dev_attr.max_sge));
+    if (r < 2) r = 2;  // SGE0 is the header; keep >=1 payload segment
+  }
+  ReleaseSharedDevice(shared.first);
+  return r;
+}
+
 void SerializeQpInfo(const QpInfo& in, char out[kQpInfoBytes]) {
   std::memset(out, 0, kQpInfoBytes);
   net::PutU32(out + 0, in.qpn);
