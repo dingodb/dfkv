@@ -1188,6 +1188,27 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       if (rr[m]) lens[fb[m]] = rl[m];
     }
   }
+  // Per-batch split, opt-in (DFKV_CLIENT_NODE_DEDUP_LOG=1): the one line that
+  // distinguishes "waits time out" from "claims never dedup" when the server
+  // counters look wrong — cheap enough to leave on in a canary.
+  static const bool log_split = [] {
+    const char* v = std::getenv("DFKV_CLIENT_NODE_DEDUP_LOG");
+    return v && std::strcmp(v, "1") == 0;
+  }();
+  if (log_split) {
+    size_t hits0 = 0;
+    for (bool b : res) hits0 += b;
+    DFKV_LOG_INFO("gpu-dedup batch: n=" + std::to_string(N) +
+                  " claim_hit=" + std::to_string(N - fetch_map.size() - wait_list.size()) +
+                  " fetched=" + std::to_string(fetch_map.size()) +
+                  " waited=" + std::to_string(wait_list.size()) +
+                  " fallback=" + std::to_string(fb.size()) +
+                  " ok=" + std::to_string(hits0) +
+                  " cum(h=" + std::to_string(gd->hits()) +
+                  ",f=" + std::to_string(gd->fetches()) +
+                  ",wh=" + std::to_string(gd->wait_hits()) +
+                  ",wt=" + std::to_string(gd->wait_timeouts()) + ")");
+  }
   if (out_lens) *out_lens = std::move(lens);
   return res;
 }
