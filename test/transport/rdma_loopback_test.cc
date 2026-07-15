@@ -104,11 +104,14 @@ TEST(RdmaLoopback, ExistManyWindowedMixedHitMiss) {
     std::string v = "v" + std::to_string(i);
     ASSERT_TRUE(c.Put("p" + std::to_string(i), v.data(), v.size())) << i;
   }
-  // Interleave present (even) and absent (odd) keys.
+  // Interleave present (even) and absent (odd) keys. The probes must carry the
+  // same model_hash the KVClient salted the identity with on Put (SelfHdr());
+  // a bare ToBlockKey probes the mh=0 keyspace and misses everything.
+  const uint64_t mh = SelfHdr().model_hash;
   std::vector<BlockKey> keys;
   for (int i = 0; i < N; ++i) {
-    keys.push_back(ToBlockKey("p" + std::to_string(i)));      // present
-    keys.push_back(ToBlockKey("absent" + std::to_string(i))); // miss
+    keys.push_back(ToBlockKey("p" + std::to_string(i), mh));      // present
+    keys.push_back(ToBlockKey("absent" + std::to_string(i), mh)); // miss
   }
   std::vector<char> exists;
   auto sts = rt.ExistMany(node.addr, keys, &exists);
@@ -678,10 +681,13 @@ TEST(RdmaLoopback, BatchRetriesAfterServerReclaim) {
   // probe must detect that on the first window and re-dial a fresh conn, returning
   // CORRECT results — not kIOError for the whole batch. Direct transport call so no
   // KVClient-level health retry can mask a transport that failed to recover.
+  // Probe with the Put-side model_hash: KVClient salts the block identity with
+  // SelfHdr().model_hash, so a bare ToBlockKey would probe the wrong keyspace.
+  const uint64_t mh = SelfHdr().model_hash;
   std::vector<BlockKey> keys;
   for (int i = 0; i < N; ++i) {
-    keys.push_back(ToBlockKey("b" + std::to_string(i)));     // present (warm)
-    keys.push_back(ToBlockKey("nope" + std::to_string(i)));  // absent
+    keys.push_back(ToBlockKey("b" + std::to_string(i), mh));     // present (warm)
+    keys.push_back(ToBlockKey("nope" + std::to_string(i), mh));  // absent
   }
   std::vector<char> exists;
   auto sts = rt.ExistMany(node.addr, keys, &exists);

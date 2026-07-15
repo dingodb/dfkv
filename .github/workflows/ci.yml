@@ -141,17 +141,28 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDFKV_WITH_RDMA=ON
           cmake --build build -j --target rdma_loopback_test
-      # Best-effort: the runner's Soft-RoCE rxe may not actually round-trip RC
-      # traffic to itself (the test build above is the hard gate; the datapath is
-      # hard-gated locally + on real RDMA HW where rxe loopback works). We still
-      # run it here for signal — continue-on-error so an rxe env quirk can't block.
-      - name: Run RDMA datapath test (best-effort; logs results)
-        continue-on-error: true
+      # Probe-then-gate: blanket continue-on-error masked real assertion failures
+      # for weeks (two broken tests stayed green). Instead, first check that rxe
+      # can actually round-trip RC traffic with the simplest datapath case; only
+      # an env-level probe failure is tolerated. Once the probe passes, the full
+      # suite is a hard gate.
+      - name: Probe rxe loopback connectivity
+        id: rxe_probe
+        run: |
+          ulimit -l unlimited 2>/dev/null || true
+          if ./build/rdma_loopback_test --gtest_filter=RdmaLoopback.PutGetExistMissOverRdma; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::rxe loopback cannot round-trip RC traffic on this runner; datapath suite skipped"
+          fi
+      - name: Run RDMA datapath test (hard gate when rxe works)
+        if: steps.rxe_probe.outputs.ok == 'true'
         run: |
           ulimit -l unlimited 2>/dev/null || true
           ./build/rdma_loopback_test
-      - name: Build + run RDMA datapath test under ThreadSanitizer (best-effort)
-        continue-on-error: true
+      - name: Build + run RDMA datapath test under ThreadSanitizer (hard gate when rxe works)
+        if: steps.rxe_probe.outputs.ok == 'true'
         run: |
           cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DDFKV_WITH_RDMA=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" \
