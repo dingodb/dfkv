@@ -306,7 +306,11 @@ TEST(RdmaLoopback, UserMrCapTracksDepth) {
   EXPECT_GE(shallow.user_mr_cap(), shallow.depth());
   rdma::RcEndpoint deep;
   ASSERT_TRUE(deep.Open(nullptr, 16 * 1024, 100));  // depth > default cap of 64
-  EXPECT_GE(deep.user_mr_cap(), 100u) << "cap below depth -> in-window MR eviction risk";
+  // The SG multi paths register up to max_sge-1 out-of-pool segments per slot
+  // and post only after the whole window is registered: the cap must cover
+  // depth * max_sge or a same-window LRU eviction hands a freed MR to a WR.
+  EXPECT_GE(deep.user_mr_cap(), 100u * deep.max_sge())
+      << "cap below depth*max_sge -> in-window MR eviction risk on SG batches";
 }
 
 TEST(RdmaLoopback, PoolMrSharedAcrossBuffers) {
@@ -515,6 +519,63 @@ TEST(RdmaLoopback, ScatterGatherRoundtripOverRdma) {
 // CacheFromMulti/RangeIntoMulti, NOT poison its node batch. Previously the up-front
 // validation std::fill'd every result kInvalid and returned; now the offender is
 // skipped in the window and its siblings on the same node proceed normally.
+// Regression (phase-4 C5): one deep window of SG items where EVERY segment is
+// a distinct unregistered buffer. The ad-hoc MR cache was capped at
+// max(64, depth); the SG multi paths register the whole window's segments
+// (up to depth * (max_sge-1) MRs) BEFORE posting any WR, so slot 3+'s
+// registrations LRU-evicted (ibv_dereg_mr) MRs earlier slots still held in
+// mrs_per — posted WRs then carried freed lkeys (use-after-dereg; on the RECV
+// side a completion scattering into freed memory). With the cap raised to
+// depth * max_sge the whole window stays registered and the batch is correct.
+TEST(RdmaLoopback, SgDeepWindowManyUnregisteredSegmentsSafe) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ::setenv("DFKV_RDMA_DEPTH", "4", 1);
+  RdmaNode node("sgdw");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  ASSERT_TRUE(rt.pipelined());
+
+  constexpr int kItems = 8;   // > depth: also crosses windows
+  constexpr int kSegs = 29;   // max payload SGEs per slot
+  constexpr size_t kSeg = 512;
+  std::vector<std::vector<std::string>> src(kItems);
+  std::vector<KvPutItemSg> puts;
+  for (int it = 0; it < kItems; ++it) {
+    src[it].resize(kSegs);
+    std::vector<const void*> ptrs;
+    std::vector<size_t> sizes;
+    for (int sg = 0; sg < kSegs; ++sg) {
+      src[it][sg].assign(kSeg, static_cast<char>('a' + (it * 7 + sg) % 26));
+      ptrs.push_back(src[it][sg].data());
+      sizes.push_back(kSeg);
+    }
+    puts.push_back({"sgdw_" + std::to_string(it), ptrs, sizes});
+  }
+  auto pr = c.BatchPutSg(puts);
+  ASSERT_EQ(pr.size(), puts.size());
+  for (int it = 0; it < kItems; ++it) EXPECT_TRUE(pr[it]) << "put item " << it;
+
+  std::vector<std::vector<std::string>> dst(kItems);
+  std::vector<KvGetItemSg> gets;
+  for (int it = 0; it < kItems; ++it) {
+    dst[it].assign(kSegs, std::string(kSeg, '\0'));
+    std::vector<void*> dptrs;
+    std::vector<size_t> caps;
+    for (int sg = 0; sg < kSegs; ++sg) { dptrs.push_back(&dst[it][sg][0]); caps.push_back(kSeg); }
+    gets.push_back({"sgdw_" + std::to_string(it), dptrs, caps});
+  }
+  std::vector<size_t> lens;
+  auto gr = c.BatchGetAutoSg(gets, &lens);
+  ASSERT_EQ(gr.size(), gets.size());
+  for (int it = 0; it < kItems; ++it) {
+    EXPECT_TRUE(gr[it]) << "get item " << it;
+    EXPECT_EQ(lens[it], kSegs * kSeg) << it;
+    for (int sg = 0; sg < kSegs; ++sg)
+      EXPECT_EQ(dst[it][sg], src[it][sg]) << "item " << it << " seg " << sg;
+  }
+  ::unsetenv("DFKV_RDMA_DEPTH");
+}
+
 TEST(RdmaLoopback, ScatterGatherOversizedFailsOnlyOffender) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ::setenv("DFKV_RDMA_DEPTH", "4", 1);
