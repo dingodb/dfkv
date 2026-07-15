@@ -1157,18 +1157,35 @@ std::vector<bool> KVClient::BatchGetAutoSg(const std::vector<KvGetItemSg>& items
       }
     }
   }
+  // Waits are sequential with a per-key deadline; a batch-level budget stops
+  // a slow/failed fetcher from stacking those deadlines (1554 keys x 500 ms
+  // was a 7-minute request, observed live). Everything unresolved when the
+  // budget runs out — and every individual wait miss — falls back through
+  // ONE direct batch, not per-key singles.
+  std::vector<size_t> fb;
+  const uint64_t wait_deadline =
+      NowMs() + 2ull * static_cast<uint64_t>(gd->wait_ms());
   for (size_t i : wait_list) {
-    segs_of(items[i]);
     size_t got = 0;
-    if (gd->WaitSg(bks[i], segs.data(), segs.size(), total_cap(items[i]), &got)) {
-      res[i] = true;
-      lens[i] = got;
-    } else {  // fetcher failed/slow: bounded fallback to a direct read
-      std::vector<KvGetItemSg> one(1, items[i]);
-      std::vector<size_t> ol;
-      auto rr = BatchGetAutoSgDirect(one, &ol);
-      res[i] = rr[0];
-      if (rr[0]) lens[i] = ol[0];
+    if (NowMs() < wait_deadline) {
+      segs_of(items[i]);
+      if (gd->WaitSg(bks[i], segs.data(), segs.size(), total_cap(items[i]), &got)) {
+        res[i] = true;
+        lens[i] = got;
+        continue;
+      }
+    }
+    fb.push_back(i);
+  }
+  if (!fb.empty()) {
+    std::vector<KvGetItemSg> rest;
+    rest.reserve(fb.size());
+    for (size_t i : fb) rest.push_back(items[i]);
+    std::vector<size_t> rl;
+    auto rr = BatchGetAutoSgDirect(rest, &rl);
+    for (size_t m = 0; m < fb.size(); ++m) {
+      res[fb[m]] = rr[m];
+      if (rr[m]) lens[fb[m]] = rl[m];
     }
   }
   if (out_lens) *out_lens = std::move(lens);

@@ -91,6 +91,8 @@ class GpuNodeDedup {
   void PublishSg(const BlockKey& key, const Seg* segs, size_t nsegs, size_t len);
   void Abort(const BlockKey& key);
 
+  int wait_ms() const { return wait_ms_; }
+
   // diagnostics (relaxed; process-local)
   uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
   uint64_t fetches() const { return fetches_.load(std::memory_order_relaxed); }
@@ -109,6 +111,11 @@ class GpuNodeDedup {
   // bind our device's primary context on demand so every entry point works
   // from any caller thread.
   void EnsureThreadCtx() const;
+  // The rendezvous' own non-blocking stream (lazy; guarded by stream_mu_).
+  // Copies must NOT ride the legacy default stream: that falsely serializes
+  // them with the framework's in-flight kernels, and unsynchronized D2D
+  // "completions" published stale arena bytes (both observed live).
+  CUstream Stream();
   Slot* Find(const BlockKey& key) const;
   Slot* Reserve(const BlockKey& key);
   bool CopyOutSg(Slot* s, const Seg* segs, size_t nsegs, size_t total_cap,
@@ -134,6 +141,8 @@ class GpuNodeDedup {
   uint32_t self_idx_ = kMaxProcs;
   uint64_t self_gen_ = 0;
   int self_device_ = -1;  // arena's device (EnsureThreadCtx re-binds to it)
+  std::mutex stream_mu_;
+  CUstream stream_ = nullptr;
 
   std::mutex peer_mu_;  // guards peer_map_
   struct PeerMap {

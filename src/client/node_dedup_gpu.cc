@@ -253,6 +253,7 @@ GpuNodeDedup::~GpuNodeDedup() {
   if (cu_) {
     for (auto& pm : peer_map_)
       if (pm.base) cu_->IpcCloseMemHandle(pm.base);  // best-effort at teardown
+    if (stream_) cu_->StreamDestroy(stream_);
     if (arena_base_) cu_->MemFree(arena_base_);
   }
   if (map_base_) ::munmap(map_base_, map_len_);
@@ -262,6 +263,14 @@ void GpuNodeDedup::EnsureThreadCtx() const {
   // First bind on a thread retains the primary ctx once (bounded by thread
   // count); afterwards HasCurrentCtx short-circuits.
   if (!cu_->HasCurrentCtx()) cu_->BindPrimaryCtx(self_device_);
+}
+
+CUstream GpuNodeDedup::Stream() {
+  std::lock_guard<std::mutex> lk(stream_mu_);
+  if (!stream_ &&
+      cu_->StreamCreate(&stream_, kCuStreamNonBlocking) != kCudaSuccess)
+    stream_ = nullptr;
+  return stream_;
 }
 
 GpuNodeDedup::Slot* GpuNodeDedup::Find(const BlockKey& key) const {
@@ -371,16 +380,21 @@ bool GpuNodeDedup::CopyOutSg(Slot* s, const Seg* segs, size_t nsegs,
     return false;
   CUdeviceptr base = PeerBase(oi, egen);
   if (!base) return false;
+  CUstream st = Stream();
+  if (!st) return false;
   size_t done = 0;
   for (size_t j = 0; j < nsegs && done < n; ++j) {
     const size_t m = std::min(n - done, segs[j].cap);
     if (m == 0) continue;
-    if (cu_->Memcpy(reinterpret_cast<CUdeviceptr>(segs[j].ptr),
-                    base + off + done, m) != kCudaSuccess)
+    if (cu_->MemcpyAsync(reinterpret_cast<CUdeviceptr>(segs[j].ptr),
+                         base + off + done, m, st) != kCudaSuccess)
       return false;  // unmapped/raced VA: the driver rejects, we miss
     done += m;
   }
-  if (done != n) return false;
+  // The scatter must be ON the device before we declare a hit — async D2D
+  // "returns" immediately; the framework would otherwise consume the blocks
+  // before the bytes land.
+  if (done != n || cu_->StreamSynchronize(st) != kCudaSuccess) return false;
   // ... and AFTER: un-lapped payload, same entry generation (arena still the
   // one we copied from), untouched slot.
   if (e.alloc_cursor.load(std::memory_order_acquire) - seq > e.arena_bytes - n)
@@ -451,17 +465,22 @@ void GpuNodeDedup::PublishSg(const BlockKey& key, const Seg* segs, size_t nsegs,
       break;
     }
   }
-  // Gather the caller's segments (device VAs, D2D) into the arena.
+  // Gather the caller's segments (device VAs, D2D) into the arena on our own
+  // stream, and SYNC before flipping READY: an unsynchronized gather let
+  // peers copy stale arena bytes (garbage KV, observed live).
+  CUstream st = Stream();
+  if (!st) return abandon();
   size_t done = 0;
   for (size_t j = 0; j < nsegs && done < n; ++j) {
     const size_t m = std::min(n - done, segs[j].cap);
     if (m == 0) continue;
-    if (cu_->Memcpy(arena_base_ + off + done,
-                    reinterpret_cast<CUdeviceptr>(segs[j].ptr), m) != kCudaSuccess)
+    if (cu_->MemcpyAsync(arena_base_ + off + done,
+                         reinterpret_cast<CUdeviceptr>(segs[j].ptr), m,
+                         st) != kCudaSuccess)
       return abandon();
     done += m;
   }
-  if (done != n) return abandon();
+  if (done != n || cu_->StreamSynchronize(st) != kCudaSuccess) return abandon();
   s->gen.fetch_add(1, std::memory_order_acq_rel);
   s->len = static_cast<uint32_t>(n);
   s->payload_off = off;

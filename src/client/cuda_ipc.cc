@@ -33,6 +33,15 @@ bool CudaLib::Resolve() {
       SymV2(h, "cuMemFree_v2", "cuMemFree"));
   Memcpy = reinterpret_cast<CUresult (*)(CUdeviceptr, CUdeviceptr, size_t)>(
       ::dlsym(h, "cuMemcpy"));
+  MemcpyAsync = reinterpret_cast<CUresult (*)(CUdeviceptr, CUdeviceptr, size_t,
+                                              CUstream)>(
+      ::dlsym(h, "cuMemcpyAsync"));
+  StreamCreate = reinterpret_cast<CUresult (*)(CUstream*, unsigned)>(
+      ::dlsym(h, "cuStreamCreate"));
+  StreamSynchronize = reinterpret_cast<CUresult (*)(CUstream)>(
+      ::dlsym(h, "cuStreamSynchronize"));
+  StreamDestroy = reinterpret_cast<CUresult (*)(CUstream)>(
+      SymV2(h, "cuStreamDestroy_v2", "cuStreamDestroy"));
   IpcGetMemHandle = reinterpret_cast<CUresult (*)(CUipcMemHandle*, CUdeviceptr)>(
       ::dlsym(h, "cuIpcGetMemHandle"));
   IpcOpenMemHandle = reinterpret_cast<CUresult (*)(CUdeviceptr*, CUipcMemHandle,
@@ -50,10 +59,11 @@ bool CudaLib::Resolve() {
       ::dlsym(h, "cuDevicePrimaryCtxRetain"));
   pointer_get_attribute_ = reinterpret_cast<CUresult (*)(void*, int, CUdeviceptr)>(
       ::dlsym(h, "cuPointerGetAttribute"));
-  if (!init || !MemAlloc || !MemFree || !Memcpy || !IpcGetMemHandle ||
-      !IpcOpenMemHandle || !IpcCloseMemHandle || !ctx_get_current_ ||
-      !ctx_set_current_ || !ctx_get_device_ || !primary_ctx_retain_ ||
-      !pointer_get_attribute_)
+  if (!init || !MemAlloc || !MemFree || !Memcpy || !MemcpyAsync ||
+      !StreamCreate || !StreamSynchronize || !StreamDestroy ||
+      !IpcGetMemHandle || !IpcOpenMemHandle || !IpcCloseMemHandle ||
+      !ctx_get_current_ || !ctx_set_current_ || !ctx_get_device_ ||
+      !primary_ctx_retain_ || !pointer_get_attribute_)
     return false;
   // cuInit is idempotent; the host framework normally beat us to it. A
   // failure here (no device, driver/library mismatch) disables the surface.

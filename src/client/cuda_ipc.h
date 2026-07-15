@@ -20,6 +20,7 @@ namespace dfkv {
 using CUresult = int;
 using CUdeviceptr = unsigned long long;
 using CUcontext = void*;
+using CUstream = void*;
 struct CUipcMemHandle {
   char reserved[64];
 };
@@ -28,6 +29,7 @@ constexpr unsigned kCuIpcMemLazyEnablePeerAccess = 0x1;
 constexpr int kCuPointerAttributeMemoryType = 2;    // CU_POINTER_ATTRIBUTE_MEMORY_TYPE
 constexpr int kCuPointerAttributeDeviceOrdinal = 9; // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
 constexpr unsigned kCuMemoryTypeDevice = 2;         // CU_MEMORYTYPE_DEVICE
+constexpr unsigned kCuStreamNonBlocking = 1;        // CU_STREAM_NON_BLOCKING
 
 class CudaLib {
  public:
@@ -52,7 +54,16 @@ class CudaLib {
   CUresult (*MemAlloc)(CUdeviceptr*, size_t) = nullptr;
   CUresult (*MemFree)(CUdeviceptr) = nullptr;
   // Unified-addressing copy: any host/device src/dst combination.
+  // NOTE (learned live): the synchronous cuMemcpy runs on the LEGACY default
+  // stream — it falsely serializes with every compute kernel the framework
+  // has in flight (100x slowdowns under load) AND returns before D2D copies
+  // complete. The rendezvous therefore uses MemcpyAsync on its own
+  // non-blocking stream + StreamSynchronize; plain Memcpy stays for tests.
   CUresult (*Memcpy)(CUdeviceptr, CUdeviceptr, size_t) = nullptr;
+  CUresult (*MemcpyAsync)(CUdeviceptr, CUdeviceptr, size_t, CUstream) = nullptr;
+  CUresult (*StreamCreate)(CUstream*, unsigned) = nullptr;
+  CUresult (*StreamSynchronize)(CUstream) = nullptr;
+  CUresult (*StreamDestroy)(CUstream) = nullptr;
   CUresult (*IpcGetMemHandle)(CUipcMemHandle*, CUdeviceptr) = nullptr;
   CUresult (*IpcOpenMemHandle)(CUdeviceptr*, CUipcMemHandle, unsigned) = nullptr;
   CUresult (*IpcCloseMemHandle)(CUdeviceptr) = nullptr;
