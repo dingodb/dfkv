@@ -9,8 +9,13 @@
 namespace dfkv {
 
 namespace {
-// Prefer the versioned symbol (what cuda.h binds since CUDA 3.2/11); fall
-// back to the legacy name so ancient drivers still resolve.
+// Prefer the versioned symbol ONLY where cuda.h itself binds it (the classic
+// 32->64-bit _v2 set: cuMemAlloc/cuMemFree/cuIpcOpenMemHandle) — there the
+// _v2 signature is the one we declare. NEVER guess _v2 for other entry
+// points: drivers export e.g. cuCtxGetDevice_v2 with a DIFFERENT signature
+// (an extra CUcontext parameter), and calling it through the plain prototype
+// reads a garbage register — a segfault that only fires on some threads
+// (found live: one of four vLLM workers died in exactly that call).
 void* SymV2(void* h, const char* v2, const char* legacy) {
   if (void* p = ::dlsym(h, v2)) return p;
   return ::dlsym(h, legacy);
@@ -36,13 +41,13 @@ bool CudaLib::Resolve() {
   IpcCloseMemHandle = reinterpret_cast<CUresult (*)(CUdeviceptr)>(
       ::dlsym(h, "cuIpcCloseMemHandle"));
   ctx_get_current_ = reinterpret_cast<CUresult (*)(CUcontext*)>(
-      SymV2(h, "cuCtxGetCurrent_v2", "cuCtxGetCurrent"));
+      ::dlsym(h, "cuCtxGetCurrent"));
   ctx_set_current_ = reinterpret_cast<CUresult (*)(CUcontext)>(
-      SymV2(h, "cuCtxSetCurrent_v2", "cuCtxSetCurrent"));
+      ::dlsym(h, "cuCtxSetCurrent"));
   ctx_get_device_ = reinterpret_cast<CUresult (*)(int*)>(
-      SymV2(h, "cuCtxGetDevice_v2", "cuCtxGetDevice"));
+      ::dlsym(h, "cuCtxGetDevice"));
   primary_ctx_retain_ = reinterpret_cast<CUresult (*)(CUcontext*, int)>(
-      SymV2(h, "cuDevicePrimaryCtxRetain_v2", "cuDevicePrimaryCtxRetain"));
+      ::dlsym(h, "cuDevicePrimaryCtxRetain"));
   pointer_get_attribute_ = reinterpret_cast<CUresult (*)(void*, int, CUdeviceptr)>(
       ::dlsym(h, "cuPointerGetAttribute"));
   if (!init || !MemAlloc || !MemFree || !Memcpy || !IpcGetMemHandle ||
