@@ -71,15 +71,25 @@ def should_create_client(
     elide_requested: bool,
 ) -> tuple[bool, str]:
     """Phase 2a of issue #111 (producer-side client elision): a kv_producer's
-    non-participant ranks never touch dfkv -- their store path early-exits
-    (Phase 1 striping) and a producer has no load path -- so they can skip
-    creating the client entirely: no RDMA connections, no MDS registration,
-    no MR pin. instances x TP -> instances x N connections on the P side.
+    non-participant ranks skip creating the client AT INIT -- their store path
+    early-exits (Phase 1 striping) -- saving RDMA connections, MDS
+    registration and MR pins: instances x TP -> instances x N connections on
+    the P side.
+
+    A producer DOES have a load path (cross-instance prefix reuse:
+    get_finished issues loads with no role gate), so elision is init-time
+    only, not permanent: the worker keeps the client kwargs and lazily
+    UN-elides -- creates the client and replays pool registrations -- the
+    first time a real load reaches an elided rank
+    (DfkvStoreWorker._ensure_client_for_load). The alternative (failing the
+    load into a whole-span recompute) costs far more than the connections
+    saved.
 
     Deliberately NOT applied to kv_consumer / kv_both: their load path runs on
-    every rank (each rank fills its own GPU KV), so eliding would turn loads
-    into misses. Load-side convergence (Phase 2b: participant-proxied GET +
-    same-host page sharing) is a separate, measurement-gated design.
+    every rank from the first request, so eliding would just re-create every
+    client lazily with no savings. Load-side convergence (Phase 2b:
+    participant-proxied GET + same-host page sharing) is a separate,
+    measurement-gated design.
 
     Opt-in (DFKV_CONNECTOR_CLIENT_ELIDE=1) and layout-clamped like Phase 1:
     unset, or any non-eligible combination, keeps today's behavior exactly."""
