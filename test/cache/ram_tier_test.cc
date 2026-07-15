@@ -336,3 +336,42 @@ TEST(RamTier, BatchFlushDrainsQueueAndRetriesPerItem) {
   EXPECT_FALSE(rt.Contains(K(900))) << "dropped after retries";
   EXPECT_TRUE(rt.Contains(K(901)));
 }
+
+// Sharded tier: keys route by hash to independent shards; the whole lifecycle
+// (put -> visible -> flush -> durable -> get/pin/release -> remove) must hold
+// with shards > 1 exactly as with the single-lock layout.
+TEST(RamTier, ShardedLifecycleAcrossShards) {
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);  // 1 MiB extents
+  ::setenv("DFKV_RAM_TIER_SHARDS", "8", 1);
+  FlushSink sink;  // gate open by default
+  RamTier::Options o;
+  o.bytes = 256ull << 20;  // 256 extents -> 32/shard, keeps 8 shards
+  o.slot_granularity = 4096;
+  o.flush_threads = 8;
+  RamTier t(o, sink.fn());
+  ASSERT_TRUE(t.ok());
+  EXPECT_EQ(t.shards(), 8u);
+
+  const int N = 512;  // hash spreads these across all shards
+  std::string v(8000, 'x');
+  for (int i = 0; i < N; ++i) ASSERT_TRUE(t.Put(K(1000 + i), v.data(), v.size())) << i;
+  EXPECT_EQ(t.Count(), static_cast<size_t>(N));
+  // Wait for every shard's flushers to drain.
+  for (int spin = 0; spin < 500 && t.Flushed() < static_cast<uint64_t>(N); ++spin)
+    std::this_thread::sleep_for(10ms);
+  EXPECT_EQ(t.Flushed(), static_cast<uint64_t>(N));
+  EXPECT_EQ(t.FlushBacklog(), 0u);
+
+  // Every key readable; tokens (shard-encoded) release correctly.
+  for (int i = 0; i < N; ++i) {
+    RamTier::Hit h;
+    ASSERT_TRUE(t.GetPrep(K(1000 + i), 0, 0, &h)) << i;
+    EXPECT_EQ(h.len, v.size());
+    EXPECT_EQ(std::string(h.ptr, 16), v.substr(0, 16));
+    t.Release(h.token);
+  }
+  // Durable + idle -> removable, on whichever shard the key lives.
+  for (int i = 0; i < N; i += 7) EXPECT_TRUE(t.Remove(K(1000 + i))) << i;
+  ::unsetenv("DFKV_RAM_TIER_SHARDS");
+  ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
+}

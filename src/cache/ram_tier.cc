@@ -75,16 +75,46 @@ RamTier::RamTier(Options opt, FlushFn flush)
   }
   if (ext > opt_.bytes) ext = opt_.bytes;
   extent_bytes_ = ext;
-  SlabAllocator::Options ao;
-  ao.extent_bytes = ext;
-  ao.num_extents = static_cast<uint32_t>(std::max<uint64_t>(1, opt_.bytes / ext));
-  ao.align = opt_.slot_granularity;
-  ao.max_waste = 0.25;
-  alloc_ = std::make_unique<SlabAllocator>(ao);
-  const uint32_t nf = opt_.flush_threads ? opt_.flush_threads : 1;
+  const uint64_t total_extents = std::max<uint64_t>(1, opt_.bytes / ext);
+
+  // Shard count: enough shards to take the single lock off the hot path, few
+  // enough that every shard keeps a deep extent pool for class coexistence
+  // (>= 32 extents per shard). Small/test arenas degrade to 1 shard (identical
+  // to the pre-sharding behavior).
+  size_t nshards = 8;
+  if (const char* s = std::getenv("DFKV_RAM_TIER_SHARDS")) {
+    long v = std::strtol(s, nullptr, 10);
+    if (v >= 1 && v <= static_cast<long>(kMaxShards)) nshards = static_cast<size_t>(v);
+  }
+  nshards = std::min(nshards, kMaxShards);
+  while (nshards > 1 && total_extents / nshards < 32) nshards /= 2;
+  if (nshards < 1) nshards = 1;
+
+  const uint64_t ext_per_shard = total_extents / nshards;  // remainder unused (<1 extent/shard)
+  shards_.reserve(nshards);
+  for (size_t s = 0; s < nshards; ++s) {
+    auto sh = std::make_unique<Shard>();
+    sh->base_off = static_cast<uint64_t>(s) * ext_per_shard * ext;
+    SlabAllocator::Options ao;
+    ao.extent_bytes = ext;
+    ao.num_extents = static_cast<uint32_t>(ext_per_shard);
+    ao.align = opt_.slot_granularity;
+    ao.max_waste = 0.25;
+    sh->alloc = std::make_unique<SlabAllocator>(ao);
+    shards_.push_back(std::move(sh));
+  }
+  if (nshards > 1)
+    DFKV_LOG_INFO("ram tier sharded: " + std::to_string(nshards) + " shards x " +
+                  std::to_string(ext_per_shard) + " extents");
+
+  // Flush workers: distribute round-robin over shards, at least one per shard.
+  const uint32_t nf = std::max<uint32_t>(opt_.flush_threads ? opt_.flush_threads : 1,
+                                         static_cast<uint32_t>(nshards));
   flushers_.reserve(nf);
-  for (uint32_t i = 0; i < nf; ++i)
-    flushers_.emplace_back([this] { FlushLoop(); });
+  for (uint32_t i = 0; i < nf; ++i) {
+    Shard& s = *shards_[i % nshards];
+    flushers_.emplace_back([this, &s] { FlushLoop(s); });
+  }
   if (opt_.reclaim_interval_ms > 0) {
     reclaim_thread_ = std::thread([this] {
       std::unique_lock<std::mutex> lk(reclaim_mu_);
@@ -93,7 +123,7 @@ RamTier::RamTier(Options opt, FlushFn flush)
                              [this] { return reclaim_stop_; });
         if (reclaim_stop_) return;
         lk.unlock();
-        ReclaimTick();
+        for (size_t s = 0; s < shards_.size(); ++s) ReclaimTick(*shards_[s], s);
         lk.lock();
       }
     });
@@ -106,44 +136,42 @@ RamTier::~RamTier() {
     reclaim_cv_.notify_all();
     reclaim_thread_.join();
   }
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    stop_ = true;
+  for (auto& sh : shards_) {
+    std::lock_guard<std::mutex> lk(sh->mu);
+    sh->stop = true;
   }
-  flush_cv_.notify_all();
+  for (auto& sh : shards_) sh->cv.notify_all();
   for (auto& f : flushers_) if (f.joinable()) f.join();
   if (arena_) std::free(arena_);
 }
 
-// One reclaimer pass (mirror of DiskSlabStore::ReclaimTick, arena flavor): for
-// every class with new inserts since the last pass, top its free slots up to a
-// demand-driven watermark, in small batches per mu_ hold. Victims are unpinned
-// (== durable, no send in flight), so dropping them from index_ is the same
-// operation Put performs for its own inline evictions. This keeps Put's
-// allocator call on the pop-free-slot fast path; without it a full arena runs
-// the CLOCK sweep inline under mu_ on every admission.
-void RamTier::ReclaimTick() {
-  const auto classes = alloc_->Classes();
-  if (reclaim_last_puts_.size() < classes.size())
-    reclaim_last_puts_.resize(classes.size(), 0);
+// One reclaimer pass over one shard (mirror of DiskSlabStore::ReclaimTick,
+// arena flavor): for every class with new inserts since the last pass, top its
+// free slots up to a demand-driven watermark, in small batches per lock hold.
+// Victims are unpinned (== durable, no send in flight), so dropping them from
+// the index is the same operation Put performs for its own inline evictions.
+void RamTier::ReclaimTick(Shard& s, size_t /*shard_idx*/) {
+  const auto classes = s.alloc->Classes();
+  if (s.reclaim_last_puts.size() < classes.size())
+    s.reclaim_last_puts.resize(classes.size(), 0);
   std::vector<uint64_t> delta(classes.size(), 0);
   std::vector<uint32_t> extents(classes.size(), 0);
   for (size_t i = 0; i < classes.size(); ++i) {
-    delta[i] = classes[i].puts - reclaim_last_puts_[i];
-    reclaim_last_puts_[i] = classes[i].puts;
+    delta[i] = classes[i].puts - s.reclaim_last_puts[i];
+    s.reclaim_last_puts[i] = classes[i].puts;
     extents[i] = classes[i].extents;
   }
   // -- GROW -- (mirror of DiskSlabStore::ReclaimTick; see its comment)
   // Runs even while flush-gated, ON PURPOSE: a cold donor's extents hold
   // DURABLE residents, so moving them to the hot class frees admission
-  // capacity precisely when the flusher can't -- the arena's pinned mass is
+  // capacity precisely when the flusher can't -- the shard's pinned mass is
   // the hot class's own unflushed writes, not the donors'.
   for (size_t i = 0; i < classes.size(); ++i) {
     if (delta[i] == 0) continue;
     const auto& c = classes[i];
     size_t free_now = c.free_slots;
     const size_t want = std::max<size_t>(64, static_cast<size_t>(2 * delta[i]));
-    if (free_now >= want || c.slots_per_extent == 0 || alloc_->PoolExtents() > 0)
+    if (free_now >= want || c.slots_per_extent == 0 || s.alloc->PoolExtents() > 0)
       continue;
     size_t need_ext =
         (want - free_now + c.slots_per_extent - 1) / c.slots_per_extent;
@@ -162,9 +190,9 @@ void RamTier::ReclaimTick() {
       std::vector<std::string> evicted;
       bool ok;
       {
-        std::lock_guard<std::mutex> lk(mu_);
-        ok = alloc_->StealFrom(donor, i, &evicted);
-        for (const auto& ev : evicted) index_.erase(ev);
+        std::lock_guard<std::mutex> lk(s.mu);
+        ok = s.alloc->StealFrom(donor, i, &evicted);
+        for (const auto& ev : evicted) s.index.erase(ev);
       }
       if (!ok) { extents[donor] = 0; continue; }  // donor all pinned: try next
       extents[donor]--;
@@ -172,15 +200,14 @@ void RamTier::ReclaimTick() {
       --need_ext;
     }
   }
-  // Flush-gated regime: when the flush queue is deep, the arena is mostly
+  // Flush-gated regime: when the flush queue is deep, the shard is mostly
   // PINNED (not-yet-durable) slots -- free slots are not the admission
   // constraint, and a CLOCK sweep over a pinned-heavy ring just burns lock
   // time skipping entries. Skip the self-eviction phase; it resumes as the
-  // flusher catches up. 4096 = the per-tick eviction budget: below it one
-  // pass could plausibly matter, above it admission is flusher-bound.
+  // flusher catches up. The 4096 budget is per shard.
   {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (flushq_.size() > 4096) return;
+    std::lock_guard<std::mutex> lk(s.mu);
+    if (s.flushq.size() > 4096) return;
   }
   // -- RECLAIM --
   for (size_t i = 0; i < classes.size(); ++i) {
@@ -196,9 +223,9 @@ void RamTier::ReclaimTick() {
       const size_t batch = std::min<size_t>(64, budget);
       size_t got;
       {
-        std::lock_guard<std::mutex> lk(mu_);
-        got = alloc_->ReclaimClass(i, target, batch, &evicted);
-        for (const auto& ev : evicted) index_.erase(ev);
+        std::lock_guard<std::mutex> lk(s.mu);
+        got = s.alloc->ReclaimClass(i, target, batch, &evicted);
+        for (const auto& ev : evicted) s.index.erase(ev);
       }
       if (got > 0) reclaimed_.fetch_add(got, std::memory_order_relaxed);
       budget -= std::min(budget, got);
@@ -210,131 +237,142 @@ void RamTier::ReclaimTick() {
 }
 
 void RamTier::SetArenaMr(void* mr) {
-  std::lock_guard<std::mutex> lk(mu_);
-  arena_mr_ = mr;
+  arena_mr_.store(mr, std::memory_order_release);
 }
 
 bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
   if (!arena_) return false;
   if (data == nullptr && len != 0) return false;
   const std::string fn = key.Filename();
+  Shard& s = ShardFor(fn);
 
   uint64_t offset = 0;
   uint32_t cap = 0;
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(s.mu);
     // Resident, or another thread is mid-copy on this same (content-addressed)
     // key -> dedup. The in-progress writer produces identical bytes, so returning
     // "accepted" here is correct read-after-write for this key.
-    if (index_.count(fn) || writing_.count(fn)) return true;
+    if (s.index.count(fn) || s.writing.count(fn)) return true;
     SlabAllocator::SlotRef ref;
     std::vector<std::string> evicted;
-    if (!alloc_->Put(fn, len, &ref, &evicted)) {
-      // Backpressure (gap 10.3): arena full of non-evictable (flushing / in-
+    if (!s.alloc->Put(fn, len, &ref, &evicted)) {
+      // Backpressure (gap 10.3): shard full of non-evictable (flushing / in-
       // flight) slots. Decline -> caller does the normal synchronous disk write.
       put_bypass_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
-    for (const auto& ev : evicted) index_.erase(ev);  // evicted are durable+idle
+    for (const auto& ev : evicted) s.index.erase(ev);  // evicted are durable+idle
     // Flush-pin the slot: RAM_ONLY, not evictable until the async flush lands.
-    alloc_->Pin(fn);
-    writing_.insert(fn);  // reserve the key so a concurrent same-key Put dedups
-    offset = ref.extent * extent_bytes_ + ref.offset;  // global arena offset
-    cap = ref.slot_size;                               // (ref.offset is within-extent)
-    // NOT visible yet: index_ install is deferred until after the copy, so a
+    s.alloc->Pin(fn);
+    s.writing.insert(fn);  // reserve the key so a concurrent same-key Put dedups
+    offset = s.base_off + ref.extent * extent_bytes_ + ref.offset;  // global offset
+    cap = ref.slot_size;                                            // (within-extent)
+    // NOT visible yet: index install is deferred until after the copy, so a
     // concurrent GetPrep can't read the slot mid-copy.
   }
 
   std::memcpy(arena_ + offset, data, len);  // copy outside the lock (MB-scale)
 
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(s.mu);
     Entry e;
     e.offset = offset;
     e.len = static_cast<uint32_t>(len);
     e.cap = cap;
     e.durable = false;
-    index_[fn] = e;
-    writing_.erase(fn);  // copy done -> now visible to GetPrep
-    flushq_.push_back(QItem{fn, key, 0});
+    s.index[fn] = e;
+    s.writing.erase(fn);  // copy done -> now visible to GetPrep
+    s.flushq.push_back(QItem{fn, key, 0});
   }
-  flush_cv_.notify_one();
+  s.cv.notify_one();
   puts_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
 bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
                       Hit* out) {
+  if (shards_.empty()) return false;  // failed-construction guard (ok()==false)
   const std::string fn = key.Filename();
-  std::lock_guard<std::mutex> lk(mu_);
-  auto it = index_.find(fn);
-  if (it == index_.end()) {
+  const size_t sidx = std::hash<std::string>{}(fn) % shards_.size();
+  Shard& s = *shards_[sidx];
+  std::lock_guard<std::mutex> lk(s.mu);
+  auto it = s.index.find(fn);
+  if (it == s.index.end()) {
     misses_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
   const Entry& e = it->second;
   // Send-pin: the RDMA send reads the shared arena in place; the slot must not
   // be evicted/reused until the send completes (gap 10.1).
-  alloc_->Pin(fn);
+  s.alloc->Pin(fn);
   const uint64_t start = std::min<uint64_t>(offset, e.len);
   const uint64_t avail = e.len - start;
   const uint64_t n = std::min(length ? length : avail, avail);
   if (out) {
     out->ptr = arena_ + e.offset + start;
     out->len = static_cast<size_t>(n);
-    out->mr = arena_mr_;
-    out->token = next_token_++;
-    pinned_[out->token] = fn;
+    out->mr = arena_mr_.load(std::memory_order_acquire);
+    // Token encodes the shard so Release() routes without a global map.
+    out->token = (s.next_token++ << kTokenShardBits) | sidx;
+    s.pinned[out->token] = fn;
   }
   hits_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
 void RamTier::Release(uint64_t token) {
-  std::lock_guard<std::mutex> lk(mu_);
-  auto it = pinned_.find(token);
-  if (it == pinned_.end()) return;
-  alloc_->Unpin(it->second);  // release the send-pin
-  pinned_.erase(it);
+  if (shards_.empty()) return;
+  Shard& s = *shards_[(token & (kMaxShards - 1)) % shards_.size()];
+  std::lock_guard<std::mutex> lk(s.mu);
+  auto it = s.pinned.find(token);
+  if (it == s.pinned.end()) return;
+  s.alloc->Unpin(it->second);  // release the send-pin
+  s.pinned.erase(it);
 }
 
 bool RamTier::Contains(const BlockKey& key) const {
-  std::lock_guard<std::mutex> lk(mu_);
-  return index_.find(key.Filename()) != index_.end();
+  if (shards_.empty()) return false;
+  const std::string fn = key.Filename();
+  const Shard& s = ShardFor(fn);
+  std::lock_guard<std::mutex> lk(s.mu);
+  return s.index.find(fn) != s.index.end();
 }
 
 bool RamTier::Remove(const BlockKey& key) {
+  if (shards_.empty()) return false;
   const std::string fn = key.Filename();
-  std::lock_guard<std::mutex> lk(mu_);
-  auto it = index_.find(fn);
-  if (it == index_.end()) return false;
+  Shard& s = ShardFor(fn);
+  std::lock_guard<std::mutex> lk(s.mu);
+  auto it = s.index.find(fn);
+  if (it == s.index.end()) return false;
   // Best-effort for a cache: only a DURABLE, not-in-flight slot can be freed
   // safely. A still-flushing slot holds the flush-pin (the flusher owns it); an
   // in-flight slot holds a send-pin. Either way, decline -- the caller retries.
   if (!it->second.durable) return false;
   bool in_flight = false;
-  for (const auto& kv : pinned_) if (kv.second == fn) { in_flight = true; break; }
+  for (const auto& kv : s.pinned) if (kv.second == fn) { in_flight = true; break; }
   if (in_flight) return false;
-  DropLocked(fn);
+  DropLocked(s, fn);
   return true;
 }
 
-void RamTier::DropLocked(const std::string& fn) {
-  alloc_->Remove(fn);   // frees the slot (must be unpinned)
-  index_.erase(fn);
+void RamTier::DropLocked(Shard& s, const std::string& fn) {
+  s.alloc->Remove(fn);   // frees the slot (must be unpinned)
+  s.index.erase(fn);
 }
 
-void RamTier::FlushLoop() {
+void RamTier::FlushLoop(Shard& s) {
   for (;;) {
     // Drain up to kFlushBatchMax queued items in one pass (one worker's batch).
     std::vector<QItem> batch;
     {
-      std::unique_lock<std::mutex> lk(mu_);
-      flush_cv_.wait(lk, [this] { return stop_ || !flushq_.empty(); });
-      if (stop_ && flushq_.empty()) return;
-      while (!flushq_.empty() && batch.size() < kFlushBatchMax) {
-        batch.push_back(std::move(flushq_.front()));
-        flushq_.pop_front();
+      std::unique_lock<std::mutex> lk(s.mu);
+      s.cv.wait(lk, [&s] { return s.stop || !s.flushq.empty(); });
+      if (s.stop && s.flushq.empty()) return;
+      while (!s.flushq.empty() && batch.size() < kFlushBatchMax) {
+        batch.push_back(std::move(s.flushq.front()));
+        s.flushq.pop_front();
       }
     }
 
@@ -344,10 +382,10 @@ void RamTier::FlushLoop() {
     std::vector<FlushItem> items(B);
     std::vector<char> live(B, 0);
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      std::lock_guard<std::mutex> lk(s.mu);
       for (size_t i = 0; i < B; ++i) {
-        auto it = index_.find(batch[i].fn);
-        if (it == index_.end() || it->second.durable) continue;  // gone/already done
+        auto it = s.index.find(batch[i].fn);
+        if (it == s.index.end() || it->second.durable) continue;  // gone/already done
         items[i] = FlushItem{batch[i].key, arena_ + it->second.offset,
                              it->second.len, it->second.cap};
         live[i] = 1;
@@ -374,23 +412,23 @@ void RamTier::FlushLoop() {
     if (!flush_ && !flush_batch_) for (size_t i = 0; i < B; ++i) ok[i] = live[i];
 
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      std::lock_guard<std::mutex> lk(s.mu);
       for (size_t i = 0; i < B; ++i) {
         if (!live[i]) continue;
-        auto it = index_.find(batch[i].fn);
-        if (it == index_.end()) continue;  // defensive
+        auto it = s.index.find(batch[i].fn);
+        if (it == s.index.end()) continue;  // defensive
         if (ok[i]) {
           it->second.durable = true;
-          alloc_->Unpin(batch[i].fn);  // release the flush-pin -> now evictable
+          s.alloc->Unpin(batch[i].fn);  // release the flush-pin -> now evictable
           flushed_.fetch_add(1, std::memory_order_relaxed);
         } else if (++batch[i].tries < opt_.flush_retries) {
-          flushq_.push_back(std::move(batch[i]));  // retry later
-          flush_cv_.notify_one();
+          s.flushq.push_back(std::move(batch[i]));  // retry later
+          s.cv.notify_one();
         } else {
           // Give up: drop from RAM (releases flush-pin + frees slot). GET falls
           // back to a miss (recompute) -- correct cache semantics, no arena leak.
-          alloc_->Unpin(batch[i].fn);
-          DropLocked(batch[i].fn);
+          s.alloc->Unpin(batch[i].fn);
+          DropLocked(s, batch[i].fn);
           flush_dropped_.fetch_add(1, std::memory_order_relaxed);
         }
       }
@@ -398,14 +436,34 @@ void RamTier::FlushLoop() {
   }
 }
 
+uint64_t RamTier::Evictions() const {
+  uint64_t n = 0;
+  for (const auto& sh : shards_) n += sh->alloc->Evictions();
+  return n;
+}
+
+uint64_t RamTier::UsedBytes() const {
+  uint64_t n = 0;
+  for (const auto& sh : shards_) n += sh->alloc->UsedBytes();
+  return n;
+}
+
 size_t RamTier::Count() const {
-  std::lock_guard<std::mutex> lk(mu_);
-  return index_.size();
+  size_t n = 0;
+  for (const auto& sh : shards_) {
+    std::lock_guard<std::mutex> lk(sh->mu);
+    n += sh->index.size();
+  }
+  return n;
 }
 
 size_t RamTier::FlushBacklog() const {
-  std::lock_guard<std::mutex> lk(mu_);
-  return flushq_.size();
+  size_t n = 0;
+  for (const auto& sh : shards_) {
+    std::lock_guard<std::mutex> lk(sh->mu);
+    n += sh->flushq.size();
+  }
+  return n;
 }
 
 }  // namespace dfkv

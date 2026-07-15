@@ -23,6 +23,16 @@
  * Alignment (gap 10.4): the arena base is posix_memalign(4096) and slot sizes
  * are 4096-multiples, so a slot address is O_DIRECT-aligned for the flusher.
  *
+ * SHARDING: every op used to funnel through ONE mutex (index/alloc/flushq/pins)
+ * — with 16 serve threads + 16 flush workers the single lock was the measured
+ * write-path serialization point (each RAM op also took the allocator's lock
+ * UNDER it: two locks per op). The arena is still one allocation (one reg_mr),
+ * but it is partitioned into DFKV_RAM_TIER_SHARDS (default 8) independent
+ * shards — own SlabAllocator, mutex, index, flush queue and flush workers —
+ * routed by hash(key) so a key's whole lifecycle stays on one shard. Hot paths
+ * only contend within a shard. Backpressure is per shard (a full shard
+ * declines while others admit); the hash keeps that rare and unbiased.
+ *
  * Off by default (DFKV_RAM_TIER=0); this class is the standalone core, wired in
  * by later PRs. RDMA MR registration is deferred (SetArenaMr) so this stays
  * hermetically testable without libibverbs. */
@@ -53,20 +63,16 @@ class RamTier {
     uint64_t bytes = (4ull << 30);       // arena size (DFKV_RAM_TIER_BYTES)
     uint32_t slot_granularity = 4096;    // slot quantum (>= O_DIRECT align)
     uint32_t flush_retries = 3;          // per-item flush attempts before drop
-    // Flush worker threads draining the shared queue. One DIO stream sustains
-    // only ~1.6-3 GB/s -- far below the arena's ingest -- so the drain rate,
-    // not the arena size, decides when Put backpressure kicks in. The server
-    // defaults this to 4x the disk count, capped at 16 (small objects are
-    // IOPS-bound: one sync write per worker leaves NVMe queues nearly idle;
-    // 3 -> 16 workers measured +73% on 64 KiB saturated writes once the ingest
-    // lock contention was fixed). Same-key flushes can't run concurrently (one
-    // queued item per key at a time), so workers need no extra ordering.
+    // Flush worker threads draining the shard queues (distributed round-robin
+    // over the shards, at least one per shard). One DIO stream sustains only
+    // ~1.6-3 GB/s -- far below the arena's ingest -- so the drain rate, not
+    // the arena size, decides when Put backpressure kicks in. The server
+    // defaults this to 4x the disk count, capped at 16.
     uint32_t flush_threads = 1;
     // Background free-slot reclaimer cadence (ms; 0 = off). Keeps demand-driven
     // free-slot headroom per class so Put's allocator call stays pop-free-slot;
-    // without it a full arena runs the CLOCK eviction sweep inline under mu_ on
-    // every admission -- with tens of ingest threads that sweep is the measured
-    // write-path serialization point.
+    // without it a full arena runs the CLOCK eviction sweep inline under the
+    // shard lock on every admission.
     uint32_t reclaim_interval_ms = 10;
   };
 
@@ -97,7 +103,7 @@ class RamTier {
   };
 
   RamTier(Options opt, FlushFn flush);
-  ~RamTier();                // stops the flusher, joins
+  ~RamTier();                // stops the flushers, joins
 
   RamTier(const RamTier&) = delete;
   RamTier& operator=(const RamTier&) = delete;
@@ -106,8 +112,8 @@ class RamTier {
 
   // Write-through: copy into a RAM slot + make visible + enqueue flush. Returns
   // true if accepted into RAM (caller may skip the sync disk write; the flusher
-  // will persist). Returns false on backpressure (arena full of non-evictable
-  // slots) or if len exceeds the arena -- caller then does the normal disk write.
+  // will persist). Returns false on backpressure (shard full of non-evictable
+  // slots) or if len exceeds the shard -- caller then does the normal disk write.
   bool Put(const BlockKey& key, const void* data, size_t len);
 
   // On hit, pins the slot (send-pin) and returns its arena location. The caller
@@ -122,6 +128,7 @@ class RamTier {
   void SetArenaMr(void* mr);
   char* arena() const { return arena_; }
   uint64_t arena_bytes() const { return opt_.bytes; }
+  size_t shards() const { return shards_.size(); }  // test/diagnostic
 
   // metrics (relaxed)
   uint64_t Hits() const { return hits_.load(std::memory_order_relaxed); }
@@ -132,55 +139,71 @@ class RamTier {
   uint64_t FlushDropped() const { return flush_dropped_.load(std::memory_order_relaxed); }
   uint64_t Reclaimed() const { return reclaimed_.load(std::memory_order_relaxed); }
   uint64_t Rebalanced() const { return rebalanced_.load(std::memory_order_relaxed); }
-  uint64_t Evictions() const { return alloc_->Evictions(); }
-  uint64_t UsedBytes() const { return alloc_->UsedBytes(); }  // resident slot bytes
+  uint64_t Evictions() const;
+  uint64_t UsedBytes() const;   // resident slot bytes
   size_t Count() const;
   size_t FlushBacklog() const;  // queued, not-yet-durable items
 
  private:
   struct Entry {
-    uint64_t offset = 0;   // byte offset into arena_
+    uint64_t offset = 0;   // byte offset into arena_ (GLOBAL, not shard-local)
     uint32_t len = 0;      // payload length
     uint32_t cap = 0;      // slot size (>= len, 4 KiB multiple) -- flusher's DIO cap
     bool durable = false;  // flushed to disk (metrics; eviction uses alloc pin)
   };
   struct QItem { std::string fn; BlockKey key; uint32_t tries = 0; };
 
-  void FlushLoop();
+  // One independent slice of the tier. All state a key's lifecycle touches
+  // (allocator, index, writing set, send-pins, flush queue) lives here, under
+  // this shard's mutex only. base_off is the shard's byte offset into arena_.
+  struct Shard {
+    uint64_t base_off = 0;
+    std::unique_ptr<SlabAllocator> alloc;
+    mutable std::mutex mu;
+    std::unordered_map<std::string, Entry> index;
+    std::unordered_set<std::string> writing;
+    std::unordered_map<uint64_t, std::string> pinned;  // token -> fn (send-pins)
+    uint64_t next_token = 1;
+    std::deque<QItem> flushq;
+    std::condition_variable cv;
+    bool stop = false;
+    std::vector<uint64_t> reclaim_last_puts;  // reclaim-thread-local snapshot
+  };
+
+  Shard& ShardFor(const std::string& fn) {
+    return *shards_[std::hash<std::string>{}(fn) % shards_.size()];
+  }
+  const Shard& ShardFor(const std::string& fn) const {
+    return *shards_[std::hash<std::string>{}(fn) % shards_.size()];
+  }
+
+  void FlushLoop(Shard& s);
   // Max items one flush worker drains per store visit. Big enough to amortize
   // the two store-lock hops + reach a useful uring submit width, small enough
   // that a batch's slots stay flush-pinned only briefly.
   static constexpr size_t kFlushBatchMax = 16;
-  void ReclaimTick();  // one background grow + free-slot top-up pass (see Options)
+  // Send-pin tokens encode their shard in the low bits so Release() can route
+  // without a global map. 4 bits = up to 16 shards.
+  static constexpr int kTokenShardBits = 4;
+  static constexpr size_t kMaxShards = 1u << kTokenShardBits;
+  void ReclaimTick(Shard& s, size_t shard_idx);
   // Rebalance rate cap: extents moved per tick per hot class (32 MiB default
   // extents; converges in well under a second at the 10 ms tick).
   static constexpr size_t kGrowExtentsPerTick = 8;
-  void DropLocked(const std::string& fn);  // remove key from index_ + alloc + unpin
+  static void DropLocked(Shard& s, const std::string& fn);  // s.mu held
 
   Options opt_;
   FlushFn flush_;
   FlushBatchFn flush_batch_;
   char* arena_ = nullptr;
-  void* arena_mr_ = nullptr;
+  std::atomic<void*> arena_mr_{nullptr};
   uint64_t extent_bytes_ = 0;   // SlabAllocator extent size; global arena offset
-                                // of a slot = ref.extent * extent_bytes_ + ref.offset
-  std::unique_ptr<SlabAllocator> alloc_;
-
-  mutable std::mutex mu_;
-  std::unordered_map<std::string, Entry> index_;         // fn -> arena entry (visible)
-  // Keys whose slot is reserved+pinned but whose arena copy is still in progress
-  // (memcpy runs outside the lock so a GET never blocks on a PUT). A concurrent
-  // same-key Put sees this and dedups instead of copying the same slot twice.
-  std::unordered_set<std::string> writing_;
-  std::unordered_map<uint64_t, std::string> pinned_;     // token -> fn (send-pins)
-  uint64_t next_token_ = 1;
-  std::deque<QItem> flushq_;
-  std::condition_variable flush_cv_;
-  bool stop_ = false;
+                                // of a slot = shard.base_off + ref.extent *
+                                // extent_bytes_ + ref.offset
+  std::vector<std::unique_ptr<Shard>> shards_;
   std::vector<std::thread> flushers_;
   // Background free-slot reclaimer (own cv/mutex so shutdown never races the
-  // flushers' flush_cv_ protocol).
-  std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
+  // flushers' cv protocol). One thread sweeps all shards.
   std::thread reclaim_thread_;
   std::condition_variable reclaim_cv_;
   std::mutex reclaim_mu_;
