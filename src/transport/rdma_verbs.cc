@@ -188,7 +188,6 @@ void RcEndpoint::Close() {
 bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib_port,
                       bool direct_io_buffers, size_t direct_io_cap) {
   cap_ = cap; depth_ = depth; ib_port_ = ib_port;
-  user_mr_cap_ = std::max(kMinUserMr, depth_);  // >= depth: no in-window MR eviction
 
   int wp[2];
   if (::pipe(wp) != 0) return false;  // self-pipe to interrupt WaitComp
@@ -225,6 +224,14 @@ bool RcEndpoint::Open(const char* dev_name, size_t cap, size_t depth, uint8_t ib
       max_sge_ = kMaxSge;  // query failed: trust the documented device cap
     }
   }
+  // The ad-hoc MR cache must never evict an MR another slot of the SAME window
+  // still references: the SG multi paths register up to max_sge_-1 out-of-pool
+  // segment buffers PER SLOT for the whole window before posting any WR, so the
+  // in-flight worst case is depth * max_sge_ (not depth) distinct MRs. A cap of
+  // max(kMinUserMr, depth) let a depth>=3 window with unregistered SG segments
+  // LRU-evict (ibv_dereg_mr) MRs still held in mrs_per -> use-after-free lkeys,
+  // and on the RECV side a completion scattering into freed memory.
+  user_mr_cap_ = std::max(kMinUserMr, depth_ * max_sge_);
 
   ibv_qp_init_attr qa{};
   qa.send_cq = cq_; qa.recv_cq = cq_;

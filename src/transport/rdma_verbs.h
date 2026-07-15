@@ -214,10 +214,12 @@ class RcEndpoint {
   // LRU-capped cache of caller-buffer MRs (addr -> {mr, lru-iterator}); front of
   // user_lru_ is MRU. Bounded so a workload with many distinct buffers can't leak
   // registrations (a stable HiCache pool stays fully cached and always hits). The
-  // cap MUST be >= pipeline depth: one window registers up to `depth` distinct
-  // out-of-pool buffers before posting their WRs, so a smaller cap could evict
-  // (ibv_dereg_mr) an MR still referenced by an in-flight WR in the same window
-  // (use-after-dereg). Set to max(kMinUserMr, depth) in Open().
+  // cap MUST cover every MR one window can hold in flight before posting: the
+  // legacy paths register 1 buffer per slot (depth total), but the SG multi
+  // paths register up to max_sge-1 segment buffers PER SLOT and only then post
+  // the whole window — a smaller cap could evict (ibv_dereg_mr) an MR still
+  // referenced in mrs_per (use-after-dereg). Set to
+  // max(kMinUserMr, depth * max_sge) in Open() after max_sge_ is negotiated.
   static constexpr size_t kMinUserMr = 64;
   size_t user_mr_cap_ = kMinUserMr;
   std::list<uintptr_t> user_lru_;
