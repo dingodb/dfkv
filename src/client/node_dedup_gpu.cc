@@ -73,7 +73,11 @@ struct GpuNodeDedup::ProcEntry {
   int32_t device;
   uint32_t pad0;
   CUipcMemHandle handle;
-  uint64_t pad1[3];  // -> 128 B (cross-process ABI)
+  // The exporter's own arena VA: cuIpcOpenMemHandle refuses handles from the
+  // EXPORTING process, so a second instance in the same process (same address
+  // space) reads through this pointer directly. Only trusted when pid matches.
+  uint64_t owner_va;
+  uint64_t pad1[2];  // -> 128 B (cross-process ABI)
 };
 
 struct GpuNodeDedup::Header {
@@ -212,6 +216,7 @@ std::unique_ptr<GpuNodeDedup> GpuNodeDedup::Open(const Options& opt) {
     e.arena_bytes = opt.arena_bytes;
     e.device = cu->CurrentDevice();
     std::memcpy(&e.handle, &handle, sizeof(handle));
+    e.owner_va = static_cast<uint64_t>(d->arena_base_);
     e.ready.store(1, std::memory_order_release);
     d->self_idx_ = i;
   }
@@ -295,6 +300,18 @@ GpuNodeDedup::Slot* GpuNodeDedup::Reserve(const BlockKey& key) {
 CUdeviceptr GpuNodeDedup::PeerBase(uint32_t idx, uint64_t gen) {
   if (idx == self_idx_)
     return gen == self_gen_ ? arena_base_ : 0;  // own publishes: no IPC open
+  {
+    // Another instance in THIS process: cuIpcOpenMemHandle refuses handles
+    // the process itself exported, but its arena VA is directly valid here.
+    ProcEntry& e = reg_[idx];
+    if (e.pid.load(std::memory_order_acquire) ==
+        static_cast<uint32_t>(::getpid())) {
+      if (e.ready.load(std::memory_order_acquire) != 1 ||
+          e.generation.load(std::memory_order_acquire) != gen)
+        return 0;
+      return static_cast<CUdeviceptr>(e.owner_va);
+    }
+  }
   std::lock_guard<std::mutex> lk(peer_mu_);
   PeerMap& pm = peer_map_[idx];
   if (pm.base && pm.gen == gen) return pm.base;
