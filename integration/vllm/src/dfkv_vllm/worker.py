@@ -495,6 +495,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         tp_rank: int,
         ready_event: threading.Event,
         record_operation: Callable[..., None] | None = None,
+        client_provider: Callable[[], Any] | None = None,
     ):
         super().__init__(
             client,
@@ -505,6 +506,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             name="KVCacheStoreRecvingThread",
             record_operation=record_operation,
         )
+        # Elided ranks start with client=None; a real load arriving there calls
+        # this back into the worker to lazily un-elide (create + register the
+        # client) instead of failing the span into a recompute.
+        self.client_provider = client_provider
         # _invalid_block_ids can be access by both the Worker and RecvingThread
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
@@ -571,7 +576,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             # budget, so the Mooncake disk-offload sub-batch split is dropped.
             # Flatten per-key scatter-gather to one (ptr, cap) per dfkv key, then
             # map each flattened result back to its originating block id for error
-            # reporting (see _flatten_segments / seg_owner).
+            # reporting (see _group_segments_sg / seg_owner).
             sg_keys, sg_ptrs, sg_caps, sg_owner = _group_segments_sg(
                 key_list_c, addr_list_c, size_list_c
             )
@@ -585,10 +590,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 # into this chunk's per-layer segments. hit == 1 + len == sum(caps)
                 # means the chunk loaded; a miss or short read marks the originating
                 # block as a load error so vLLM recomputes that span (never fatal).
-                if self.client is None:  # elided producer rank: defensive miss
+                client = self.client
+                if client is None and self.client_provider is not None:
+                    client = self.client_provider()  # lazy un-elide
+                    if client is not None:
+                        self.client = client
+                if client is None:  # no client (un-elide failed): miss -> recompute
                     hits, lens = [False] * len(sg_keys), [0] * len(sg_keys)
                 else:
-                    hits, lens = self.client.batch_get_auto_sg(sg_keys, sg_ptrs, sg_caps)
+                    hits, lens = client.batch_get_auto_sg(sg_keys, sg_ptrs, sg_caps)
                 failed_block_ids: list[int] = []
                 failed_detail: list[tuple[str, int]] = []
                 for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True)):
@@ -649,46 +659,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             self.request_queue.task_done()
 
 
-# dfkv: per-key scatter-gather flatten helpers. Mooncake's
-# batch_*_multi_buffers accepted addrs[i]/sizes[i] as a segment list per key;
-# DfkvDeviceClient takes one (ptr, size) per key. For the single-segment
-# (MLA / FlashInfer) path this is a 1:1 passthrough; for the K/V-split layout
-# each segment becomes its own dfkv key ("<key>@seg{n}").
-def _flatten_segments(
-    keys: list[str],
-    addrs: list[list[int]],
-    sizes: list[list[int]],
-) -> tuple[list[str], list[int], list[int]]:
-    flat_keys, flat_ptrs, flat_sizes, _ = _flatten_segments_with_owner(
-        keys, addrs, sizes
-    )
-    return flat_keys, flat_ptrs, flat_sizes
-
-
-def _flatten_segments_with_owner(
-    keys: list[str],
-    addrs: list[list[int]],
-    sizes: list[list[int]],
-) -> tuple[list[str], list[int], list[int], list[int]]:
-    flat_keys: list[str] = []
-    flat_ptrs: list[int] = []
-    flat_sizes: list[int] = []
-    seg_owner: list[int] = []
-    # dfkv: always suffix "@seg{n}" -- even single-segment keys -- so that the
-    # SAVE, LOAD and LOOKUP paths agree on the on-wire key. The lookup checks
-    # "<key>@seg0" as the block-present proxy (a missing later segment is caught
-    # on load and recomputed; saves are issued as one batch so partials are rare).
-    for key_idx, (key, addr, size) in enumerate(
-        zip(keys, addrs, sizes, strict=True)
-    ):
-        for seg, (a, sz) in enumerate(zip(addr, size, strict=True)):
-            flat_keys.append(f"{key}@seg{seg}")
-            flat_ptrs.append(a)
-            flat_sizes.append(sz)
-            seg_owner.append(key_idx)
-    return flat_keys, flat_ptrs, flat_sizes, seg_owner
-
-
 # dfkv: max payload segments gathered into one scatter-gather key. The HCA
 # max_sge is 30; SGE[0] is the request/value header, leaving 29 for payload.
 SG_MAX_SEGS = 29
@@ -697,7 +667,7 @@ SG_MAX_SEGS = 29
 # dfkv scatter-gather grouping: coalesce each chunk's per-layer segments
 # (addrs[i]/sizes[i]) into "<key>@sg{n}" groups of <= SG_MAX_SEGS segments. Each
 # group is ONE dfkv key carrying all its segments via a single RDMA multi-SGE op
-# (vs _flatten_segments' one key per segment). owner[i] maps each @sg key back to
+# (one @sg key per chunk). owner[i] maps each @sg key back to
 # its originating chunk index for per-block load-error attribution.
 def _group_segments_sg(
     keys: list[str],
@@ -754,6 +724,14 @@ class DfkvStoreWorker:
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "load_async", True
         )
+        if not self.load_async:
+            # Fail at construction with an actionable message: the synchronous
+            # load mode was never implemented, and the old hot-path assert in
+            # get_finished() crashed the worker mid-serving instead.
+            raise ValueError(
+                "dfkv connector: kv_connector_extra_config.load_async=false is "
+                "not supported (loads are handled by the async recv thread); "
+                "remove the key or set it to true")
         self.cache_config = vllm_config.cache_config
         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
@@ -849,27 +827,46 @@ class DfkvStoreWorker:
                 f"role={self.kv_role},tp_size={self.tp_size},"
                 f"tp_rank={self.tp_rank},ver={_tcfg.dist_version('dfkv-vllm')}"
             )
-        # Phase 2a (issue #111): producer non-participants skip the client
-        # entirely (opt-in via DFKV_CONNECTOR_CLIENT_ELIDE=1; layout-clamped).
-        create_client, elide_reason = should_create_client(
-            self.kv_role, self.tp_rank, self.tp_size, self.client_ranks,
-            _tcfg.truthy(os.environ.get(ELIDE_ENV, "0")))
-        if not create_client:
-            logger.info("dfkv client elided: %s", elide_reason)
-            self.client = None
-        else:
-            self.client = DfkvDeviceClient(
+        model_hash = int(extra.get("model_hash", 0))
+        if model_hash == 0:
+            # mh=0 is the shared legacy keyspace with NO geometry guard beyond
+            # the byte-length check: two models with the same model_name but a
+            # different dtype/page layout can cross-read each other's blocks.
+            # (hicache derives real geometry; lmcache derives a stable hash.)
+            logger.warning(
+                "dfkv connector: model_hash is 0 (shared keyspace, no "
+                "cross-model isolation). Set kv_connector_extra_config."
+                "model_hash to a per-model value in multi-model fleets.")
+        client_kwargs = dict(
             members=extra.get("members", ""),
             mds_endpoints=mds_endpoints,
             mds_group=mds_group,
             mds_poll_ms=int(extra.get("mds_poll_ms", 3000)),
-            model_hash=int(extra.get("model_hash", 0)),
+            model_hash=model_hash,
             lib_path=extra.get("lib"),
             batch_concurrency=int(extra.get("batch_concurrency", 0)),  # 0 = lib default (>=1.20 auto)
             client_register=client_register,
             client_id=client_id,
             client_info=client_info,
         )
+        # Phase 2a (issue #111): producer non-participants skip the client
+        # (opt-in via DFKV_CONNECTOR_CLIENT_ELIDE=1; layout-clamped). The saved
+        # kwargs let the rank UN-elide lazily if a load ever reaches it — a
+        # producer DOES load on cross-instance prefix reuse (get_finished has
+        # no role gate), and failing those loads into whole-span recomputes
+        # would cost more than the elided connections save.
+        self._lazy_client_kwargs: dict | None = None
+        self._lazy_client_lock = threading.Lock()
+        self._kv_pool_regions: list[tuple[int, int]] = []
+        create_client, elide_reason = should_create_client(
+            self.kv_role, self.tp_rank, self.tp_size, self.client_ranks,
+            _tcfg.truthy(os.environ.get(ELIDE_ENV, "0")))
+        if not create_client:
+            logger.info("dfkv client elided: %s", elide_reason)
+            self.client = None
+            self._lazy_client_kwargs = client_kwargs
+        else:
+            self.client = DfkvDeviceClient(**client_kwargs)
 
         # dfkv: no disk-offload staging budget (Mooncake owner-DirectIO only).
 
@@ -962,6 +959,33 @@ class DfkvStoreWorker:
         """
         self.register_kv_caches({"__cross_layer__": kv_cache})
 
+    def _ensure_client_for_load(self) -> Any:
+        """Lazily un-elide: create the dfkv client on an elided producer rank
+        the first time a real load reaches it (cross-instance prefix reuse —
+        get_finished has no role gate). Keeps phase 2a's connection savings for
+        the common P-instance case while never trading a whole-span recompute
+        for them. Thread-safe; returns None (load misses, vLLM recomputes) if
+        creation fails or the rank was never elided-with-kwargs."""
+        if self.client is not None:
+            return self.client
+        if self._lazy_client_kwargs is None:
+            return None
+        with self._lazy_client_lock:
+            if self.client is None:
+                try:
+                    client = DfkvDeviceClient(**self._lazy_client_kwargs)
+                    for base, ln in self._kv_pool_regions:
+                        client.register_memory(base, ln)
+                except Exception:
+                    logger.exception(
+                        "dfkv lazy un-elide failed; loads on this rank miss")
+                    return None
+                self.client = client
+                logger.info(
+                    "dfkv client un-elided: a load reached this elided "
+                    "producer rank (tp_rank=%d)", self.tp_rank)
+        return self.client
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
@@ -1019,6 +1043,10 @@ class DfkvStoreWorker:
             # each physical storage region ONCE (aliased groups reuse the MR).
             if base_addr not in registered_ptrs:
                 registered_ptrs.add(base_addr)
+                # Recorded even when the client is elided: a lazy un-elide
+                # (load reaching an elided rank) must replay these
+                # registrations before its first GET.
+                self._kv_pool_regions.append((base_addr, region_len))
                 if self.client is not None:
                     self.client.register_memory(base_addr, region_len)
 
@@ -1090,6 +1118,7 @@ class DfkvStoreWorker:
             self.tp_rank,
             ready_event_recving,
             record_operation=self._record_kv_connector_operation,
+            client_provider=self._ensure_client_for_load,
         )
         self.kv_recv_thread.start()
         ready_event_recving.wait()
@@ -1161,7 +1190,6 @@ class DfkvStoreWorker:
             assert self.kv_recv_thread is not None
             self.kv_recv_thread.add_request(request)
 
-        assert self.load_async, "load_async must be True for better performance."
         # Issue stores with CUDA event synchronization
         if self.kv_role in ["kv_producer", "kv_both"]:
             current_event = None
