@@ -17,6 +17,7 @@
 
 #include "utils/log.h"          // DFKV_LOG_WARN (uring init fallback)
 #include "utils/net_util.h"     // ReadAll / WriteAll / Get*/Put*
+#include "utils/thread_name.h"
 #include "utils/numa_util.h"    // pin serve thread to the device's NUMA node
 #include "utils/wire_limits.h"  // ResolveMaxPayload (shared with the TCP path)
 #include "transport/rdma_verbs.h"   // RcEndpoint, QpInfo
@@ -93,7 +94,7 @@ Status RdmaServer::Start(int port) {
     }
   }
   running_ = true;
-  accept_thread_ = std::thread([this] { AcceptLoop(); });
+  accept_thread_ = std::thread([this] { NameThisThread("rdma-accept"); AcceptLoop(); });
   return Status::kOk;
 }
 
@@ -151,6 +152,7 @@ void RdmaServer::AcceptLoop() {
     ReapDoneLocked();  // reap connections that finished since the last accept
     auto done = std::make_shared<std::atomic<bool>>(false);
     conns_.push_back({std::thread([this, fd, done] {
+                        NameThisThread("rdma-serve");
                         Serve(fd);
                         done->store(true, std::memory_order_release);  // last act
                       }),

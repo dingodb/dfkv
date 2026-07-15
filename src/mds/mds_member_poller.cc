@@ -8,6 +8,7 @@
 
 #include "common/status.h"
 #include "utils/net_util.h"
+#include "utils/thread_name.h"
 #include "utils/wire_limits.h"
 #include "transport/wire.h"
 
@@ -107,7 +108,7 @@ void MdsMemberPoller::Loop() {
 
 void MdsMemberPoller::Start() {
   if (running_.exchange(true)) return;
-  th_ = std::thread([this] { Loop(); });
+  th_ = std::thread([this] { NameThisThread("mds-poll"); Loop(); });
 }
 
 void MdsMemberPoller::Stop() {
