@@ -15,6 +15,65 @@
 
 namespace dfkv {
 
+// Guards ring adoption against transient view collapses. Two cases, same
+// hysteresis: a *successful* ListMembers that is (a) empty, or (b) a shrink
+// dropping more than shrink_pct% of the adopted baseline at once — both are
+// almost always etcd-outage recovery (mass lease expiry, e.g. NOSPACE) rather
+// than a genuine teardown. The old guard only covered (a); a partially-expired
+// table ("non-empty but shrunken") sailed through and remapped the whole
+// cluster twice (once on the collapse, once on recovery). Suspicious views
+// must persist for views_to_accept consecutive polls to be believed. Growth
+// and small shrinks (single-node failures) pass through immediately. Pure
+// logic; unit-tested without etcd.
+class MemberViewGuard {
+ public:
+  MemberViewGuard(int views_to_accept, int shrink_pct)
+      : views_to_accept_(views_to_accept), shrink_pct_(shrink_pct) {}
+
+  // May this successful view be adopted now? false = keep the last ring.
+  bool Admit(size_t incoming) {
+    if (!have_baseline_) {  // first successful view: adopt as-is
+      have_baseline_ = true;
+      baseline_ = incoming;
+      return true;
+    }
+    if (incoming == 0 && baseline_ > 0) {
+      if (++empty_streak_ >= views_to_accept_) {
+        baseline_ = 0; empty_streak_ = 0; shrink_streak_ = 0;
+        return true;  // persisted: believe the teardown
+      }
+      ++rejected_empty_;
+      return false;
+    }
+    empty_streak_ = 0;
+    if (shrink_pct_ > 0 && baseline_ > 0 &&
+        incoming < baseline_ * static_cast<size_t>(100 - shrink_pct_) / 100) {
+      if (++shrink_streak_ >= views_to_accept_) {
+        baseline_ = incoming; shrink_streak_ = 0;
+        return true;  // persisted: real mass drain
+      }
+      ++rejected_shrink_;
+      return false;
+    }
+    shrink_streak_ = 0;
+    baseline_ = incoming;
+    return true;
+  }
+
+  uint64_t rejected_empty() const { return rejected_empty_; }
+  uint64_t rejected_shrink() const { return rejected_shrink_; }
+
+ private:
+  const int views_to_accept_;
+  const int shrink_pct_;  // 0 disables the shrink arm (empty arm always on)
+  bool have_baseline_ = false;
+  size_t baseline_ = 0;  // last admitted view's member count
+  int empty_streak_ = 0;
+  int shrink_streak_ = 0;
+  uint64_t rejected_empty_ = 0;
+  uint64_t rejected_shrink_ = 0;
+};
+
 // Client-side discovery: periodically polls the MDS for a group's member view and
 // invokes on_change(members) whenever the epoch (etcd revision) changes. Endpoint
 // selection + failover via MdsEndpoints. One background thread.
@@ -28,8 +87,9 @@ class MdsMemberPoller {
   void Start();
   void Stop();
   bool PollOnce();
-  // Count of member views suppressed by the empty-view guard (diagnostic).
-  uint64_t empty_view_rejected() const { return empty_view_rejected_; }
+  // Views suppressed by the adoption guard (diagnostic).
+  uint64_t empty_view_rejected() const { return guard_.rejected_empty(); }
+  uint64_t shrink_view_rejected() const { return guard_.rejected_shrink(); }
 
  private:
   bool Query(std::vector<MemberInfo>* out, uint64_t* epoch);
@@ -44,16 +104,9 @@ class MdsMemberPoller {
   int io_ms_;
   uint64_t last_epoch_ = 0;
   bool have_epoch_ = false;
-  // Empty-view guard: after etcd loses every lease (outage > TTL), a RECOVERED
-  // MDS answers ListMembers *successfully* with an empty table, which would
-  // otherwise swap in an empty ring (total miss until nodes re-register). If we
-  // have previously seen a non-empty view, require this many consecutive empty
-  // views before believing the cluster is truly gone. First view (incl. empty)
-  // is adopted as-is.
-  static constexpr int kEmptyViewsToAccept = 3;
-  bool seen_nonempty_ = false;
-  int consecutive_empty_ = 0;
-  uint64_t empty_view_rejected_ = 0;  // observability
+  // Suspicious-view hysteresis depth (empty and mass-shrink arms alike).
+  static constexpr int kViewsToAccept = 3;
+  MemberViewGuard guard_;
   std::atomic<bool> running_{false};
   std::thread th_;
   std::mutex mu_;

@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <utility>
 
 #include "common/status.h"
@@ -12,13 +13,28 @@
 
 namespace dfkv {
 
+namespace {
+// Mass-shrink suspicion threshold, percent of the adopted baseline that must
+// disappear IN ONE POLL to trigger hysteresis. 50 clears any realistic
+// same-poll failure burst (a 64-node ring trips only below 32 survivors) while
+// catching the etcd NOSPACE / lease-mass-expiry signature. 0 disables.
+int ShrinkGuardPct() {
+  if (const char* v = std::getenv("DFKV_MDS_SHRINK_GUARD_PCT")) {
+    const long p = std::atol(v);
+    if (p >= 0 && p <= 99) return static_cast<int>(p);
+  }
+  return 50;
+}
+}  // namespace
+
 MdsMemberPoller::MdsMemberPoller(std::vector<std::string> mds_eps, std::string group,
                                  OnChange cb, int poll_ms, int io_timeout_ms)
     : eps_(std::move(mds_eps)),
       group_(std::move(group)),
       cb_(std::move(cb)),
       poll_ms_(poll_ms),
-      io_ms_(io_timeout_ms) {}
+      io_ms_(io_timeout_ms),
+      guard_(kViewsToAccept, ShrinkGuardPct()) {}
 
 MdsMemberPoller::~MdsMemberPoller() { Stop(); }
 
@@ -58,18 +74,15 @@ bool MdsMemberPoller::PollOnce() {
   uint64_t epoch = 0;
   if (!Query(&ms, &epoch)) return false;  // failed RPC never clears the ring
 
-  // Empty-view guard: a *successful* empty response after we have seen real
-  // members is almost always etcd-outage recovery (all leases expired), not a
-  // genuine teardown. Don't swap in an empty ring until it persists for
-  // kEmptyViewsToAccept consecutive polls; adopting late costs nothing (an
-  // empty ring can serve no requests anyway), while adopting early causes a
-  // cluster-wide miss storm and a double remap when members re-register.
-  if (ms.empty() && seen_nonempty_ &&
-      ++consecutive_empty_ < kEmptyViewsToAccept) {
-    ++empty_view_rejected_;
+  // Adoption guard (MemberViewGuard): a *successful* response that is empty OR
+  // sheds most of the adopted baseline at once is almost always etcd-outage
+  // recovery (mass lease expiry), not a genuine teardown; adopting it remaps
+  // the whole cluster into a miss storm and remaps AGAIN when the members
+  // re-register. Suspicious views must persist for kViewsToAccept polls.
+  // Rejecting must not advance the epoch — the eventual adoption of the same
+  // etcd revision would otherwise be suppressed by the epoch dedup below.
+  if (!guard_.Admit(ms.size()))
     return true;  // keep the last ring; do NOT invoke on_change
-  }
-  if (!ms.empty()) { seen_nonempty_ = true; consecutive_empty_ = 0; }
 
   if (!have_epoch_ || epoch != last_epoch_) {
     last_epoch_ = epoch;
