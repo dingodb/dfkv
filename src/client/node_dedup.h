@@ -61,6 +61,14 @@ class NodeDedup {
   // DFKV_CLIENT_NODE_DEDUP=1. model_hash namespaces the segment so distinct
   // keyspaces on one host never share entries.
   static std::unique_ptr<NodeDedup> FromEnv(uint64_t model_hash);
+  // The env-derived segment name. The shm LAYOUT VERSION is part of the name:
+  // a layout change must never collide with a segment an older lib left
+  // behind — v1.23.0 shipped a layout bump behind the same name, the header
+  // check "safely" refused the stale segment, and the feature silently
+  // disabled itself across the whole upgrade (canary re-measured 8x). The
+  // header magic stays as a backstop only. Exposed so tests clean up the
+  // exact segment FromEnv would use.
+  static std::string EnvSegmentName(uint64_t model_hash);
   // Opens (or creates) the shm segment. Returns nullptr on any failure — the
   // caller just runs without dedup. A parameter mismatch with an existing
   // segment also returns nullptr (never reinterpret another config's layout).

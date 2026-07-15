@@ -224,3 +224,12 @@ TEST(NodeDedup, ExistRendezvousBothAnswers) {
   std::string dst(4096, '\0');
   EXPECT_EQ(a->Claim(K(9), dst.size(), &dst[0]), NodeDedup::Role::kFetch);
 }
+
+TEST(NodeDedup, EnvSegmentNameCarriesLayoutVersion) {
+  // A layout bump must land in a FRESH segment name: v1.23.0 bumped the header
+  // magic behind the same name, the mismatch check refused the stale v1.22
+  // segment, and the feature silently disabled itself fleet-wide on upgrade.
+  const std::string nm = NodeDedup::EnvSegmentName(0xABCD);
+  EXPECT_NE(nm.find("/dfkv-dedup-v2-"), std::string::npos) << nm;
+  EXPECT_NE(nm.find("000000000000abcd"), std::string::npos) << nm;
+}

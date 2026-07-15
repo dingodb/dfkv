@@ -66,6 +66,19 @@ uint64_t NodeDedup::NowMs() {
       std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+std::string NodeDedup::EnvSegmentName(uint64_t model_hash) {
+  char name[128];
+  // Layout version FIRST: a layout bump gets a fresh name and can never be
+  // silently disabled by (or corrupt) a segment an older lib left behind —
+  // old and new processes each rendezvous within their own generation during
+  // a rolling upgrade, then the old segment ages out with its processes.
+  // uid-scoped so unrelated users on one host can't share (or collide on) a
+  // segment; model_hash separates keyspaces (same salting as the block keys).
+  std::snprintf(name, sizeof(name), "/dfkv-dedup-v2-%u-%016llx", ::getuid(),
+                static_cast<unsigned long long>(model_hash));
+  return name;
+}
+
 std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t model_hash) {
   const char* on = std::getenv("DFKV_CLIENT_NODE_DEDUP");
   if (!on || std::strcmp(on, "1") != 0) return nullptr;
@@ -75,12 +88,7 @@ std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t model_hash) {
   o.wait_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_WAIT_MS", 500));
   o.takeover_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TAKEOVER_MS", 2000));
   o.ttl_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TTL_MS", 5000));
-  char name[128];
-  // uid-scoped so unrelated users on one host can't share (or collide on) a
-  // segment; model_hash separates keyspaces (same salting as the block keys).
-  std::snprintf(name, sizeof(name), "/dfkv-dedup-%u-%016llx", ::getuid(),
-                static_cast<unsigned long long>(model_hash));
-  o.name = name;
+  o.name = EnvSegmentName(model_hash);
   return Open(o);
 }
 

@@ -5,6 +5,7 @@
 // no RDMA device is present. Built only when DFKV_WITH_RDMA is defined. Run under
 // ThreadSanitizer to exercise the worker-pool / QP concurrency.
 #include "client/kv_client.h"
+#include "client/node_dedup.h"
 #include "client/key_map.h"
 #include "cache/kv_node_server.h"
 #include "cache/rdma_server.h"
@@ -191,10 +192,8 @@ TEST(RdmaLoopback, BatchPutOversizedFailsOnlyOffender) {
 // server — server-side completions stay ~flat while the data stays correct.
 TEST(RdmaLoopback, NodeDedupCollapsesSameHostGets) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  char nm[128];
-  std::snprintf(nm, sizeof(nm), "/dfkv-dedup-%u-%016llx",
-                ::getuid(), static_cast<unsigned long long>(SelfHdr().model_hash));
-  ::shm_unlink(nm);
+  const std::string nm = NodeDedup::EnvSegmentName(SelfHdr().model_hash);
+  ::shm_unlink(nm.c_str());
   ::setenv("DFKV_CLIENT_NODE_DEDUP", "1", 1);
   {
     RdmaNode node("ndd");
@@ -231,7 +230,7 @@ TEST(RdmaLoopback, NodeDedupCollapsesSameHostGets) {
         << " completions); rendezvous not deduplicating";
   }
   ::unsetenv("DFKV_CLIENT_NODE_DEDUP");
-  ::shm_unlink(nm);
+  ::shm_unlink(nm.c_str());
 }
 
 TEST(RdmaLoopback, PutGetExistMissOverRdma) {
