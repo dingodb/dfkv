@@ -459,24 +459,57 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
         ++submitted;
       }
       if (submitted) {
-        int rc = io_uring_submit(ring);
+        // io_uring_submit returns how many SQEs the kernel actually consumed.
+        // On a short submit (rc < submitted, or rc < 0) the tail SQEs stay
+        // queued in the SQ and would be pushed by the NEXT batch's submit —
+        // by then their iovecs point at arena slots this flush has released.
+        // Likewise, a CQE left unreaped here would be handed to the next batch
+        // under a same-range user_data index and could mark an unwritten item
+        // io_ok (a stale/short slot then serves reads). Invariant: a batch
+        // either fully reaps the completions it submitted, or the ring is
+        // retired with them; nothing may leak across batches.
+        const int rc = io_uring_submit(ring);
+        const size_t expect = rc > 0 ? static_cast<size_t>(rc) : 0;
         size_t done = 0;
-        while (rc > 0 && done < submitted) {
+        bool reap_ok = true;
+        while (done < expect) {
           io_uring_cqe* cqe = nullptr;
-          if (io_uring_wait_cqe(ring, &cqe) != 0) break;
-          const size_t i = static_cast<size_t>(reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe)));
-          const auto& it = items[i];
-          const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
-          if (i < N && cqe->res == static_cast<int>(alen)) st[i].io_ok = true;
+          const int wrc = io_uring_wait_cqe(ring, &cqe);
+          if (wrc == -EINTR) continue;         // signal: just retry the wait
+          if (wrc != 0) { reap_ok = false; break; }
+          // Bounds-check the completion's index BEFORE touching items[i]: a
+          // corrupt/foreign user_data must not become an out-of-bounds read.
+          const size_t i = static_cast<size_t>(
+              reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe)));
+          if (i < N && st[i].active && st[i].direct) {
+            const auto& it = items[i];
+            const size_t alen = (it.len + 4095) & ~static_cast<size_t>(4095);
+            if (cqe->res == static_cast<int>(alen)) st[i].io_ok = true;
+          }
           io_uring_cqe_seen(ring, cqe);
           ++done;
         }
+        if (!reap_ok || expect != submitted) {
+          // Unreaped CQEs or unsubmitted SQEs remain: retire the ring so they
+          // die with it; the next batch re-inits a fresh one. The affected
+          // items keep io_ok=false and are rewritten by the sequential path
+          // below (their slots are exclusively owned by this flush, so the
+          // rewrite is idempotent).
+          io_uring_queue_exit(ring);
+          delete ring;
+          uring_w_ = nullptr;
+        }
         did_uring = true;
-        uring_write_batches_.fetch_add(1, std::memory_order_relaxed);
-        batched_writes_.fetch_add(submitted, std::memory_order_relaxed);
-        // A submitted-but-failed (or unsubmitted, SQ-full) item keeps
-        // io_ok=false and falls through to the sequential path below, which
-        // retries it once (direct first, then the buffered fallback inside).
+        size_t batch_ok = 0;
+        for (size_t i = 0; i < N; ++i)
+          if (st[i].active && st[i].io_ok) ++batch_ok;
+        if (batch_ok) {
+          uring_write_batches_.fetch_add(1, std::memory_order_relaxed);
+          // Count only CQE-confirmed writes: submitted-but-failed items fall
+          // through to the sequential path and are tallied there (previously
+          // they were double-counted as both batched and dio-fallback).
+          batched_writes_.fetch_add(batch_ok, std::memory_order_relaxed);
+        }
       }
     }
   }

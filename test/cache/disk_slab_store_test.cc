@@ -10,6 +10,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -515,3 +517,46 @@ TEST_F(DiskSlabTest, CacheDirectBatchEvictsUnderPressure) {
   EXPECT_EQ(s.Count(), 8u);
   for (int i = 0; i < 4; ++i) EXPECT_TRUE(s.IsCached(K(100 + i)));
 }
+
+#ifdef DFKV_WITH_URING
+// batched_writes must count CQE-confirmed writes exactly: on a healthy fs a
+// fully-successful uring batch tallies every item once (previously the counter
+// tallied *submitted* items, so a submitted-but-failed write was counted as
+// batched AND again by the sequential fallback it fell through to).
+TEST_F(DiskSlabTest, UringBatchCountsOnlyConfirmedWrites) {
+  auto opts = Opts(1 << 20, 1 << 20, 4096);
+  opts.direct_writes = true;
+  bool ok = false;
+  DiskSlabStore s(opts, &ok);
+  ASSERT_TRUE(ok);
+  if (!s.DirectWritesActive()) GTEST_SKIP() << "fs rejected O_DIRECT (tmpfs)";
+  // The uring one-submit path takes only page-aligned payloads (unaligned data
+  // rides the buffered fallback), so hand it 4 KiB-aligned page-multiple items
+  // exactly like RamTier arena slots.
+  constexpr uint64_t N = 8;
+  constexpr size_t kLen = 4096;
+  std::vector<void*> bufs(N);
+  std::vector<DiskSlabStore::CacheBatchItem> items;
+  for (uint64_t i = 0; i < N; ++i) {
+    ASSERT_EQ(posix_memalign(&bufs[i], 4096, kLen), 0);
+    std::memset(bufs[i], static_cast<int>('A' + i), kLen);
+    items.push_back({K(700 + i), static_cast<char*>(bufs[i]), kLen, kLen});
+  }
+  auto sts = s.CacheDirectBatch(items);
+  for (auto st : sts) ASSERT_EQ(st, Status::kOk);
+  const auto stats = s.GetStats();
+  if (stats.uring_write_batches == 0) {
+    for (auto* b : bufs) free(b);
+    GTEST_SKIP() << "uring path not taken (env-disabled or init fallback)";
+  }
+  EXPECT_EQ(stats.uring_write_batches, 1u);
+  EXPECT_EQ(stats.batched_writes, N);
+  EXPECT_EQ(stats.dio_write_fallbacks, 0u);
+  for (uint64_t i = 0; i < N; ++i) {
+    std::string out;
+    ASSERT_EQ(s.Range(K(700 + i), 0, kLen, &out), Status::kOk) << i;
+    EXPECT_EQ(out, std::string(kLen, static_cast<char>('A' + i))) << i;
+  }
+  for (auto* b : bufs) free(b);
+}
+#endif  // DFKV_WITH_URING
