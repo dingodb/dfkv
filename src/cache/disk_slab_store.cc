@@ -13,7 +13,8 @@
 #include <filesystem>
 #include <vector>
 
-#include "utils/net_util.h"  // PutU32/PutU64/GetU32/GetU64 (host-endian codec)
+#include "utils/net_util.h"
+#include "utils/thread_name.h"  // PutU32/PutU64/GetU32/GetU64 (host-endian codec)
 
 namespace fs = std::filesystem;
 
@@ -105,6 +106,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   if (ok_) Rebuild();
   if (ok_ && opt_.table_sync_ms > 0) {
     sync_thread_ = std::thread([this] {
+      NameThisThread("slab-sync");
       std::unique_lock<std::mutex> lk(sync_mu_);
       for (;;) {
         sync_cv_.wait_for(lk, std::chrono::milliseconds(opt_.table_sync_ms),
@@ -130,6 +132,7 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
 #endif
   if (ok_ && opt_.reclaim_interval_ms > 0) {
     reclaim_thread_ = std::thread([this] {
+      NameThisThread("slab-reclaim");
       std::unique_lock<std::mutex> lk(reclaim_mu_);
       for (;;) {
         reclaim_cv_.wait_for(lk, std::chrono::milliseconds(opt_.reclaim_interval_ms),

@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "utils/log.h"
+#include "utils/thread_name.h"
 #include "utils/numa_util.h"
 
 namespace dfkv {
@@ -113,10 +114,11 @@ RamTier::RamTier(Options opt, FlushFn flush)
   flushers_.reserve(nf);
   for (uint32_t i = 0; i < nf; ++i) {
     Shard& s = *shards_[i % nshards];
-    flushers_.emplace_back([this, &s] { FlushLoop(s); });
+    flushers_.emplace_back([this, &s, i] { NameThisThread("rt-flush-", i); FlushLoop(s); });
   }
   if (opt_.reclaim_interval_ms > 0) {
     reclaim_thread_ = std::thread([this] {
+      NameThisThread("rt-reclaim");
       std::unique_lock<std::mutex> lk(reclaim_mu_);
       for (;;) {
         reclaim_cv_.wait_for(lk, std::chrono::milliseconds(opt_.reclaim_interval_ms),

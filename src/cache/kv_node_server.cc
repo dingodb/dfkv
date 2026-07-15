@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "utils/net_util.h"
+#include "utils/thread_name.h"
 #include "utils/wire_limits.h"
 #include "utils/prom_escape.h"
 #include "transport/transport.h"
@@ -118,7 +119,7 @@ Status KvNodeServer::Start(int port) {
   ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&sa), &sl);
   port_ = ntohs(sa.sin_port);
   running_ = true;
-  accept_thread_ = std::thread([this] { AcceptLoop(); });
+  accept_thread_ = std::thread([this] { NameThisThread("kv-accept"); AcceptLoop(); });
   return Status::kOk;
 }
 
@@ -320,6 +321,7 @@ void KvNodeServer::AcceptLoop() {
     conn_fds_.insert(fd);
     auto done = std::make_shared<std::atomic<bool>>(false);
     conns_.push_back({std::thread([this, fd, done] {
+                        NameThisThread("kv-serve");
                         Handle(fd);
                         open_connections_.fetch_sub(1, std::memory_order_relaxed);
                         { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }

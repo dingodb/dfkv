@@ -11,6 +11,7 @@
 #include "common/membership.h"
 #include "mds/mds_proto.h"
 #include "utils/net_util.h"
+#include "utils/thread_name.h"
 #include "utils/wire_limits.h"
 #include "transport/wire.h"
 
@@ -45,7 +46,7 @@ Status MdsServer::Start(int port) {
   ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&sa), &sl);
   port_ = ntohs(sa.sin_port);
   running_ = true;
-  accept_thread_ = std::thread([this] { AcceptLoop(); });
+  accept_thread_ = std::thread([this] { NameThisThread("mds-accept"); AcceptLoop(); });
   return Status::kOk;
 }
 
@@ -116,6 +117,7 @@ void MdsServer::AcceptLoop() {
     conn_fds_.push_back(fd);
     auto done = std::make_shared<std::atomic<bool>>(false);
     conns_.push_back({std::thread([this, fd, done] {
+                        NameThisThread("mds-conn");
                         Handle(fd);
                         {
                           std::lock_guard<std::mutex> lk(conn_mu_);

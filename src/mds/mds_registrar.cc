@@ -9,6 +9,7 @@
 #include "common/status.h"
 #include "mds/mds_proto.h"
 #include "utils/net_util.h"
+#include "utils/thread_name.h"
 #include "utils/wire_limits.h"
 #include "transport/wire.h"
 
@@ -96,7 +97,7 @@ void MdsRegistrar::Loop() {
 
 void MdsRegistrar::Start() {
   if (running_.exchange(true)) return;
-  th_ = std::thread([this] { Loop(); });
+  th_ = std::thread([this] { NameThisThread(is_client_ ? "mds-reg-cli" : "mds-reg"); Loop(); });
 }
 
 void MdsRegistrar::Stop() {

@@ -16,6 +16,7 @@
 
 #include "client/key_map.h"
 #include "utils/log.h"
+#include "utils/thread_name.h"
 #include "transport/transport_factory.h"
 
 namespace dfkv {
@@ -105,7 +106,7 @@ class FanoutPool {
   void EnsureThreads(size_t want) {
     std::lock_guard<std::mutex> lk(mu_);
     while (threads_ < want && threads_ < kMaxThreads) {
-      std::thread([this] { Loop(); }).detach();
+      std::thread([this, i = threads_] { NameThisThread("kv-fan-", i); Loop(); }).detach();
       ++threads_;
     }
   }
@@ -233,7 +234,7 @@ void KVClient::StartProbe(int interval_ms) {
   if (interval_ms <= 0 || probe_running_.load(std::memory_order_relaxed)) return;
   probe_interval_ms_ = interval_ms;
   probe_running_.store(true, std::memory_order_relaxed);
-  probe_th_ = std::thread([this] { ProbeLoop(); });
+  probe_th_ = std::thread([this] { NameThisThread("kv-probe"); ProbeLoop(); });
 }
 
 void KVClient::StopProbe() {
