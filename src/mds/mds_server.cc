@@ -1,5 +1,6 @@
 #include "mds/mds_server.h"
 
+#include <cstdlib>
 #include <map>
 
 #include <netinet/in.h>
@@ -77,18 +78,41 @@ void MdsServer::ReapDoneLocked() {
 
 size_t MdsServer::live_conn_count() {
   std::lock_guard<std::mutex> lk(conn_mu_);
+  ReapDoneLocked();  // count only genuinely-live handlers, not finished-unreaped ones
   return conns_.size();
 }
 
 void MdsServer::AcceptLoop() {
+  // Silent/half-open peers must not pin a handler thread forever (Handle is a
+  // thread-per-conn long-lived loop): bound both directions, like the RDMA
+  // bootstrap does. Legit clients speak every few seconds (member poll /
+  // heartbeat), far inside the 60 s default; a timed-out ReadAll/WriteAll
+  // returns false and the handler closes the conn (the client re-dials).
+  // DFKV_MDS_IO_TIMEOUT_S tunes it (tests use 1); DFKV_MDS_MAX_CONNS caps the
+  // handler-thread count so a connect flood degrades to refused conns instead
+  // of unbounded threads.
+  long tmo_s = 60;
+  if (const char* v = std::getenv("DFKV_MDS_IO_TIMEOUT_S")) {
+    const long t = std::atol(v);
+    if (t > 0) tmo_s = t;
+  }
+  size_t max_conns = 4096;
+  if (const char* v = std::getenv("DFKV_MDS_MAX_CONNS")) {
+    const long m = std::atol(v);
+    if (m > 0) max_conns = static_cast<size_t>(m);
+  }
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) { if (!running_) break; continue; }
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    timeval tv{tmo_s, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     std::lock_guard<std::mutex> lk(conn_mu_);
     if (!running_) { ::close(fd); break; }
     ReapDoneLocked();  // join handlers that finished since the last accept
+    if (conns_.size() >= max_conns) { ::close(fd); continue; }
     conn_fds_.push_back(fd);
     auto done = std::make_shared<std::atomic<bool>>(false);
     conns_.push_back({std::thread([this, fd, done] {

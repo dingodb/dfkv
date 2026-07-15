@@ -73,8 +73,10 @@ static bool QueryClients(const std::string& mds, const std::string& group,
     if (fd < 0) continue;
     char pre[kReqPrefix];
     EncodeReq(pre, WireOp::kListClients, BlockKey{}, 0, 0, group.size());
+    // An empty group is a valid query (server-side default group): it must not
+    // short-circuit the send into a fake failure ('&&' bug — poller uses '||').
     bool ok = net::WriteAll(fd, pre, kReqPrefix) &&
-              (!group.empty() && net::WriteAll(fd, group.data(), group.size()));
+              (group.empty() || net::WriteAll(fd, group.data(), group.size()));
     std::string data;
     if (ok) {
       char rp[kRespPrefix];

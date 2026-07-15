@@ -76,6 +76,11 @@ void MetricsHttpServer::AcceptLoop() {
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) { if (!running_) break; continue; }
+    // A scrape is one short request/response; a silent peer must not pin the
+    // handler thread (Handle's recv loop otherwise blocks indefinitely).
+    timeval tv{10, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     std::lock_guard<std::mutex> lk(conn_mu_);
     if (!running_) { ::close(fd); break; }
     ReapDoneLocked();  // join finished scrape handlers (Connection: close => one per scrape)

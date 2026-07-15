@@ -39,3 +39,34 @@ TEST(ConHashWeight, EqualWeightRoughlyBalanced) {
   double ratio = static_cast<double>(std::max(a, b)) / std::min(a, b);
   EXPECT_LT(ratio, 1.3) << "a=" << a << " b=" << b;
 }
+
+TEST(ConHashWeight, HugeOrNonPositiveWeightStillOnRing) {
+  // 40 * weight used to overflow int for huge weights (keys went negative ->
+  // ZERO vnodes -> the node silently vanished from the data plane); weight <= 0
+  // had the same silent-drop effect. Both must clamp and stay routable.
+  dfkv::ConHash h;
+  h.AddNode("huge", 2000000000);
+  h.AddNode("plain", 1);
+  h.Build();
+  int hit_huge = 0;
+  for (int i = 0; i < 5000; ++i) {
+    std::string node;
+    ASSERT_TRUE(h.Lookup("key" + std::to_string(i), &node));
+    if (node == "huge") ++hit_huge;
+  }
+  EXPECT_GT(hit_huge, 0) << "huge-weight node dropped from the ring";
+
+  // Zero weight clamps up to 1: paired with an equal-share peer both nodes
+  // must take traffic (deterministic — ~50/50 split over 1000 keys).
+  dfkv::ConHash h2;
+  h2.AddNode("zero", 0);
+  h2.AddNode("plain", 1);
+  h2.Build();
+  int hit_zero = 0;
+  for (int i = 0; i < 1000; ++i) {
+    std::string node;
+    ASSERT_TRUE(h2.Lookup("key" + std::to_string(i), &node));
+    if (node == "zero") ++hit_zero;
+  }
+  EXPECT_GT(hit_zero, 0) << "zero-weight node dropped from the ring";
+}
