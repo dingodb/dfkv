@@ -26,6 +26,15 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "integration", "hicache"))  # 
 BUILD = os.environ.get("DFKV_BUILD", os.path.join(HERE, "..", "..", "build"))
 SERVER_BIN = os.path.join(BUILD, "dfkv_server")
 
+# These plugin tests are single-rank in one process, so the same-host
+# rendezvous (auto-enabled since phase 9 for mla+tp>1, which most fixtures
+# are) has no peer to dedup and only adds a persistent /dev/shm segment whose
+# published exist answers leak ACROSS tests (synthetic keys + model_hash 0 +
+# sub-second timing collide inside the TTL). Pin it off so the datapath is
+# exercised deterministically; the rendezvous has its own coverage in
+# node_dedup_test.cc. resolve_node_dedup honors this explicit env over auto.
+os.environ.setdefault("DFKV_CLIENT_NODE_DEDUP", "0")
+
 
 @contextmanager
 def _env(key, value):
