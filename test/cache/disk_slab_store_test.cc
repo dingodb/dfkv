@@ -442,7 +442,11 @@ TEST_F(DiskSlabTest, BackgroundReclaimerFreesSlotsOnFullStore) {
     ASSERT_EQ(s.Cache(K(2000 + i), v.data(), v.size()), Status::kOk);
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  EXPECT_GT(s.GetStats().reclaimed_slots, 0u) << "reclaimer never ran";
+  // The reclaimer keeps a full store writable via EITHER path: demand-driven
+  // CLOCK reclaim, or (phase 10) proactive watermark eviction that frees cold
+  // extents before the ring hits 100% — the latter now handles the common case.
+  const auto st = s.GetStats();
+  EXPECT_GT(st.reclaimed_slots + st.watermark_evictions, 0u) << "reclaimer never ran";
 }
 
 // Class rebalance regression (the "new value size retains only a sliver of its
