@@ -279,14 +279,19 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
     // Concurrent claimers can reserve TWO slots for one key when the second
     // claimer's Find() races the first's identity write (near-synchronous
     // claim loops hit that window almost every key; found live on the GPU
-    // flavor as exactly-2x server reads). Lowest probe position is canonical;
-    // a non-canonical winner releases and waits.
-    Slot* first = Find(key, kind);
-    if (first && first != mine) {
-      uint32_t st = kStateFetching;
-      mine->state.compare_exchange_strong(st, kStateEmpty,
-                                          std::memory_order_acq_rel);
-      return Role::kWait;
+    // flavor as exactly-2x server reads). Re-scan twice — immediately and
+    // after a ~1 us settle spin — and keep only the LOWEST probe position
+    // (what every waiter's Find returns); other winners release and wait.
+    for (int pass = 0; pass < 2; ++pass) {
+      Slot* first = Find(key, kind);
+      if (first && first != mine) {
+        uint32_t st = kStateFetching;
+        mine->state.compare_exchange_strong(st, kStateEmpty,
+                                            std::memory_order_acq_rel);
+        return Role::kWait;
+      }
+      if (pass == 0)
+        for (volatile int spin = 0; spin < 2000; ++spin) {}
     }
     fetches_.fetch_add(1, std::memory_order_relaxed);
     return Role::kFetch;

@@ -517,14 +517,20 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
     // second claimer's Find() raced the first's identity write (a ~100 ns
     // window that near-synchronous claim loops hit almost every key —
     // observed live as server reads of exactly 2x the uniques). Re-scan the
-    // probe window: the LOWEST probe position is canonical (Find returns it
-    // for every waiter); a non-canonical winner releases its slot and waits.
-    Slot* first = Find(key);
-    if (first && first != mine) {
-      uint32_t st = kStateFetching;
-      mine->state.compare_exchange_strong(st, kStateEmpty,
-                                          std::memory_order_acq_rel);
-      return Role::kWait;
+    // probe window TWICE — immediately, and after a ~1 us settle spin so a
+    // truly simultaneous peer's identity write has landed. The LOWEST probe
+    // position is canonical (it is what every waiter's Find returns); a
+    // non-canonical winner releases its slot and waits.
+    for (int pass = 0; pass < 2; ++pass) {
+      Slot* first = Find(key);
+      if (first && first != mine) {
+        uint32_t st = kStateFetching;
+        mine->state.compare_exchange_strong(st, kStateEmpty,
+                                            std::memory_order_acq_rel);
+        return Role::kWait;
+      }
+      if (pass == 0)
+        for (volatile int spin = 0; spin < 2000; ++spin) {}
     }
     fetches_.fetch_add(1, std::memory_order_relaxed);
     return Role::kFetch;
