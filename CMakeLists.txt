@@ -139,12 +139,22 @@ if(DFKV_BUILD_TESTS)
     get_filename_component(name ${t} NAME_WE)
     add_executable(${name} ${t})
     target_link_libraries(${name} PRIVATE dfkv_core GTest::gtest_main)
-    gtest_discover_tests(${name})
+    # node_dedup_gpu_test drives real CUDA (arenas, contexts, cross-process
+    # IPC via fork+exec). Under `ctest -j N` on the B200 gate it otherwise runs
+    # concurrently with the RDMA datapath tests, and the child of the IPC test
+    # fails opening the peer handle under that GPU contention (flaked the gate
+    # even with GPUs otherwise free). A shared RESOURCE_LOCK serializes every
+    # GPU/RDMA-touching test against each other while the rest still parallelize.
+    if(name STREQUAL "node_dedup_gpu_test")
+      gtest_discover_tests(${name} PROPERTIES RESOURCE_LOCK gpu_rdma_hw)
+    else()
+      gtest_discover_tests(${name})
+    endif()
   endforeach()
   if(DFKV_WITH_RDMA)  # exercised in CI under Soft-RoCE (rdma_rxe); skips if no device
     add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
     target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
-    gtest_discover_tests(rdma_loopback_test)
+    gtest_discover_tests(rdma_loopback_test PROPERTIES RESOURCE_LOCK gpu_rdma_hw)
     add_executable(qp_depth_negotiation_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
     target_link_libraries(qp_depth_negotiation_test PRIVATE dfkv_core GTest::gtest_main)
     gtest_discover_tests(qp_depth_negotiation_test)
