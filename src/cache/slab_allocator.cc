@@ -17,6 +17,20 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(opt) {
   if (opt_.num_extents == 0) opt_.num_extents = 1;
   extents_.assign(opt_.num_extents, ExtentMeta{});  // all kUnbound (in pool)
   unbound_ = opt_.num_extents;
+  // Cold-donor protect window. Default 0 = AUTO: the window tracks the live
+  // object count, so an extent is "cold" once the working set has fully turned
+  // over past its newest write (self-tuning across object sizes). A positive
+  // DFKV_SLAB_COLD_STEAL_WINDOW pins a fixed window; a sentinel disables the
+  // feature entirely (pre-phase-9 self-eviction-first).
+  cold_steal_enabled_ = true;
+  if (const char* w = std::getenv("DFKV_SLAB_COLD_STEAL_WINDOW")) {
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(w, &end, 10);
+    if (end != w) {
+      if (v == 0) cold_steal_enabled_ = false;  // explicit "0" disables
+      else cold_window_ = static_cast<uint64_t>(v);
+    }
+  }
 }
 
 void SlabAllocator::PushFreeLocked(Class& C, uint32_t ext, uint32_t slot) {
@@ -253,6 +267,35 @@ bool SlabAllocator::StealExtentFor(size_t cls, std::vector<std::string>* evicted
   return StealExtentLocked(static_cast<uint32_t>(best), cls, evicted);
 }
 
+bool SlabAllocator::StealColdExtentFor(size_t cls,
+                                       std::vector<std::string>* evicted) {
+  if (!cold_steal_enabled_) return false;
+  // AUTO window (cold_window_==0): the live object count — an extent is cold
+  // once the working set has fully cycled past its newest write. Fixed window
+  // when configured.
+  const uint64_t window = cold_window_ ? cold_window_ : index_.size();
+  if (window == 0 || put_seq_ <= window) return false;  // not cycled yet
+  const uint64_t cold_before = put_seq_ - window;
+  // Stalest fully-unpinned donor extent in ANOTHER class whose newest resident
+  // predates the protect window. Smallest youngest_seq = coldest.
+  int best = -1;
+  uint64_t best_seq = cold_before;  // strictly older than the window to qualify
+  for (uint32_t e = 0; e < extents_.size(); ++e) {
+    const ExtentMeta& m = extents_[e];
+    if (m.cls == kUnbound || m.cls == static_cast<int>(cls)) continue;
+    if (m.pinned != 0) continue;
+    if (m.residents.empty()) continue;  // pooled/empty handled elsewhere
+    // No stripe-width floor here: a donor this cold (youngest older than a full
+    // working-set cycle) is by definition not being actively written, so fully
+    // reclaiming it is the intent — that stale data is exactly what should go.
+    if (m.youngest_seq < best_seq) { best = static_cast<int>(e); best_seq = m.youngest_seq; }
+  }
+  if (best < 0) return false;
+  if (!StealExtentLocked(static_cast<uint32_t>(best), cls, evicted)) return false;
+  ++cold_steals_;
+  return true;
+}
+
 bool SlabAllocator::StealExtentLocked(uint32_t E, size_t target_cls,
                                       std::vector<std::string>* evicted) {
   ExtentMeta& m = extents_[E];
@@ -278,6 +321,7 @@ bool SlabAllocator::StealExtentLocked(uint32_t E, size_t target_cls,
     m.total_slots = 0;
     m.free_slots = 0;
     m.pinned = 0;
+    m.youngest_seq = 0;  // fresh recency once re-bound (residents restamp it)
     ++unbound_;
   }
   ++steals_;
@@ -332,6 +376,13 @@ bool SlabAllocator::Put(const std::string& key, size_t len, SlotRef* out,
     if (C.bound_extents < kStripeWays &&
         StealExtentFor(cls, evicted, /*min_donor_extents=*/kStripeWays))
       continue;
+    // Cross-class eviction of globally-cold data BEFORE self-eviction: a
+    // single-size-class working set that fills the ring would otherwise evict
+    // its own just-written pages every Put (CLOCK degrades to FIFO), while
+    // stale OTHER-class extents sit untouched — measured as a 0% hot-round hit
+    // rate once the pool filled. Reclaim a cold donor extent instead when one
+    // exists; else fall back to self-eviction, then any-donor steal.
+    if (StealColdExtentFor(cls, evicted)) continue;
     if (EvictOneFrom(cls, evicted)) continue;
     if (StealExtentFor(cls, evicted)) continue;
     return false;  // nothing to free: all candidate slots are pinned
@@ -345,6 +396,7 @@ bool SlabAllocator::Put(const std::string& key, size_t len, SlotRef* out,
   e.ref.offset = static_cast<uint64_t>(got.slot) * classes_[cls]->slot_size;
   e.refs = 0;
   e.referenced = false;
+  e.put_seq = ++put_seq_;
   Class& C = *classes_[cls];
   C.ring.push_front(key);
   e.ring_it = C.ring.begin();
@@ -353,6 +405,8 @@ bool SlabAllocator::Put(const std::string& key, size_t len, SlotRef* out,
   used_bytes_ += e.ref.slot_size;
   auto res = index_.emplace(key, std::move(e));
   ExtentMeta& m = extents_[got.extent];
+  if (res.first->second.put_seq > m.youngest_seq)
+    m.youngest_seq = res.first->second.put_seq;
   m.residents.push_front(&res.first->first);
   res.first->second.ext_it = m.residents.begin();
   if (out) *out = res.first->second.ref;
@@ -477,6 +531,10 @@ uint64_t SlabAllocator::Evictions() const {
 uint64_t SlabAllocator::Steals() const {
   std::lock_guard<std::mutex> lk(mu_);
   return steals_;
+}
+uint64_t SlabAllocator::ColdSteals() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return cold_steals_;
 }
 uint64_t SlabAllocator::ExtentReturns() const {
   std::lock_guard<std::mutex> lk(mu_);
