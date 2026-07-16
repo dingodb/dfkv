@@ -160,6 +160,17 @@ class SlabAllocator {
   uint64_t Evictions() const;
   uint64_t Steals() const;          // cross-class extent steals (capacity churn signal)
   uint64_t ColdSteals() const;      // steals of globally-cold donor extents (phase 9)
+  uint64_t WatermarkEvictions() const;  // extents freed by proactive watermark eviction
+  // Phase 10: proactive watermark eviction. While used_bytes exceeds
+  // target_bytes, free the GLOBALLY-COLDEST fully-unpinned extent (min
+  // youngest_seq across all classes) back to the pool, appending its residents
+  // to *evicted. Bounded to max_extents freed per call (the reclaimer runs it
+  // every tick) so the store lock is never held long. Returns extents freed.
+  // Keeps headroom AHEAD of demand so a write burst never has to synchronously
+  // self-evict on a full ring (the phase-8 0%-hit cliff). Unlike the
+  // demand-driven grow/reclaim, this is size-driven and class-agnostic.
+  size_t EvictColdToTarget(uint64_t target_bytes, size_t max_extents,
+                           std::vector<std::string>* evicted);
   uint64_t ExtentReturns() const;   // fully-free extents unbound back to the pool
   size_t ClassCount() const;
   uint32_t BoundExtents() const;    // extents currently carved to a class
@@ -257,6 +268,7 @@ class SlabAllocator {
   uint64_t evictions_ = 0;
   uint64_t steals_ = 0;
   uint64_t cold_steals_ = 0;  // steals of globally-cold donor extents (phase 9)
+  uint64_t watermark_evictions_ = 0;  // extents freed by proactive watermark eviction
   uint64_t extent_returns_ = 0;
   uint64_t put_seq_ = 0;      // monotonic Put counter (recency clock)
   // Cold-donor protect window in puts. 0 = AUTO (tracks live object count at

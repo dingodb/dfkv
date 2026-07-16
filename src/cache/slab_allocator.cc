@@ -296,6 +296,39 @@ bool SlabAllocator::StealColdExtentFor(size_t cls,
   return true;
 }
 
+size_t SlabAllocator::EvictColdToTarget(uint64_t target_bytes, size_t max_extents,
+                                        std::vector<std::string>* evicted) {
+  std::lock_guard<std::mutex> lk(mu_);
+  size_t freed = 0;
+  while (used_bytes_ > target_bytes && freed < max_extents) {
+    // Globally-coldest fully-unpinned extent (min youngest_seq across ALL
+    // classes) — proactive, class-agnostic: reclaim the stalest data first so
+    // headroom is kept ahead of demand and a burst never hits a full ring.
+    int best = -1;
+    uint64_t best_seq = std::numeric_limits<uint64_t>::max();
+    for (uint32_t e = 0; e < extents_.size(); ++e) {
+      const ExtentMeta& m = extents_[e];
+      if (m.cls == kUnbound || m.pinned != 0 || m.residents.empty()) continue;
+      if (m.youngest_seq < best_seq) { best = static_cast<int>(e); best_seq = m.youngest_seq; }
+    }
+    if (best < 0) break;  // every non-empty extent is pinned: nothing to free
+    // Free every resident of the coldest extent (FreeSlotLocked returns it to
+    // the pool once fully free, if its class keeps its striping width).
+    ExtentMeta& m = extents_[static_cast<uint32_t>(best)];
+    while (!m.residents.empty()) {
+      const std::string victim = *m.residents.front();
+      auto it = index_.find(victim);
+      if (it == index_.end()) { m.residents.pop_front(); continue; }  // defensive
+      FreeSlotLocked(victim, it->second);
+      evicted->push_back(victim);
+      ++evictions_;
+    }
+    ++watermark_evictions_;
+    ++freed;
+  }
+  return freed;
+}
+
 bool SlabAllocator::StealExtentLocked(uint32_t E, size_t target_cls,
                                       std::vector<std::string>* evicted) {
   ExtentMeta& m = extents_[E];
@@ -535,6 +568,10 @@ uint64_t SlabAllocator::Steals() const {
 uint64_t SlabAllocator::ColdSteals() const {
   std::lock_guard<std::mutex> lk(mu_);
   return cold_steals_;
+}
+uint64_t SlabAllocator::WatermarkEvictions() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return watermark_evictions_;
 }
 uint64_t SlabAllocator::ExtentReturns() const {
   std::lock_guard<std::mutex> lk(mu_);

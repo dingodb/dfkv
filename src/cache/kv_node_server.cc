@@ -267,6 +267,12 @@ std::string KvNodeServer::MetricsText() const {
            "slots.tbl fdatasync cycles performed", ss.table_syncs);
     metric("dfkv_slab_extent_steals_total", "counter",
            "Cross-class extent steals (class capacity churn)", ss.steals);
+    metric("dfkv_slab_cold_steals_total", "counter",
+           "Steals of globally-cold cross-class extents (full-ring self-thrash guard)",
+           ss.cold_steals);
+    metric("dfkv_slab_watermark_evictions_total", "counter",
+           "Proactive watermark extent evictions (headroom kept ahead of demand)",
+           ss.watermark_evictions);
     metric("dfkv_slab_extent_returns_total", "counter",
            "Fully-free extents returned to the shared pool", ss.extent_returns);
     metric("dfkv_slab_deferred_removes_total", "counter",

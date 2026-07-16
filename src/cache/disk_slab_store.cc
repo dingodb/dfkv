@@ -102,6 +102,23 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   };
   alloc_ = std::make_unique<SlabAllocator>(ao);
 
+  // Phase 10: proactive watermark eviction. When used bytes cross the high
+  // watermark, the reclaimer evicts globally-cold extents down to the low
+  // watermark so a write burst never hits a 100%-full ring and has to
+  // synchronously self-evict just-written pages (the phase-8 0%-hit cliff).
+  // DFKV_SLAB_EVICT_HIGH_PCT / _LOW_PCT (of capacity); high=0 disables.
+  auto env_pct = [](const char* name, unsigned dflt) -> unsigned {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return dflt;
+    long x = std::strtol(v, nullptr, 10);
+    return (x >= 0 && x <= 100) ? static_cast<unsigned>(x) : dflt;
+  };
+  const unsigned high_pct = env_pct("DFKV_SLAB_EVICT_HIGH_PCT", 92);
+  unsigned low_pct = env_pct("DFKV_SLAB_EVICT_LOW_PCT", 88);
+  if (low_pct >= high_pct && high_pct > 0) low_pct = high_pct - 1;
+  evict_high_bytes_ = high_pct ? opt_.capacity_bytes / 100 * high_pct : 0;
+  evict_low_bytes_ = opt_.capacity_bytes / 100 * low_pct;
+
   ok_ = OpenOrInit();
   if (ok_) Rebuild();
   if (ok_ && opt_.table_sync_ms > 0) {
@@ -801,6 +818,21 @@ uint64_t DiskSlabStore::EvictedBytes() const {
 // of the insert rate, capped at 1/4 of bound capacity) in bounded batches per
 // lock hold, so Put never waits behind an inline CLOCK sweep.
 void DiskSlabStore::ReclaimTick() {
+  // Proactive watermark eviction FIRST: keep global headroom so the
+  // demand-driven grow/reclaim below never runs against a full ring.
+  if (evict_high_bytes_ != 0 && alloc_->UsedBytes() > evict_high_bytes_) {
+    std::vector<std::string> evicted;
+    // Bounded per tick (kGrowExtentsPerTick) so the store lock isn't held long;
+    // the 50 ms cadence drains a sustained overflow over a few ticks.
+    alloc_->EvictColdToTarget(evict_low_bytes_, kGrowExtentsPerTick, &evicted);
+    if (!evicted.empty()) {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (const auto& ev : evicted) {
+        auto pit = payload_len_.find(ev);
+        if (pit != payload_len_.end()) { evicted_bytes_ += pit->second; payload_len_.erase(pit); }
+      }
+    }
+  }
   const auto classes = alloc_->Classes();
   if (reclaim_last_puts_.size() < classes.size())
     reclaim_last_puts_.resize(classes.size(), 0);
@@ -889,6 +921,8 @@ DiskSlabStore::Stats DiskSlabStore::GetStats() const {
   st.table_syncs = table_syncs_.load(std::memory_order_relaxed);
   st.bind_wipes = bind_wipes_.load(std::memory_order_relaxed);
   st.steals = alloc_->Steals();
+  st.cold_steals = alloc_->ColdSteals();
+  st.watermark_evictions = alloc_->WatermarkEvictions();
   st.extent_returns = alloc_->ExtentReturns();
   std::lock_guard<std::mutex> lk(mu_);
   st.deferred_removes = deferred_remove_total_;

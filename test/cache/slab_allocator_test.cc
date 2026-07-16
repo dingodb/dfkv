@@ -199,6 +199,45 @@ TEST(SlabAllocator, ColdStealDisabledFallsBackToSelfEvict) {
   ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
 }
 
+TEST(SlabAllocator, EvictColdToTargetFreesGloballyColdestFirst) {
+  // Phase 10: proactive watermark eviction. Fill the pool, then evict down to
+  // a target — the OLDEST data must go first, newest survives.
+  SlabAllocator a(Opts(4 * 4096, 8));  // 8 extents, 32 4096-slots
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 32; ++i)  // fill: k0 oldest .. k31 newest
+    ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  const uint64_t full = a.UsedBytes();
+  EXPECT_EQ(full, 32u * 4096);
+  ev.clear();
+  // Evict down to ~half. Coldest-first: the low-numbered (oldest) keys go.
+  size_t freed = a.EvictColdToTarget(full / 2, /*max_extents=*/8, &ev);
+  EXPECT_GT(freed, 0u);
+  EXPECT_LE(a.UsedBytes(), full / 2 + 4 * 4096);  // within one extent of target
+  EXPECT_GE(a.WatermarkEvictions(), 1u);
+  ASSERT_FALSE(ev.empty());
+  // Everything evicted is from the older half; the newest key survived.
+  for (const auto& k : ev) {
+    int n = std::stoi(k.substr(1));
+    EXPECT_LT(n, 32) << k;
+  }
+  EXPECT_TRUE(a.Contains("k31")) << "newest data must survive proactive eviction";
+}
+
+TEST(SlabAllocator, EvictColdToTargetRespectsPinsAndTarget) {
+  SlabAllocator a(Opts(4 * 4096, 4));  // 4 extents, 16 slots
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 16; ++i) ASSERT_TRUE(a.Put("k" + std::to_string(i), 4096, &r, &ev));
+  ASSERT_TRUE(a.Pin("k0"));  // pins k0's whole extent against eviction
+  ev.clear();
+  const uint64_t used0 = a.UsedBytes();
+  // Target 0 would want to evict everything, but pinned extents can't be freed.
+  a.EvictColdToTarget(0, /*max_extents=*/4, &ev);
+  EXPECT_TRUE(a.Contains("k0")) << "pinned key never evicted";
+  EXPECT_LT(a.UsedBytes(), used0) << "some cold extents freed";
+}
+
 TEST(SlabAllocator, OversizeValueRejected) {
   SlabAllocator a(Opts(4096, 2));  // extent holds one 4096 slot
   std::vector<std::string> ev;

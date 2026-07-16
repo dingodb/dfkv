@@ -75,6 +75,8 @@ class DiskSlabStore : public StoreEngine {
     uint64_t table_syncs = 0;          // fdatasync cycles actually performed
     uint64_t bind_wipes = 0;           // extent table regions wiped on (re)bind
     uint64_t steals = 0;               // allocator cross-class extent steals
+    uint64_t cold_steals = 0;          // steals of globally-cold donor extents (phase 9)
+    uint64_t watermark_evictions = 0;  // proactive watermark extent evictions (phase 10)
     uint64_t extent_returns = 0;       // fully-free extents returned to the pool
     uint64_t deferred_removes = 0;     // Removes deferred behind in-flight I/O
     uint64_t inflight = 0;             // keys with an unlocked read/write in flight
@@ -218,6 +220,8 @@ class DiskSlabStore : public StoreEngine {
   // The batched-write submission ring is thread_local (see disk_slab_store.cc):
   // one per flush worker, no shared lock across the blocking CQE wait.
   std::vector<uint64_t> reclaim_last_puts_;  // reclaim-thread-local puts snapshot
+  uint64_t evict_high_bytes_ = 0;  // used > this -> proactive cold eviction (0=off)
+  uint64_t evict_low_bytes_ = 0;   // ... down to this
   std::thread reclaim_thread_;
   std::condition_variable reclaim_cv_;
   std::mutex reclaim_mu_;
