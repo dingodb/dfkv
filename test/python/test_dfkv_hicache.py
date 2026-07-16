@@ -1125,5 +1125,99 @@ class TestNodeDedupDefaults(unittest.TestCase):
         self.assertEqual(self._r(1, None, False, 1), ("1", False))
 
 
+class PutRetryTest(unittest.TestCase):
+    """_put_flat single-retry of transiently failed puts (R1 finding,
+    2026-07-17): under a cold-round write burst ~0.1% of batch_put keys fail;
+    SGLang's backup bookkeeping ignores per-page False, so an unretried
+    failure becomes a phantom "backed" page the hot round cannot retrieve.
+    One delayed retry recovers the transient portion; keys that keep failing
+    stay False (the honest result is unchanged)."""
+    PAGE_SIZE = 64
+    PAGE_BYTES = 4096
+
+    def _fake_lib(self, fail_first_call_last_n=0, fail_always_keys=()):
+        calls = {"put": [], "exist": 0}
+
+        class _FakeLib:
+            def __init__(self):
+                self.dfkv_open = lambda *a, **k: ctypes.c_void_p(0xBEEF)
+                self.dfkv_set_batch_concurrency = lambda *a, **k: 0
+                self.dfkv_transport_mode = lambda *a, **k: b"tcp"
+                self.dfkv_close = lambda *a, **k: None
+                self.dfkv_version = lambda *a, **k: b"1.27.0"
+                self.dfkv_batch_exist = self._exist
+                self.dfkv_batch_put = self._put
+
+            def _exist(self, h, karr, n, out):
+                calls["exist"] += 1
+                for i in range(n):
+                    out[i] = 0  # nothing in L3 yet: all keys proceed to put
+                return 0
+
+            def _put(self, h, karr, parr, sarr, n, out):
+                keys = [karr[i].decode() for i in range(n)]
+                calls["put"].append(keys)
+                first = len(calls["put"]) == 1
+                for i, k in enumerate(keys):
+                    if k in fail_always_keys:
+                        out[i] = 0
+                    elif first and i >= n - fail_first_call_last_n:
+                        out[i] = 0  # transient burst failure
+                    else:
+                        out[i] = 1
+                return 0
+
+        return _FakeLib(), calls
+
+    def _plugin(self, fake):
+        os.environ["DFKV_CLIENT_NODE_DEDUP"] = "0"
+        cfg = HiCacheStorageConfig(
+            tp_rank=0, tp_size=8, is_mla_model=True,
+            is_page_first_layout=False, model_name="glm-retry",
+            extra_config={
+                "members": "n0=127.0.0.1:1", "model_hash": 0x51,
+                "dtype_tag": 0x46384534, "page_size": self.PAGE_SIZE,
+                "layer_num": 78, "head_num": 1, "head_dim": 576,
+                "interface_v1": 1,
+            })
+        with patch.object(dfkv_hicache, "_load_lib", return_value=fake):
+            st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st.register_mem_pool_host(FakeMlaPool(8, self.PAGE_BYTES,
+                                              self.PAGE_SIZE))
+        return st
+
+    def _set(self, st, npages):
+        keys = [f"k{i}" for i in range(npages)]
+        idx = list(range(npages * self.PAGE_SIZE))
+        return st.batch_set_v1(keys, idx)
+
+    def test_transient_failures_recovered_by_retry(self):
+        fake, calls = self._fake_lib(fail_first_call_last_n=3)
+        st = self._plugin(fake)
+        res = self._set(st, 8)
+        self.assertEqual(res, [True] * 8)
+        self.assertEqual(len(calls["put"]), 2)          # initial + one retry
+        self.assertEqual(len(calls["put"][1]), 3)       # only failed keys retried
+        self.assertEqual(st._put_retry_recovered, 3)
+
+    def test_persistent_failures_stay_false(self):
+        # MLA sub-key = "<model>/<page_hash>_k"; k0 fails on both attempts.
+        fake, calls = self._fake_lib(fail_always_keys={"glm-retry/k0_k"})
+        st = self._plugin(fake)
+        res = self._set(st, 4)
+        self.assertEqual(res, [False, True, True, True])
+        self.assertEqual(len(calls["put"]), 2)          # retry attempted once
+        self.assertEqual(calls["put"][1], ["glm-retry/k0_k"])
+        self.assertEqual(st._put_retry_recovered, 0)
+
+    def test_no_retry_when_all_succeed(self):
+        fake, calls = self._fake_lib()
+        st = self._plugin(fake)
+        res = self._set(st, 8)
+        self.assertEqual(res, [True] * 8)
+        self.assertEqual(len(calls["put"]), 1)          # no second call
+        self.assertEqual(st._put_retry_recovered, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

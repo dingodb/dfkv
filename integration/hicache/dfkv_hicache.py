@@ -281,6 +281,7 @@ class DfkvHiCache(HiCacheStorage):
             self._backup_exist_gate = _truthy(
                 cfg.get("backup_exist_gate",
                         os.environ.get("DFKV_BACKUP_EXIST_GATE", "1")))
+            self._put_retry_recovered = 0  # last _put_flat's retry recoveries
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
             flags = _FLAG_IS_MLA if self.is_mla else 0
@@ -587,6 +588,8 @@ class DfkvHiCache(HiCacheStorage):
             dur = time.perf_counter() - t0
             res = self._fold(flat, n, sub)
             r.result = f"ok {sum(res)}/{n}"
+            if self._put_retry_recovered:
+                r.result += f" retry_ok={self._put_retry_recovered}"
             if _sp:
                 _sp.hits = sum(res); _sp.bytes = sum(ss)
             self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=sum(ss), seconds=dur)
@@ -663,27 +666,44 @@ class DfkvHiCache(HiCacheStorage):
         return 1 if self.is_mla else 2
 
     def _put_flat(self, sks, sp, ss) -> List[bool]:
-        """batch_put with the phase-9 exist gate: sub-objects already in L3
-        are reported stored without rewriting. Falls back to a straight put
-        when the gate is off or everything is missing (cold path unchanged
-        except one exist round-trip)."""
-        if self._backup_exist_gate and sks:
+        """batch_put with the phase-9 exist gate (sub-objects already in L3
+        are reported stored without rewriting) and a single retry of failed
+        keys. Under a cold-round write burst ~0.1% of puts fail transiently,
+        and SGLang's backup bookkeeping does not consume per-page failures —
+        an unretried miss becomes a phantom "backed" page that the hot round
+        then fails to retrieve (R1 finding, 2026-07-17). The burst is
+        momentary, so one delayed retry recovers almost all of them; keys
+        still failing stay False (honest result, as before)."""
+        self._put_retry_recovered = 0
+        if not sks:
+            return []
+        if self._backup_exist_gate:
             present = list(self._batch_exist_flat(sks))
             todo = [i for i, p in enumerate(present) if not p]
             if not todo:
                 return [True] * len(sks)
-            if len(todo) < len(sks):
-                karr, parr, sarr, out, _kb = _arrays(
-                    [sks[i] for i in todo], [sp[i] for i in todo],
-                    [ss[i] for i in todo])
-                self._lib.dfkv_batch_put(self._h, karr, parr, sarr,
-                                         len(todo), out)
-                for m, i in enumerate(todo):
-                    present[i] = out[m] == 1
-                return present
-        karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
-        self._lib.dfkv_batch_put(self._h, karr, parr, sarr, len(sks), out)
-        return [out[i] == 1 for i in range(len(sks))]
+        else:
+            present = [False] * len(sks)
+            todo = list(range(len(sks)))
+        for attempt in (0, 1):
+            if not todo:
+                break
+            if attempt:
+                time.sleep(0.01)  # let the write burst drain first
+            karr, parr, sarr, out, _kb = _arrays(
+                [sks[i] for i in todo], [sp[i] for i in todo],
+                [ss[i] for i in todo])
+            self._lib.dfkv_batch_put(self._h, karr, parr, sarr,
+                                     len(todo), out)
+            failed = []
+            for m, i in enumerate(todo):
+                present[i] = out[m] == 1
+                if not present[i]:
+                    failed.append(i)
+                elif attempt:
+                    self._put_retry_recovered += 1
+            todo = failed
+        return present
 
     def _v2_io(self, transfers, putting):
         results = {}
@@ -723,6 +743,8 @@ class DfkvHiCache(HiCacheStorage):
                            lambda: f"{self._alog_tag} {_fmt_pools(transfers)}") as r:
             res = self._v2_io(transfers, putting=True)
             r.result = _fmt_pool_results(res)
+            if self._put_retry_recovered:
+                r.result += f" retry_ok={self._put_retry_recovered}"
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in res.values())
             return res
