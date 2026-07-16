@@ -183,8 +183,12 @@ class RamTier {
   // that a batch's slots stay flush-pinned only briefly.
   static constexpr size_t kFlushBatchMax = 16;
   // Send-pin tokens encode their shard in the low bits so Release() can route
-  // without a global map. 4 bits = up to 16 shards.
-  static constexpr int kTokenShardBits = 4;
+  // without a global map. 6 bits = up to 64 shards (raised from 4/16 in phase
+  // 10: a clean GET scaling sweep peaked at 8 threads with the default 8 shards
+  // then DEGRADED — the per-shard lock is the >8-connection concurrency ceiling
+  // for both read and write. Raising the cap lets read/write-heavy multi-client
+  // deployments set DFKV_RAM_TIER_SHARDS past 16; the default stays 8).
+  static constexpr int kTokenShardBits = 6;
   static constexpr size_t kMaxShards = 1u << kTokenShardBits;
   void ReclaimTick(Shard& s, size_t shard_idx);
   // Rebalance rate cap: extents moved per tick per hot class (32 MiB default
