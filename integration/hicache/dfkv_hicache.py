@@ -273,6 +273,14 @@ class DfkvHiCache(HiCacheStorage):
                       "same-host rendezvous collapses replicated L3 loads; "
                       "set node_dedup=0 or DFKV_CLIENT_NODE_DEDUP=0 to disable.",
                       file=sys.stderr, flush=True)
+            # Phase 9: exist gate on the backup path. Recomputed pages whose
+            # KV is ALREADY in L3 were re-backed wholesale (measured 485 GB
+            # per hot round on the canary — write pressure that starved the
+            # very reads the cache exists for). One batch_exist (collapsed by
+            # the rendezvous) filters them out. backup_exist_gate=0 disables.
+            self._backup_exist_gate = _truthy(
+                cfg.get("backup_exist_gate",
+                        os.environ.get("DFKV_BACKUP_EXIST_GATE", "1")))
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
             flags = _FLAG_IS_MLA if self.is_mla else 0
@@ -574,11 +582,10 @@ class DfkvHiCache(HiCacheStorage):
                 return res
             ptrs, sizes = meta
             sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
-            karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
             t0 = time.perf_counter()
-            self._lib.dfkv_batch_put(self._h, karr, parr, sarr, len(sks), out)
+            flat = self._put_flat(sks, sp, ss)
             dur = time.perf_counter() - t0
-            res = self._fold([out[i] == 1 for i in range(len(sks))], n, sub)
+            res = self._fold(flat, n, sub)
             r.result = f"ok {sum(res)}/{n}"
             if _sp:
                 _sp.hits = sum(res); _sp.bytes = sum(ss)
@@ -655,6 +662,29 @@ class DfkvHiCache(HiCacheStorage):
             return self._sub()
         return 1 if self.is_mla else 2
 
+    def _put_flat(self, sks, sp, ss) -> List[bool]:
+        """batch_put with the phase-9 exist gate: sub-objects already in L3
+        are reported stored without rewriting. Falls back to a straight put
+        when the gate is off or everything is missing (cold path unchanged
+        except one exist round-trip)."""
+        if self._backup_exist_gate and sks:
+            present = list(self._batch_exist_flat(sks))
+            todo = [i for i, p in enumerate(present) if not p]
+            if not todo:
+                return [True] * len(sks)
+            if len(todo) < len(sks):
+                karr, parr, sarr, out, _kb = _arrays(
+                    [sks[i] for i in todo], [sp[i] for i in todo],
+                    [ss[i] for i in todo])
+                self._lib.dfkv_batch_put(self._h, karr, parr, sarr,
+                                         len(todo), out)
+                for m, i in enumerate(todo):
+                    present[i] = out[m] == 1
+                return present
+        karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
+        self._lib.dfkv_batch_put(self._h, karr, parr, sarr, len(sks), out)
+        return [out[i] == 1 for i in range(len(sks))]
+
     def _v2_io(self, transfers, putting):
         results = {}
         segments = []
@@ -674,10 +704,11 @@ class DfkvHiCache(HiCacheStorage):
                 for j, sk in enumerate(self._pool_keys(name, k)):
                     sks.append(sk); sp.append(int(ptrs[i * sub + j])); ss.append(int(sizes[i * sub + j]))
             segments.append((name, len(keys), sub, start, len(sks)))
-        if sks:
+        if sks and putting:
+            flat = self._put_flat(sks, sp, ss)
+        elif sks:
             karr, parr, sarr, out, _ = _arrays(sks, sp, ss)
-            (self._lib.dfkv_batch_put if putting else self._lib.dfkv_batch_get)(
-                self._h, karr, parr, sarr, len(sks), out)
+            self._lib.dfkv_batch_get(self._h, karr, parr, sarr, len(sks), out)
             flat = [out[i] == 1 for i in range(len(sks))]
         else:
             flat = []
