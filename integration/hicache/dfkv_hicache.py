@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import time
 from typing import List, Optional
 
@@ -40,6 +41,24 @@ def _truthy(v) -> bool:
     if isinstance(v, str):
         return v.strip().lower() not in ("", "0", "false", "no", "off")
     return bool(v)
+
+
+def resolve_node_dedup(cfg_value, env_value, is_mla: bool, tp_size: int):
+    """Decide DFKV_CLIENT_NODE_DEDUP: (value_to_set | None, auto_enabled).
+
+    Precedence: explicit extra-config beats the env, the env beats the auto
+    default. The auto default enables the same-host rendezvous exactly for
+    the topology it exists for — MLA (TP-replicated KV) with tp_size > 1;
+    other topologies never rendezvous (per-rank keys differ) and are spared
+    the /dev/shm arena. Pure function so the policy is unit-testable.
+    """
+    if cfg_value is not None:
+        return ("1" if _truthy(cfg_value) else "0"), False
+    if env_value is not None:
+        return None, False  # operator's env stands as-is
+    if is_mla and tp_size > 1:
+        return "1", True
+    return None, False
 
 
 def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
@@ -236,12 +255,24 @@ class DfkvHiCache(HiCacheStorage):
             if cfg.get("rdma_numa"):
                 os.environ.setdefault("DFKV_RDMA_NUMA", "1")
             # Same-host GET rendezvous (phase 5): dedups TP-replicated L3 loads
-            # across the rank processes of one node. SAFE here because the
-            # HiCache pools are HOST memory (this connector's destinations are
-            # host KV pool pages); GPUDirect connectors must NOT enable it.
-            if _truthy(cfg.get("node_dedup",
-                               os.environ.get("DFKV_CLIENT_NODE_DEDUP", "0"))):
-                os.environ["DFKV_CLIENT_NODE_DEDUP"] = "1"
+            # across the rank processes of one node (HiCache destinations are
+            # HOST memory — the host flavor applies). Since phase 9 it is ON BY
+            # DEFAULT exactly for the topology it exists for: MLA (replicated
+            # KV) with tp_size > 1 — the measured 8x lockstep read case. Other
+            # topologies gain nothing (per-rank keys never rendezvous) and are
+            # spared the 512 MiB /dev/shm arena. Explicit settings always win:
+            # extra-config `node_dedup` beats the env, the env beats the auto
+            # default; "0" anywhere disables.
+            _dedup, _auto = resolve_node_dedup(
+                cfg.get("node_dedup"), os.environ.get("DFKV_CLIENT_NODE_DEDUP"),
+                self.is_mla, self.tp_size)
+            if _dedup is not None:
+                os.environ["DFKV_CLIENT_NODE_DEDUP"] = _dedup
+            if _auto:
+                print(f"[dfkv] node-dedup auto-enabled (mla, tp={self.tp_size}): "
+                      "same-host rendezvous collapses replicated L3 loads; "
+                      "set node_dedup=0 or DFKV_CLIENT_NODE_DEDUP=0 to disable.",
+                      file=sys.stderr, flush=True)
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
             flags = _FLAG_IS_MLA if self.is_mla else 0

@@ -872,6 +872,24 @@ class DfkvStoreWorker:
                 "dfkv connector: model_hash is 0 (shared keyspace, no "
                 "cross-model isolation). Set kv_connector_extra_config."
                 "model_hash to a per-model value in multi-model fleets.")
+        # Phase 9: same-host rendezvous ON BY DEFAULT for exactly the topology
+        # it exists for — MLA with REPLICATED KV across tp ranks (dcp/pcp
+        # shard the KV, so their per-rank keys never rendezvous). The vLLM SG
+        # data path is GPUDirect, so both flavors are defaulted: the CUDA-IPC
+        # one for payloads, the host one for exist probes. Explicit env
+        # settings ("0" included) always win over the auto default.
+        if (self.use_mla and self.tp_size > 1 and self.dcp_size <= 1
+                and getattr(self, "pcp_size", 1) <= 1):
+            if os.environ.get("DFKV_CLIENT_NODE_DEDUP") is None:
+                os.environ["DFKV_CLIENT_NODE_DEDUP"] = "1"
+                logger.info(
+                    "dfkv node-dedup auto-enabled (mla, tp=%d): same-host "
+                    "rendezvous collapses replicated L3 loads; set "
+                    "DFKV_CLIENT_NODE_DEDUP=0 to disable", self.tp_size)
+            if (os.environ.get("DFKV_CLIENT_NODE_DEDUP") == "1"
+                    and os.environ.get("DFKV_CLIENT_NODE_DEDUP_GPU") is None):
+                os.environ["DFKV_CLIENT_NODE_DEDUP_GPU"] = "1"
+
         client_kwargs = dict(
             members=extra.get("members", ""),
             mds_endpoints=mds_endpoints,
