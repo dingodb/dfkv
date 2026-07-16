@@ -212,8 +212,15 @@ size_t RdmaServer::PipelineDepth() const { return ServerDepth(); }
 bool RdmaServer::UseUringPath() const {
 #ifdef DFKV_WITH_URING
   if (!range_prep_handler_ || !range_complete_handler_) return false;
+  // Phase 10: default ON when built with io_uring. The batch-read path submits
+  // a whole completion batch's GET disk reads at QD>1 and replies in arrival
+  // order; phase-6 measured it NEUTRAL for the many-connection case (thread/
+  // window parallelism already saturates the disk) and phase-10 measured +6%
+  // on the single/few-connection deep-pipeline read-back the L3 hot path hits.
+  // Non-negative across cases, with a sync fallback on any ring/batch failure.
+  // DFKV_SERVER_URING=0 forces the legacy synchronous read loop.
   const char* e = std::getenv("DFKV_SERVER_URING");
-  return e && *e && std::strcmp(e, "0") != 0;
+  return !(e && std::strcmp(e, "0") == 0);
 #else
   return false;
 #endif

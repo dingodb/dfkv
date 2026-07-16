@@ -83,9 +83,9 @@ class RdmaServer {
     cache_direct_handler_ = std::move(h);
   }
   // Wire the async-GET prep + completion accounting hooks. Optional: the io_uring
-  // serve path is used only when BOTH are set, the binary is built with
-  // DFKV_WITH_URING, AND env DFKV_SERVER_URING=1. Otherwise the serve loop uses
-  // the existing synchronous path verbatim (zero behavior change).
+  // serve path is used when BOTH are set and the binary is built with
+  // DFKV_WITH_URING (default ON since phase 10; DFKV_SERVER_URING=0 forces the
+  // synchronous path). Otherwise the serve loop uses the sync path verbatim.
   void set_range_prep_handler(RangePrepHandler h) {
     range_prep_handler_ = std::move(h);
   }
@@ -150,9 +150,9 @@ class RdmaServer {
   void AcceptLoop();
   void Serve(int boot_fd);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
-  // Whether the io_uring async-GET serve path should be used for new conns. True
-  // only when built with DFKV_WITH_URING, env DFKV_SERVER_URING=1, and both the
-  // range prep + complete handlers are set. Decided once per connection.
+  // Whether the io_uring async-GET serve path should be used for new conns.
+  // Default ON when built with DFKV_WITH_URING and both range prep + complete
+  // handlers are set; DFKV_SERVER_URING=0 forces sync. Decided once per conn.
   bool UseUringPath() const;
 
   // A live connection: its Serve thread plus a flag the thread sets (last thing
