@@ -127,6 +127,48 @@ class FanoutPool {
 void RunParallel(size_t n, size_t workers, const std::function<void(size_t)>& fn) {
   FanoutPool::Instance().Run(n, workers, fn);
 }
+
+size_t EnvSize(const char* name, size_t dflt) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return dflt;
+  char* end = nullptr;
+  unsigned long long x = std::strtoull(v, &end, 10);
+  return (end != v && x > 0) ? static_cast<size_t>(x) : dflt;
+}
+
+// Split each per-node read group into up to N shards so multiple connections
+// read one node concurrently. A single- or few-node ring otherwise routes a
+// whole batch to ONE (node,size) group -> one worker -> one QP, where the
+// server drains it key-by-key (~7 ms/key, ~166 MB/s/conn measured on the
+// phase-8 hit-rate probe — the L3 read-back ceiling). Sharding turns that
+// into DFKV_READ_MAX_CONNS parallel streams per node. Shard target size and
+// the per-node cap are env-tunable; each shard keeps its group's (node,size)
+// key so downstream code is unchanged. Groups already at/under one shard pass
+// through untouched (wide rings keep their existing per-node parallelism).
+template <class GroupVec>
+GroupVec ShardReadGroups(GroupVec groups) {
+  static const size_t target = EnvSize("DFKV_READ_SHARD_KEYS", 16);
+  static const size_t maxc = EnvSize("DFKV_READ_MAX_CONNS", 8);
+  if (maxc <= 1) return groups;
+  GroupVec out;
+  out.reserve(groups.size());
+  for (auto& g : groups) {
+    const auto& idx = g.second;
+    size_t nsh = (idx.size() + target - 1) / target;
+    if (nsh < 1) nsh = 1;
+    if (nsh > maxc) nsh = maxc;
+    if (nsh <= 1) { out.push_back(std::move(g)); continue; }
+    const size_t per = (idx.size() + nsh - 1) / nsh;
+    for (size_t s = 0; s < idx.size(); s += per) {
+      typename GroupVec::value_type sh;
+      sh.first = g.first;
+      sh.second.assign(idx.begin() + s,
+                       idx.begin() + std::min(idx.size(), s + per));
+      out.push_back(std::move(sh));
+    }
+  }
+  return out;
+}
 }  // namespace
 
 KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
@@ -694,7 +736,7 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
     if (node.empty()) continue;
     by[{node, items[i].n}].push_back(i);
   }
-  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups(by.begin(), by.end());
+  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
   RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
     const std::string& node = groups[g].first.first;
     uint64_t now = NowMs();
@@ -827,7 +869,7 @@ std::vector<bool> KVClient::BatchGetAutoDirect(const std::vector<KvGetItem>& ite
     if (node.empty()) continue;
     by[{node, items[i].n}].push_back(i);
   }
-  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups(by.begin(), by.end());
+  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
   RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
     const std::string& node = groups[g].first.first;
     uint64_t now = NowMs();
@@ -1248,7 +1290,7 @@ std::vector<bool> KVClient::BatchGetAutoSgDirect(const std::vector<KvGetItemSg>&
     for (size_t c : items[i].caps) cap += c;
     by[{node, cap}].push_back(i);
   }
-  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups(by.begin(), by.end());
+  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
   RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
     const std::string& node = groups[g].first.first;
     uint64_t now = NowMs();
