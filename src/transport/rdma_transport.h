@@ -80,8 +80,15 @@ class RdmaTransport : public Transport {
   // force_new (set on a retry after a stale pooled conn) skips the pool and
   // bootstraps a fresh connection, so a second server-reclaimed conn can't be
   // handed back on the retry. *from_pool reports whether a pooled conn was used.
-  Conn* Acquire(const std::string& node, bool* from_pool, bool force_new = false);
-  void Release(const std::string& node, Conn* c);
+  // lane selects a POOL: kData carries payloads (Cache/Range, up to MBs),
+  // kControl carries only key-sized ops (Exist/Remove/Members). They never
+  // share a connection, so a lookup storm can't queue behind in-flight 1 MB
+  // GETs on the same QP — the hot-round exist p99 of ~800 s the phase-8
+  // hit-rate probe measured was exactly that head-of-line blocking.
+  enum class Lane { kData, kControl };
+  Conn* Acquire(const std::string& node, Lane lane, bool* from_pool,
+                bool force_new = false);
+  void Release(const std::string& node, Lane lane, Conn* c);
   void Destroy(Conn* c);
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
                    uint64_t offset, uint64_t length, const void* payload,
@@ -89,6 +96,9 @@ class RdmaTransport : public Transport {
 
   std::mutex mu_;
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
+  // Separate idle-conn pool for control-lane ops (Exist/Remove/Members), so
+  // small key-only round trips never share a QP with payload transfers.
+  std::unordered_map<std::string, std::vector<Conn*>> control_pool_;
   // Caller memory regions to register on every connection (the host KV pool).
   // Guarded by mu_; snapshotted in Acquire and registered on the connection.
   std::vector<std::pair<void*, size_t>> pools_;
