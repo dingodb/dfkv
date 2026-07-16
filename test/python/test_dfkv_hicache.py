@@ -1085,5 +1085,36 @@ class DfkvClientRegistrationTest(unittest.TestCase):
         self.assertEqual(calls["registration"], [])
 
 
+class TestNodeDedupDefaults(unittest.TestCase):
+    """resolve_node_dedup policy (phase 9): auto-on for MLA+TP>1 only, with
+    explicit extra-config > env > auto precedence."""
+
+    def _r(self, cfg, env, mla, tp):
+        from dfkv_hicache import resolve_node_dedup
+        return resolve_node_dedup(cfg, env, mla, tp)
+
+    def test_auto_enables_for_mla_tp_gt1(self):
+        self.assertEqual(self._r(None, None, True, 8), ("1", True))
+
+    def test_no_auto_for_mha(self):
+        self.assertEqual(self._r(None, None, False, 8), (None, False))
+
+    def test_no_auto_for_tp1(self):
+        self.assertEqual(self._r(None, None, True, 1), (None, False))
+
+    def test_env_beats_auto(self):
+        # operator already set it (either way): leave untouched, no auto log
+        self.assertEqual(self._r(None, "0", True, 8), (None, False))
+        self.assertEqual(self._r(None, "1", False, 1), (None, False))
+
+    def test_config_beats_env(self):
+        self.assertEqual(self._r("0", "1", True, 8), ("0", False))
+        self.assertEqual(self._r("1", "0", False, 1), ("1", False))
+
+    def test_config_truthy_forms(self):
+        self.assertEqual(self._r("off", None, True, 8), ("0", False))
+        self.assertEqual(self._r(1, None, False, 1), ("1", False))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
