@@ -154,12 +154,14 @@ RdmaTransport::~RdmaTransport() {
   std::lock_guard<std::mutex> lk(mu_);
   for (auto& [node, cs] : pool_)
     for (Conn* c : cs) Destroy(c);
+  for (auto& [node, cs] : control_pool_)
+    for (Conn* c : cs) Destroy(c);
 }
 
 void RdmaTransport::Destroy(Conn* c) { delete c; }  // RcEndpoint dtor tears down QP/MRs
 
-RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_pool,
-                                            bool force_new) {
+RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, Lane lane,
+                                            bool* from_pool, bool force_new) {
   std::vector<std::pair<void*, size_t>> pools;
   Conn* pooled = nullptr;
   {
@@ -169,8 +171,9 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
     // by the server, and the pool may hold more reclaimed conns — bootstrapping a
     // fresh one guarantees the retry isn't handed another dead conn.
     if (!force_new) {
-      auto it = pool_.find(node);
-      if (it != pool_.end() && !it->second.empty()) {
+      auto& p = (lane == Lane::kControl) ? control_pool_ : pool_;
+      auto it = p.find(node);
+      if (it != p.end() && !it->second.empty()) {
         pooled = it->second.back(); it->second.pop_back();
       }
     }
@@ -294,10 +297,10 @@ std::string RdmaTransport::MetricsText() const {
   return s;
 }
 
-void RdmaTransport::Release(const std::string& node, Conn* c) {
+void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c) {
   {
     std::lock_guard<std::mutex> lk(mu_);
-    auto& v = pool_[node];
+    auto& v = (lane == Lane::kControl ? control_pool_ : pool_)[node];
     if (v.size() < pool_max_) { v.push_back(c); return; }
   }
   Destroy(c);  // pool full -> drop (and tear down the QP/MRs) instead of growing
@@ -310,9 +313,13 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
   if (payload_len > control_cap_ - kReqPrefix) return Status::kInvalid;
   if (op == WireOp::kRange && length > control_cap_ - kRespPrefix)
     return Status::kInvalid;
+  // Key-only ops (Exist/Remove/Members) ride the control lane so a lookup
+  // storm never queues behind payload transfers; Cache/Range carry payloads.
+  const Lane lane = (op == WireOp::kCache || op == WireOp::kRange)
+                        ? Lane::kData : Lane::kControl;
   for (int attempt = 0; attempt < 2; ++attempt) {
     bool from_pool = false;
-    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    Conn* c = Acquire(node, lane, &from_pool, attempt > 0);
     if (!c) return Status::kIOError;
     rdma::RcEndpoint& ep = c->ep;
 
@@ -343,7 +350,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
       if (kRespPrefix + dlen > recv_bytes) { Destroy(c); return Status::kIOError; }
       out->assign(ep.rbuf(0) + kRespPrefix, dlen);
     }
-    Release(node, c);
+    Release(node, lane, c);
     return st;
   }
   return Status::kIOError;
@@ -391,7 +398,7 @@ std::vector<Status> RdmaTransport::CacheMany(const std::string& node,
   for (int attempt = 0; attempt < 2; ++attempt) {
     std::fill(res.begin(), res.end(), Status::kIOError);
     bool from_pool = false;
-    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    Conn* c = Acquire(node, Lane::kData, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
     const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
@@ -412,7 +419,7 @@ std::vector<Status> RdmaTransport::CacheMany(const std::string& node,
         if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
       }
     }
-    if (conn_ok) { Release(node, c); return res; }
+    if (conn_ok) { Release(node, Lane::kData, c); return res; }
     Destroy(c);
     if (from_pool) continue;  // stale pooled conn -> one fresh retry
     return res;               // fresh conn failed -> terminal
@@ -439,7 +446,7 @@ std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
     std::fill(res.begin(), res.end(), Status::kIOError);
     outs->assign(n, std::string());
     bool from_pool = false;
-    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    Conn* c = Acquire(node, Lane::kData, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
     const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
@@ -465,7 +472,7 @@ std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
         }
       }
     }
-    if (conn_ok) { Release(node, c); return res; }
+    if (conn_ok) { Release(node, Lane::kData, c); return res; }
     Destroy(c);
     if (from_pool) continue;  // stale pooled conn -> one fresh retry
     return res;               // fresh conn failed -> terminal
@@ -489,7 +496,7 @@ std::vector<Status> RdmaTransport::ExistMany(const std::string& node,
     std::fill(res.begin(), res.end(), Status::kIOError);
     std::fill(exists->begin(), exists->end(), 0);
     bool from_pool = false;
-    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    Conn* c = Acquire(node, Lane::kControl, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
     const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
@@ -511,7 +518,7 @@ std::vector<Status> RdmaTransport::ExistMany(const std::string& node,
         (*exists)[base + j] = (st == Status::kOk) ? 1 : 0;
       }
     }
-    if (conn_ok) { Release(node, c); return res; }
+    if (conn_ok) { Release(node, Lane::kControl, c); return res; }
     Destroy(c);
     if (from_pool) continue;  // stale pooled conn -> one fresh retry
     return res;               // fresh conn failed -> terminal
@@ -550,7 +557,7 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
     for (size_t i = 0; i < n; ++i) if (bad[i]) res[i] = Status::kInvalid;
     hdrs->assign(n, std::string());
     bool from_pool = false;
-    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    Conn* c = Acquire(node, Lane::kData, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
     const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
@@ -571,7 +578,7 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
         // unprocessed remainder as kInvalid so the caller's health accounting
         // does not MarkBad (cooldown) a healthy node for our own MR pressure.
         for (size_t i = base; i < n; ++i) if (!bad[i]) res[i] = Status::kInvalid;
-        Release(node, c);
+        Release(node, Lane::kData, c);
         return res;
       }
       // Scatter recv [hdr -> rbuf | payload -> caller buffer], then send the Range req.
@@ -616,7 +623,7 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
         }
       }
     }
-    if (conn_ok) { Release(node, c); return res; }
+    if (conn_ok) { Release(node, Lane::kData, c); return res; }
     Destroy(c);
     if (from_pool) continue;  // stale pooled conn -> one fresh retry
     return res;               // fresh conn failed -> terminal
@@ -646,7 +653,7 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
     std::fill(res.begin(), res.end(), Status::kIOError);
     for (size_t i = 0; i < n; ++i) if (bad[i]) res[i] = Status::kInvalid;
     bool from_pool = false;
-    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    Conn* c = Acquire(node, Lane::kData, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
     const size_t W = ep.window();  // negotiated: never exceed the server's posted recvs
@@ -670,7 +677,7 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
         // for the unprocessed remainder so health accounting does not MarkBad
         // (cooldown) a healthy node for our own MR pressure.
         for (size_t i = base; i < n; ++i) if (!bad[i]) res[i] = Status::kInvalid;
-        Release(node, c);
+        Release(node, Lane::kData, c);
         return res;
       }
       // Build [req prefix | value header] into sbuf[j], scatter-send with the
@@ -712,7 +719,7 @@ std::vector<Status> RdmaTransport::CacheFrom(const std::string& node,
         if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
       }
     }
-    if (conn_ok) { Release(node, c); return res; }
+    if (conn_ok) { Release(node, Lane::kData, c); return res; }
     Destroy(c);
     if (from_pool) continue;  // stale pooled conn -> one fresh retry
     return res;               // fresh conn failed -> terminal
@@ -733,7 +740,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
   for (int attempt = 0; attempt < 2; ++attempt) {
     std::fill(res.begin(), res.end(), Status::kIOError);
     bool from_pool = false;
-    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    Conn* c = Acquire(node, Lane::kData, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
     const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
@@ -774,7 +781,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
           if (!mrs_per[j][e]) regok = false;
         }
       }
-      if (!regok) { Release(node, c); return res; }
+      if (!regok) { Release(node, Lane::kData, c); return res; }
       size_t posted = 0;
       for (size_t j = 0; j < w && conn_ok; ++j) {
         if (bad[base + j]) continue;
@@ -816,7 +823,7 @@ std::vector<Status> RdmaTransport::CacheFromMulti(
         if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
       }
     }
-    if (conn_ok) { Release(node, c); return res; }
+    if (conn_ok) { Release(node, Lane::kData, c); return res; }
     Destroy(c);
     if (from_pool) continue;  // stale pooled conn -> one fresh retry
     return res;               // fresh conn failed -> terminal
@@ -846,7 +853,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
     hdrs->assign(n, std::string());
     if (out_lens) out_lens->assign(n, 0);
     bool from_pool = false;
-    Conn* c = Acquire(node, &from_pool, attempt > 0);
+    Conn* c = Acquire(node, Lane::kData, &from_pool, attempt > 0);
     if (!c) return res;
     rdma::RcEndpoint& ep = c->ep;
     const size_t max_payload_segs = ep.max_sge() - 1;  // SGE0 = header
@@ -882,7 +889,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
           if (!mrs_per[j][e]) regok = false;
         }
       }
-      if (!regok) { Release(node, c); return res; }
+      if (!regok) { Release(node, Lane::kData, c); return res; }
       size_t posted = 0;
       for (size_t j = 0; j < w && conn_ok; ++j) {
         if (bad[base + j]) continue;
@@ -935,7 +942,7 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
         }
       }
     }
-    if (conn_ok) { Release(node, c); return res; }
+    if (conn_ok) { Release(node, Lane::kData, c); return res; }
     Destroy(c);
     if (from_pool) continue;  // stale pooled conn -> one fresh retry
     return res;               // fresh conn failed -> terminal
