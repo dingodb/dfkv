@@ -512,7 +512,20 @@ GpuNodeDedup::Role GpuNodeDedup::ClaimSg(const BlockKey& key, const Seg* segs,
       return Role::kWait;
     }
   }
-  if (Reserve(key)) {
+  if (Slot* mine = Reserve(key)) {
+    // Concurrent lockstep claimers can reserve TWO slots for one key: the
+    // second claimer's Find() raced the first's identity write (a ~100 ns
+    // window that near-synchronous claim loops hit almost every key —
+    // observed live as server reads of exactly 2x the uniques). Re-scan the
+    // probe window: the LOWEST probe position is canonical (Find returns it
+    // for every waiter); a non-canonical winner releases its slot and waits.
+    Slot* first = Find(key);
+    if (first && first != mine) {
+      uint32_t st = kStateFetching;
+      mine->state.compare_exchange_strong(st, kStateEmpty,
+                                          std::memory_order_acq_rel);
+      return Role::kWait;
+    }
     fetches_.fetch_add(1, std::memory_order_relaxed);
     return Role::kFetch;
   }
