@@ -192,6 +192,18 @@ def build_payload(rec, snap, start_ns, now_ns):
                             "histogram": {"aggregationTemporality": 2,
                                           "dataPoints": hist_dps}})
 
+    # --- same-host rendezvous counters (dfkv_client_[gpu_]dedup_*), forwarded
+    #     under this connector's identity. The top of the hit-rate funnel: how
+    #     much of the TP-replicated L3 read load was collapsed to 1x vs fanned
+    #     out per rank. Label-free cumulative counters -> per-name OTLP sums.
+    dedup = snap.get("client_dedup") or {}
+    for cname, val in sorted(dedup.items()):
+        metrics.append({"name": cname.replace("dfkv_client_", "dfkv_connector_"),
+                        "sum": {"aggregationTemporality": 2, "isMonotonic": True,
+                                "dataPoints": [{"startTimeUnixNano": st,
+                                                "timeUnixNano": t,
+                                                "asInt": str(int(val))}]}})
+
     return {"resourceMetrics": [{
         "resource": {"attributes": res_attrs},
         "scopeMetrics": [{"scope": {"name": "dfkv.connector"}, "metrics": metrics}],

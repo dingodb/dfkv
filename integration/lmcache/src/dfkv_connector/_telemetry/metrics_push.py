@@ -98,6 +98,9 @@ class _NoopRecorder:
     def update_client_ops(self, client_ops):
         pass
 
+    def update_client_dedup(self, dedup):
+        pass
+
     def peer_latency_snapshot(self):
         return {}
 
@@ -186,6 +189,7 @@ class _Recorder:
         # connector's identity. {op: {requests,keys,hits,bytes,max,lat_sum,
         # lat_count, buckets:[(le_str, cum_count)]}}.
         self._client_ops = {}
+        self._client_dedup = {}
         self._otel = None
         self._provider = None
         self._stdlib = None
@@ -328,6 +332,11 @@ class _Recorder:
         with self._lock:
             self._client_ops = dict(client_ops)
 
+    def update_client_dedup(self, dedup: dict) -> None:
+        """Absolute same-host rendezvous counters (dfkv_client_[gpu_]dedup_*)."""
+        with self._lock:
+            self._client_dedup = dict(dedup)
+
     def peer_latency_snapshot(self) -> dict:
         with self._lock:
             return dict(self._peer)
@@ -347,6 +356,7 @@ class _Recorder:
                 "bounds": list(_HIST_BUCKETS),
                 "peer": dict(self._peer),
                 "client_ops": {o: dict(d) for o, d in self._client_ops.items()},
+                "client_dedup": dict(self._client_dedup),
             }
             for o in list(self._dur_max):
                 self._dur_max[o] = 0.0  # read-and-reset
@@ -613,6 +623,42 @@ def parse_client_ops(text: str) -> dict:
     return out
 
 
+_DEDUP_COUNTERS = (
+    "dfkv_client_dedup_hits_total",
+    "dfkv_client_dedup_fetches_total",
+    "dfkv_client_dedup_wait_hits_total",
+    "dfkv_client_dedup_wait_timeouts_total",
+    "dfkv_client_gpu_dedup_hits_total",
+    "dfkv_client_gpu_dedup_fetches_total",
+    "dfkv_client_gpu_dedup_wait_hits_total",
+    "dfkv_client_gpu_dedup_wait_timeouts_total",
+)
+
+
+def parse_client_dedup(text: str) -> dict:
+    """Extract the same-host rendezvous counters (host + GPU flavors) from the C
+    client snapshot. These have NO op= label, so parse_client_ops skips them —
+    yet they ARE the "was the L3 read collapsed to 1x or fanned out 8x" signal,
+    the top of the hit-rate funnel. {counter_name: value}, present ones only."""
+    out = {}
+    wanted = set(_DEDUP_COUNTERS)
+    for line in (text or "").splitlines():
+        if not line or line[0] == "#":
+            continue
+        sp = line.rfind(" ")
+        if sp <= 0:
+            continue
+        name = line[:sp]
+        if "{" in name:
+            continue  # dedup counters are label-free
+        if name in wanted:
+            try:
+                out[name] = float(line[sp + 1:])
+            except ValueError:
+                pass
+    return out
+
+
 class PeerLatencyPoller:
     """Sleeping daemon thread: polls the C client's metrics snapshot, computes a
     windowed avg (delta-sum / delta-count) + lifetime max per peer, AND forwards
@@ -632,6 +678,7 @@ class PeerLatencyPoller:
         # Forward the per-op metrics (computed once in C++) over OTLP, with this
         # connector's identity. Absolute/cumulative — no windowing needed.
         self._rec.update_client_ops(parse_client_ops(text))
+        self._rec.update_client_dedup(parse_client_dedup(text))
         stats = parse_peer_latency(text)
         result = {}
         for peer, d in stats.items():
