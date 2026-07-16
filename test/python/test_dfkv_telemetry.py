@@ -448,12 +448,41 @@ class ClientOpForwardTest(TelemetryTestBase):
         'dfkv_client_op_latency_seconds_count{op="exist"} 5\n'
     )
 
+    DEDUP_SNAP = (
+        'dfkv_client_dedup_hits_total 12000\n'
+        'dfkv_client_dedup_fetches_total 1600\n'
+        'dfkv_client_dedup_wait_hits_total 10400\n'
+        'dfkv_client_dedup_wait_timeouts_total 8\n'
+        'dfkv_client_gpu_dedup_hits_total 500\n'
+        'dfkv_client_op_requests_total{op="get"} 3\n'  # op-labeled: must NOT be a dedup counter
+    )
+
     def test_parse_client_ops(self):
         d = metrics.parse_client_ops(self.SNAP)
         self.assertEqual(d["put"]["keys"], 640.0)
         self.assertEqual(d["put"]["hits"], 600.0)   # keys-hits = failed writes
         self.assertEqual(d["exist"]["max"], 48.5)    # the batch_exist tail
         self.assertEqual(len(d["put"]["buckets"]), 3)
+
+    def test_parse_client_dedup(self):
+        d = metrics.parse_client_dedup(self.DEDUP_SNAP)
+        self.assertEqual(d["dfkv_client_dedup_hits_total"], 12000.0)
+        self.assertEqual(d["dfkv_client_dedup_wait_timeouts_total"], 8.0)
+        self.assertEqual(d["dfkv_client_gpu_dedup_hits_total"], 500.0)
+        # op-labeled lines must be excluded (they belong to parse_client_ops)
+        self.assertNotIn("dfkv_client_op_requests_total", d)
+
+    def test_dedup_forwarded_to_otlp(self):
+        from dfkv_telemetry import otlp_json
+        os.environ[config.ENV_METRICS_ENABLED] = "1"
+        metrics.configure({}, connector_type=config.TYPE_HICACHE, tp_rank=0, model="m")
+        rec = metrics._recorder
+        rec.update_client_dedup(metrics.parse_client_dedup(self.DEDUP_SNAP))
+        payload = otlp_json.build_payload(rec, rec.export_snapshot(), 1, 2)
+        names = {m["name"] for m in
+                 payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]}
+        self.assertIn("dfkv_connector_dedup_hits_total", names)
+        self.assertIn("dfkv_connector_gpu_dedup_hits_total", names)
 
     def test_forward_to_otlp_with_identity(self):
         from dfkv_telemetry import otlp_json
