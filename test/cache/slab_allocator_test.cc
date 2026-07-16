@@ -149,28 +149,33 @@ TEST(SlabAllocator, CrossClassStealWhenPoolEmpty) {
   EXPECT_GE(a.ClassCount(), 2u);
 }
 
+// Fill both size classes to a stable steady state where every extent is full,
+// so growth-first striping (grabs up to kStripeWays=8) can't monopolize the
+// pool: 16 extents, A(8192) takes 8 (16 keys), B(4096) takes 8 (32 keys).
+// Returns after both classes are full; put_seq = 48, A's youngest = 16.
+namespace {
+void FillTwoClassesFull(SlabAllocator& a, std::vector<std::string>& ev) {
+  SlotRef r;
+  for (int i = 0; i < 16; ++i)  // stale A: 8192, 2/extent -> 8 extents
+    ASSERT_TRUE(a.Put("stale" + std::to_string(i), 8192, &r, &ev));
+  for (int i = 0; i < 32; ++i)  // hot B: 4096, 4/extent -> 8 extents
+    ASSERT_TRUE(a.Put("hot" + std::to_string(i), 4096, &r, &ev));
+}
+}  // namespace
+
 TEST(SlabAllocator, ColdDonorStolenBeforeSelfEviction) {
-  // Phase 9: the pathology from the hit-rate probe. A stale class fills some
-  // extents, then a busy same-size working set cycles its own ring. Once the
-  // busy class has fully turned over past the stale data (the protect window),
-  // a new put must reclaim the STALE cross-class extent rather than evict the
-  // busy class's just-written pages. Fixed window via env for determinism.
-  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "6", 1);
-  SlabAllocator a(Opts(4 * 4096, 4));  // 4 extents; A(8192)=2 slots, B(4096)=4
+  // Phase 9: once the pool is full, a busy class must reclaim a globally-cold
+  // CROSS-class extent instead of self-evicting its own just-written pages.
+  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "6", 1);  // small window, determinism
+  SlabAllocator a(Opts(4 * 4096, 16));
   std::vector<std::string> ev;
   SlotRef r;
-  // Stale class A: 4 keys => 2 extents (seq 1..4), never touched again.
-  for (int i = 0; i < 4; ++i)
-    ASSERT_TRUE(a.Put("stale" + std::to_string(i), 8192, &r, &ev));
-  // Busy class B fills the remaining 2 extents (8 slots, seq 5..12).
-  for (int i = 0; i < 8; ++i)
-    ASSERT_TRUE(a.Put("hot" + std::to_string(i), 4096, &r, &ev));
-  ASSERT_EQ(a.ColdSteals(), 0u);
-  ev.clear();
-  // Keep writing B. put_seq climbs; once put_seq - 6 > 4 (stale's youngest),
-  // the stale A extent is cold and gets stolen instead of self-evicting hot.
+  FillTwoClassesFull(a, ev);
+  // Keep writing B (self-eviction would succeed). put_seq climbs past
+  // stale's youngest (16) + window (6): the stale A extent becomes cold and is
+  // stolen in preference to evicting a hot page.
   bool stole_stale = false;
-  for (int i = 8; i < 24 && !stole_stale; ++i) {
+  for (int i = 32; i < 80 && !stole_stale; ++i) {
     ev.clear();
     ASSERT_TRUE(a.Put("hot" + std::to_string(i), 4096, &r, &ev));
     for (const auto& k : ev)
@@ -183,15 +188,14 @@ TEST(SlabAllocator, ColdDonorStolenBeforeSelfEviction) {
 
 TEST(SlabAllocator, ColdStealDisabledFallsBackToSelfEvict) {
   ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "0", 1);  // disable
-  SlabAllocator a(Opts(4 * 4096, 4));
+  SlabAllocator a(Opts(4 * 4096, 16));
   std::vector<std::string> ev;
   SlotRef r;
-  for (int i = 0; i < 4; ++i)
-    ASSERT_TRUE(a.Put("stale" + std::to_string(i), 8192, &r, &ev));
-  for (int i = 0; i < 40; ++i)
+  FillTwoClassesFull(a, ev);
+  for (int i = 32; i < 96; ++i)  // busy class self-evicts its own only
     ASSERT_TRUE(a.Put("hot" + std::to_string(i), 4096, &r, &ev));
   EXPECT_EQ(a.ColdSteals(), 0u) << "disabled: never cold-steals";
-  EXPECT_TRUE(a.Contains("stale0")) << "stale data survives when disabled";
+  EXPECT_TRUE(a.Contains("stale0")) << "stale cross-class data survives";
   ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
 }
 
