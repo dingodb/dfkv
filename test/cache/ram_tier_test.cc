@@ -375,3 +375,32 @@ TEST(RamTier, ShardedLifecycleAcrossShards) {
   ::unsetenv("DFKV_RAM_TIER_SHARDS");
   ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
 }
+
+TEST(RamTier, ShardCountCanExceedLegacyCapOf16) {
+  // Phase 10: kTokenShardBits 4->6 lifts the cap 16->64 so read/write-heavy
+  // multi-connection deployments can shard past the old ceiling. 32 shards must
+  // be honored (not clamped to 16), and shard-encoded tokens still round-trip.
+  // 1 MiB extents (the floor) x 1 GiB = 1024 extents => 32 shards sustains the
+  // >=32 extents/shard rule (32*32=1024). The arena is mmap'd lazily and the
+  // test touches only ~2 MiB, so physical RAM stays tiny despite the 1 GiB size.
+  ::setenv("DFKV_RAM_TIER_EXTENT_BYTES", "1048576", 1);
+  ::setenv("DFKV_RAM_TIER_SHARDS", "32", 1);
+  FlushSink sink;
+  RamTier::Options o;
+  o.bytes = 1024ull << 20;   // 1024 x 1 MiB extents
+  o.slot_granularity = 4096;
+  o.flush_threads = 8;
+  RamTier t(o, sink.fn());
+  ASSERT_TRUE(t.ok());
+  EXPECT_EQ(t.shards(), 32u) << "32 shards must not be clamped to the old 16 cap";
+  std::string v(8000, 'y');
+  for (int i = 0; i < 256; ++i) ASSERT_TRUE(t.Put(K(5000 + i), v.data(), v.size())) << i;
+  for (int i = 0; i < 256; ++i) {
+    RamTier::Hit h;
+    ASSERT_TRUE(t.GetPrep(K(5000 + i), 0, 0, &h)) << i;  // token from a high shard
+    EXPECT_EQ(h.len, v.size());
+    t.Release(h.token);
+  }
+  ::unsetenv("DFKV_RAM_TIER_SHARDS");
+  ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
+}
