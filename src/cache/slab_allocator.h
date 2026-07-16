@@ -159,6 +159,7 @@ class SlabAllocator {
   uint64_t Capacity() const;        // num_extents * extent_bytes
   uint64_t Evictions() const;
   uint64_t Steals() const;          // cross-class extent steals (capacity churn signal)
+  uint64_t ColdSteals() const;      // steals of globally-cold donor extents (phase 9)
   uint64_t ExtentReturns() const;   // fully-free extents unbound back to the pool
   size_t ClassCount() const;
   uint32_t BoundExtents() const;    // extents currently carved to a class
@@ -171,6 +172,7 @@ class SlabAllocator {
     SlotRef ref;
     uint32_t refs = 0;                       // pin count
     bool referenced = false;                 // CLOCK bit
+    uint64_t put_seq = 0;                    // monotonic insert order (global recency)
     std::list<std::string>::iterator ring_it;  // this key's node in its class ring
     // This key's node in its extent's resident list (points at the index_ map
     // key, which is node-stable). Lets StealExtentFor enumerate one extent's
@@ -200,6 +202,10 @@ class SlabAllocator {
     uint32_t free_slots = 0; // free slots (== total when fully empty)
     uint32_t total_slots = 0;
     uint32_t pinned = 0;     // resident pinned slots in this extent (steal guard)
+    // Newest insert seq among residents (0 = empty). Only grows on insert; a
+    // free never lowers it (conservative: an extent looks no colder than it is,
+    // so cold-donor steal never over-eagerly reclaims a still-hot extent).
+    uint64_t youngest_seq = 0;
     // Keys resident in this extent (pointers into index_'s node-stable keys);
     // per-key node handle lives in Entry::ext_it. Empty iff fully free.
     std::list<const std::string*> residents;
@@ -216,6 +222,15 @@ class SlabAllocator {
   // last-resort semantics this function always had).
   bool StealExtentFor(size_t cls, std::vector<std::string>* evicted,
                       size_t min_donor_extents = 0); // rebind a full extent
+  // Cross-class eviction of GLOBALLY cold data: steal a fully-unpinned donor
+  // extent (from another class) whose newest resident predates put_seq_ minus
+  // the protect window — i.e. nothing in it has been written for ~a full pool
+  // cycle. Preferred over self-eviction so a single-size-class working set that
+  // fills the ring reclaims stale OTHER-class extents instead of cannibalizing
+  // its own just-written pages (the phase-8 hit-rate probe measured that
+  // self-thrash as a 0% hot-round hit rate once the ring was full). Returns
+  // false when no donor is cold enough — the caller then self-evicts as before.
+  bool StealColdExtentFor(size_t cls, std::vector<std::string>* evicted);
   // Shared steal core: evict extent E's residents, unbind E, re-bind a pool
   // extent to target_cls. E must be fully unpinned. With mu_ held.
   bool StealExtentLocked(uint32_t E, size_t target_cls,
@@ -241,7 +256,15 @@ class SlabAllocator {
   uint64_t used_bytes_ = 0;
   uint64_t evictions_ = 0;
   uint64_t steals_ = 0;
+  uint64_t cold_steals_ = 0;  // steals of globally-cold donor extents (phase 9)
   uint64_t extent_returns_ = 0;
+  uint64_t put_seq_ = 0;      // monotonic Put counter (recency clock)
+  // Cold-donor protect window in puts. 0 = AUTO (tracks live object count at
+  // eviction time); a positive DFKV_SLAB_COLD_STEAL_WINDOW pins it. An extent
+  // whose youngest resident predates put_seq_ - window is "globally cold" and
+  // preferred for cross-class steal over self-eviction.
+  uint64_t cold_window_ = 0;
+  bool cold_steal_enabled_ = true;  // DFKV_SLAB_COLD_STEAL_WINDOW=0 disables
 };
 
 }  // namespace dfkv

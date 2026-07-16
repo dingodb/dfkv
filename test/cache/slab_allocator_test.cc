@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <thread>
@@ -146,6 +147,52 @@ TEST(SlabAllocator, CrossClassStealWhenPoolEmpty) {
   EXPECT_FALSE(ev.empty()) << "steal evicts the stolen extent's residents";
   EXPECT_TRUE(a.Contains("b0"));
   EXPECT_GE(a.ClassCount(), 2u);
+}
+
+TEST(SlabAllocator, ColdDonorStolenBeforeSelfEviction) {
+  // Phase 9: the pathology from the hit-rate probe. A stale class fills some
+  // extents, then a busy same-size working set cycles its own ring. Once the
+  // busy class has fully turned over past the stale data (the protect window),
+  // a new put must reclaim the STALE cross-class extent rather than evict the
+  // busy class's just-written pages. Fixed window via env for determinism.
+  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "6", 1);
+  SlabAllocator a(Opts(4 * 4096, 4));  // 4 extents; A(8192)=2 slots, B(4096)=4
+  std::vector<std::string> ev;
+  SlotRef r;
+  // Stale class A: 4 keys => 2 extents (seq 1..4), never touched again.
+  for (int i = 0; i < 4; ++i)
+    ASSERT_TRUE(a.Put("stale" + std::to_string(i), 8192, &r, &ev));
+  // Busy class B fills the remaining 2 extents (8 slots, seq 5..12).
+  for (int i = 0; i < 8; ++i)
+    ASSERT_TRUE(a.Put("hot" + std::to_string(i), 4096, &r, &ev));
+  ASSERT_EQ(a.ColdSteals(), 0u);
+  ev.clear();
+  // Keep writing B. put_seq climbs; once put_seq - 6 > 4 (stale's youngest),
+  // the stale A extent is cold and gets stolen instead of self-evicting hot.
+  bool stole_stale = false;
+  for (int i = 8; i < 24 && !stole_stale; ++i) {
+    ev.clear();
+    ASSERT_TRUE(a.Put("hot" + std::to_string(i), 4096, &r, &ev));
+    for (const auto& k : ev)
+      if (k.rfind("stale", 0) == 0) stole_stale = true;
+  }
+  EXPECT_TRUE(stole_stale) << "a globally-cold cross-class extent was reclaimed";
+  EXPECT_GE(a.ColdSteals(), 1u);
+  ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+}
+
+TEST(SlabAllocator, ColdStealDisabledFallsBackToSelfEvict) {
+  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "0", 1);  // disable
+  SlabAllocator a(Opts(4 * 4096, 4));
+  std::vector<std::string> ev;
+  SlotRef r;
+  for (int i = 0; i < 4; ++i)
+    ASSERT_TRUE(a.Put("stale" + std::to_string(i), 8192, &r, &ev));
+  for (int i = 0; i < 40; ++i)
+    ASSERT_TRUE(a.Put("hot" + std::to_string(i), 4096, &r, &ev));
+  EXPECT_EQ(a.ColdSteals(), 0u) << "disabled: never cold-steals";
+  EXPECT_TRUE(a.Contains("stale0")) << "stale data survives when disabled";
+  ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
 }
 
 TEST(SlabAllocator, OversizeValueRejected) {
