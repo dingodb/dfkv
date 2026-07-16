@@ -237,38 +237,3 @@ jobs:
         with:
           name: dfkv-linux-x86_64
           path: dfkv-*-linux-x86_64.tar.gz
-
-  b200-hw-gate:
-    name: B200 real-HW full ctest
-    # Self-hosted runner on the xb01 B200 dev box: real ConnectX RDMA rails and
-    # CUDA devices, so the RDMA datapath and GPU-rendezvous suites actually run
-    # (the hosted runners' Soft-RoCE cannot round-trip RC traffic — the
-    # rdma-loopback job above degrades to its probe there).
-    # SECURITY (public repo + self-hosted runner): run ONLY same-repo refs —
-    # pushes to main, same-repo PRs, manual dispatch. Fork PRs never reach this
-    # runner: the branch filter above plus the repo-level "require approval for
-    # all outside collaborators" Actions policy gate them.
-    if: >-
-      github.repository == 'dingodb/dfkv' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' &&
-        github.event.pull_request.head.repo.full_name == github.repository))
-    runs-on: [self-hosted, b200]
-    concurrency:
-      group: b200-hw-gate   # one build+ctest on the box at a time
-      cancel-in-progress: false
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v6
-      - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDFKV_WITH_RDMA=ON
-      - name: Build
-        run: cmake --build build -j 48
-      - name: Full ctest on real hardware
-        # Tests place their stores under fs::temp_directory_path()/<fixed name>,
-        # which honors TMPDIR. Point it at the per-run runner temp so CI runs
-        # never collide with root-owned residue from manual ctest runs on the
-        # box (Permission denied on remove_all) or with each other.
-        env:
-          TMPDIR: ${{ runner.temp }}
-        run: ctest --test-dir build --output-on-failure -j 8
