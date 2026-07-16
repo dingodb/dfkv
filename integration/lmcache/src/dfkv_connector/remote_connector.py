@@ -114,6 +114,30 @@ class DfkvConnector(RemoteConnector):
             rdma_pools = self._collect_rdma_pools(local_cpu_backend)
             geometry = _geometry_from_metadata(local_cpu_backend.metadata)
 
+            # Phase 9: canonical (rank-agnostic) keys for MLA. LMCache embeds
+            # worker_id in every key although MLA KV is replicated across TP
+            # ranks — 8x storage/writes/reads at TP8, and the same-host
+            # rendezvous can never match (different keys). With canonical keys
+            # all ranks share one keyspace; writes are striped to a single
+            # deterministic owner per chunk (see _stripe_owner). Default ON
+            # for MLA+world>1; DFKV_CONNECTOR_MLA_CANONICAL_KEYS=0 restores
+            # the per-rank legacy keyspace (note: flipping = cold cache).
+            _md = local_cpu_backend.metadata
+            self._use_mla = bool(getattr(_md, "use_mla", False))
+            self._world_size = max(1, int(getattr(_md, "world_size", 1)))
+            self._worker_id = int(getattr(_md, "worker_id", 0))
+            _canon_env = os.environ.get("DFKV_CONNECTOR_MLA_CANONICAL_KEYS")
+            self._canonical_keys = (
+                self._use_mla and self._world_size > 1
+                and (_canon_env is None or _canon_env.strip().lower()
+                     not in ("0", "false", "no", "off")))
+            if self._canonical_keys:
+                logger.info(
+                    "dfkv canonical MLA keys enabled (world=%d): shared "
+                    "keyspace + single-writer striping; set "
+                    "DFKV_CONNECTOR_MLA_CANONICAL_KEYS=0 for legacy per-rank "
+                    "keys", self._world_size)
+
             self._local_cpu_backend = local_cpu_backend
             self._exists_lru = ExistsLRU(capacity=exists_cache_capacity)
             self._client = DfkvNativeClient(
@@ -141,6 +165,17 @@ class DfkvConnector(RemoteConnector):
                 getattr(self._client, "transport_mode", "unknown"),
             )
             r.result = f"endpoint={endpoint.raw_endpoint} group={endpoint.group}"
+
+    def _kstr(self, key: CacheEngineKey) -> str:
+        return cache_engine_key_to_dfkv_str(key, self._canonical_keys)
+
+    def _stripe_owner(self, key: CacheEngineKey) -> bool:
+        """With canonical keys every rank would redundantly PUT the same key;
+        exactly one deterministic owner writes each chunk instead (identical
+        bytes on every rank — MLA — so any single writer is correct)."""
+        if not self._canonical_keys:
+            return True
+        return (key.chunk_hash % self._world_size) == self._worker_id
 
     @staticmethod
     def _collect_rdma_pools(local_cpu_backend: Any) -> List[Tuple[int, int]]:
@@ -203,7 +238,7 @@ class DfkvConnector(RemoteConnector):
     # ------------------------------------------------------------------
 
     async def exists(self, key: CacheEngineKey) -> bool:
-        key_str = cache_engine_key_to_dfkv_str(key)
+        key_str = self._kstr(key)
         with access_log("exists", lambda: key_str) as r:
             if self._exists_lru.has(key_str):
                 r.result = "lru_hit"
@@ -216,7 +251,7 @@ class DfkvConnector(RemoteConnector):
             return found
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
-        key_str = cache_engine_key_to_dfkv_str(key)
+        key_str = self._kstr(key)
         with access_log("exists_sync", lambda: key_str) as r:
             if self._exists_lru.has(key_str):
                 r.result = "lru_hit"
@@ -250,7 +285,7 @@ class DfkvConnector(RemoteConnector):
             if self._assume_exists:
                 r.result = f"prefix={n} (assume_exists)"
                 return n
-            key_strs = [cache_engine_key_to_dfkv_str(k) for k in keys]
+            key_strs = [self._kstr(k) for k in keys]
             i = self._exists_lru.prefix_len(key_strs)
             if i == n:
                 r.result = f"prefix={n} (all lru hit)"
@@ -286,7 +321,7 @@ class DfkvConnector(RemoteConnector):
     # ------------------------------------------------------------------
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        key_str = cache_engine_key_to_dfkv_str(key)
+        key_str = self._kstr(key)
         with access_log("get", lambda: key_str) as r:
             memory_obj = self._allocate_chunk()
             if memory_obj is None:
@@ -317,9 +352,15 @@ class DfkvConnector(RemoteConnector):
         # NOTE: we do NOT ref_count_down memory_obj here. The caller hands us a
         # serialized compressed_memory_obj whose lifetime it manages. Mirrors
         # RedisConnector.put / the dingofs connector.
-        key_str = cache_engine_key_to_dfkv_str(key)
+        key_str = self._kstr(key)
         size = len(memory_obj.byte_array)
         with access_log("put", lambda: f"{key_str}, {_fmt_bytes(size)}") as r:
+            if not self._stripe_owner(key):
+                # canonical keys: the owning rank writes this chunk; treating
+                # it as stored here prevents this rank from ever re-putting.
+                self._exists_lru.add(key_str)
+                r.result = "striped_skip"
+                return
             ok, _ = await self._client.batch_set([key_str], [memory_obj.byte_array])
             if ok:
                 self._exists_lru.add(key_str)
@@ -347,7 +388,22 @@ class DfkvConnector(RemoteConnector):
             if len(keys) != len(memory_objs):
                 r.result = "FAIL length_mismatch"
                 raise ValueError("keys and memory_objs length mismatch")
-            key_strs = [cache_engine_key_to_dfkv_str(k) for k in keys]
+            if self._canonical_keys:
+                # single-writer striping: this rank only writes the chunks it
+                # owns; the rest are (being) written by their owners and are
+                # remembered as stored so this rank never re-puts them.
+                owned = [i for i, k in enumerate(keys) if self._stripe_owner(k)]
+                skipped = [self._kstr(keys[i]) for i in range(n)
+                           if i not in set(owned)]
+                if skipped:
+                    self._exists_lru.add_many(skipped)
+                if not owned:
+                    r.result = f"striped_skip {n} keys"
+                    return
+                keys = [keys[i] for i in owned]
+                memory_objs = [memory_objs[i] for i in owned]
+                n = len(keys)
+            key_strs = [self._kstr(k) for k in keys]
             views = [obj.byte_array for obj in memory_objs]
             ok_all = True
             stored_keys: List[str] = []
@@ -384,7 +440,7 @@ class DfkvConnector(RemoteConnector):
             if not keys:
                 r.result = "empty"
                 return []
-            key_strs = [cache_engine_key_to_dfkv_str(k) for k in keys]
+            key_strs = [self._kstr(k) for k in keys]
 
             objs: List[MemoryObj] = []
             for _ in keys:
@@ -485,7 +541,7 @@ class DfkvConnector(RemoteConnector):
                 r.result = "empty"
                 return []
 
-            key_strs = [cache_engine_key_to_dfkv_str(k) for k in keys]
+            key_strs = [self._kstr(k) for k in keys]
             out: List[MemoryObj] = []
             ranges = list(self._batch_slices(n))
             chunks = len(ranges)
@@ -559,7 +615,7 @@ class DfkvConnector(RemoteConnector):
             return out
 
     def remove_sync(self, key: CacheEngineKey) -> bool:
-        key_str = cache_engine_key_to_dfkv_str(key)
+        key_str = self._kstr(key)
         with access_log("remove_sync", lambda: key_str) as r:
             if not self._client.supports_remove():
                 r.result = "FAIL no remove RPC"

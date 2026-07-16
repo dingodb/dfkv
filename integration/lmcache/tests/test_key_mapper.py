@@ -125,6 +125,32 @@ def test_layer_id_zero_is_encoded():
     assert cache_engine_key_to_dfkv_str(k).endswith("@0")
 
 
+
+def test_canonical_worker_zeroes_rank():
+    # Phase 9: MLA shared keyspace — worker_id renders as 0.
+    k = _base_key(worker_id=5, chunk_hash=0xABC)
+    assert cache_engine_key_to_dfkv_str(k, canonicalize_worker=True) == \
+        "glm-5.1@8@0@abc"
+
+
+def test_canonical_default_off_keeps_legacy():
+    k = _base_key(worker_id=5, chunk_hash=0xABC)
+    assert cache_engine_key_to_dfkv_str(k) == "glm-5.1@8@5@abc"
+
+
+def test_canonical_all_ranks_converge():
+    rendered = {cache_engine_key_to_dfkv_str(
+        _base_key(worker_id=w, chunk_hash=0xDEAD), canonicalize_worker=True)
+        for w in range(8)}
+    assert len(rendered) == 1
+
+
+def test_canonical_layerwise_keeps_layer_id():
+    k = _layer_key(worker_id=3, chunk_hash=0x1, layer_id=7)
+    assert cache_engine_key_to_dfkv_str(k, canonicalize_worker=True) == \
+        "glm-5.1@8@0@1@7"
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
@@ -143,3 +169,4 @@ def _run_all():
 
 if __name__ == "__main__":
     sys.exit(1 if _run_all() else 0)
+

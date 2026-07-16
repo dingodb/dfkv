@@ -41,14 +41,27 @@ from lmcache.utils import CacheEngineKey
 __all__ = ["cache_engine_key_to_dfkv_str"]
 
 
-def cache_engine_key_to_dfkv_str(key: CacheEngineKey) -> str:
+def cache_engine_key_to_dfkv_str(key: CacheEngineKey,
+                                 canonicalize_worker: bool = False) -> str:
     """Render a CacheEngineKey as a dfkv key string.
 
     Appends ``@{layer_id}`` when ``key`` is a ``LayerCacheEngineKey`` (i.e. LMCache
     layerwise mode) so per-layer objects do not collide. Omit it for the base
     ``CacheEngineKey`` (non-layerwise mode) — byte-identical to the legacy format.
+
+    ``canonicalize_worker=True`` renders worker_id as 0 regardless of the
+    calling rank. For MLA models the KV is REPLICATED across TP ranks, yet
+    LMCache's key scheme embeds worker_id — so the same bytes were stored,
+    written and fetched once PER RANK (8x everything at TP8), and the dfkv
+    same-host rendezvous could never collapse the reads (different keys).
+    Canonicalizing gives all ranks one shared keyspace: storage and writes
+    dedup to 1x, and lockstep GETs become rendezvous-able. Only valid when
+    the per-rank KV really is identical (MLA); the caller gates it.
+    NOTE: flipping this changes the keyspace — existing cached data written
+    with per-rank keys is not reachable under canonical keys (cold start).
     """
-    base = f"{key.model_name}@{key.world_size}@{key.worker_id}@{key.chunk_hash:x}"
+    worker = 0 if canonicalize_worker else key.worker_id
+    base = f"{key.model_name}@{key.world_size}@{worker}@{key.chunk_hash:x}"
     layer_id = getattr(key, "layer_id", None)
     if layer_id is not None:
         return f"{base}@{layer_id}"
