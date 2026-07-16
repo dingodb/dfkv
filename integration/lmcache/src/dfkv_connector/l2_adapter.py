@@ -77,6 +77,17 @@ def _object_key_to_string(key: ObjectKey) -> str:
 
     Deterministic across processes/restarts so a cache written before a restart
     is found afterwards.
+
+    KNOWN GAP (MLA 8x on this path): kv_rank is NOT rank-agnostic — upstream's
+    ObjectKey.ComputeKVRank packs (world_size<<24 | global_rank<<16 | ...), so
+    every TP worker gets a distinct kv_rank and MLA's replicated KV is stored
+    8x over (one key per rank), which the same-host rendezvous can't collapse.
+    The RemoteConnector path fixes this by canonicalizing worker_id->0 (see
+    remote_connector.py, DFKV_CONNECTOR_MLA_CANONICAL_KEYS), but the L2-adapter
+    lookup expands to ALL world_size kv_ranks and fold requires every shard
+    present — so canonicalizing here needs a COORDINATED store+lookup+fold
+    change, not a one-line key rewrite. Deferred; do not assume this path is
+    deduped for MLA.
     """
     base = (
         f"{key.model_name}{_KEY_SEP}{key.kv_rank:08x}"
