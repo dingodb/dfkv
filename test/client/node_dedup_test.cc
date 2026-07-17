@@ -252,3 +252,96 @@ TEST(NodeDedup, SegmentIsEagerlyBackedNotSparse) {
   EXPECT_GE(static_cast<uint64_t>(st.st_blocks) * 512, static_cast<uint64_t>(st.st_size))
       << "segment is sparse: a full tmpfs would SIGBUS at publish time";
 }
+
+// ---- cooperative partition (Options::coop) ----
+
+NodeDedup::Options CoopOpts(const std::string& name, int rank, int world) {
+  NodeDedup::Options o = Opts(name);
+  o.coop = true;
+  o.rank = rank;
+  o.world = world;
+  return o;
+}
+
+// Ownership is a pure function of the key: every rank computes the same
+// owner, the partition covers all keys, and no key has two owners.
+TEST(NodeDedupCoop, OwnershipPartitionsKeysDeterministically) {
+  ShmGuard g("coop-own");
+  auto r0 = NodeDedup::Open(CoopOpts(g.name, 0, 4));
+  auto r1 = NodeDedup::Open(CoopOpts(g.name, 1, 4));
+  auto r2 = NodeDedup::Open(CoopOpts(g.name, 2, 4));
+  auto r3 = NodeDedup::Open(CoopOpts(g.name, 3, 4));
+  ASSERT_TRUE(r0 && r1 && r2 && r3);
+  NodeDedup* ranks[4] = {r0.get(), r1.get(), r2.get(), r3.get()};
+  int owned[4] = {0, 0, 0, 0};
+  for (uint64_t id = 1; id <= 400; ++id) {
+    int owners = 0;
+    for (int r = 0; r < 4; ++r)
+      if (ranks[r]->Owns(K(id))) { ++owners; ++owned[r]; }
+    EXPECT_EQ(owners, 1) << "key " << id;
+  }
+  for (int r = 0; r < 4; ++r)  // roughly balanced (no rank starved)
+    EXPECT_GT(owned[r], 40) << "rank " << r;
+}
+
+// The passive side never reserves: arriving FIRST it still waits, the owner
+// arriving later claims the fetch, publishes, and the waiter copies. This is
+// the exact inversion of the classic race (first arrival claims everything)
+// that serialized real inference batches.
+TEST(NodeDedupCoop, NonOwnerNeverClaimsEvenWhenFirst) {
+  ShmGuard g("coop-passive");
+  auto a = NodeDedup::Open(CoopOpts(g.name, 0, 2));
+  auto b = NodeDedup::Open(CoopOpts(g.name, 1, 2));
+  ASSERT_TRUE(a && b);
+  // Find a key owned by rank 1.
+  uint64_t id = 1;
+  while (!b->Owns(K(id))) ++id;
+  const std::string v = Val(id, 4096);
+  std::string dst(v.size(), '\0');
+
+  // Non-owner (rank 0) arrives FIRST: must wait, not claim.
+  EXPECT_EQ(a->ClaimPassive(K(id), v.size(), dst.data()), NodeDedup::Role::kWait);
+  // Owner arrives: claims the fetch.
+  std::string bdst(v.size(), '\0');
+  ASSERT_EQ(b->Claim(K(id), v.size(), bdst.data()), NodeDedup::Role::kFetch);
+  b->Publish(K(id), NodeDedup::Kind::kData, v.data(), v.size());
+  // Waiter's wait path lands the payload.
+  EXPECT_TRUE(a->WaitCopy(K(id), v.size(), dst.data()));
+  EXPECT_EQ(dst, v);
+  // A later passive claim is a straight hit.
+  std::string dst2(v.size(), '\0');
+  EXPECT_EQ(a->ClaimPassive(K(id), v.size(), dst2.data()), NodeDedup::Role::kHit);
+  EXPECT_EQ(dst2, v);
+}
+
+// A crashed owner cannot park its partition: past takeover_ms the passive
+// side takes the fetch over, same as the classic dead-fetcher path.
+TEST(NodeDedupCoop, PassiveTakesOverDeadOwner) {
+  ShmGuard g("coop-takeover");
+  auto a = NodeDedup::Open(CoopOpts(g.name, 0, 2));
+  auto b = NodeDedup::Open(CoopOpts(g.name, 1, 2));
+  ASSERT_TRUE(a && b);
+  uint64_t id = 1;
+  while (!b->Owns(K(id))) ++id;
+  const std::string v = Val(id, 1024);
+  std::string dst(v.size(), '\0');
+  // Owner claims then "dies" (never publishes).
+  ASSERT_EQ(b->Claim(K(id), v.size(), dst.data()), NodeDedup::Role::kFetch);
+  std::this_thread::sleep_for(250ms);  // > takeover_ms (200)
+  // Passive side takes over the stale FETCHING slot.
+  EXPECT_EQ(a->ClaimPassive(K(id), v.size(), dst.data()), NodeDedup::Role::kFetch);
+}
+
+// FromEnv: "coop" without usable rank/world degrades to the classic mode
+// (dedup on, coop off) instead of silently owning nothing.
+TEST(NodeDedupCoop, FromEnvDegradesWithoutRank) {
+  ::setenv("DFKV_CLIENT_NODE_DEDUP", "coop", 1);
+  auto d = NodeDedup::FromEnv(0xC0FFEE, /*rank=*/-1, /*world=*/0);
+  ASSERT_TRUE(d);
+  EXPECT_FALSE(d->coop());
+  auto d2 = NodeDedup::FromEnv(0xC0FFEE, /*rank=*/3, /*world=*/8);
+  ASSERT_TRUE(d2);
+  EXPECT_TRUE(d2->coop());
+  ::unsetenv("DFKV_CLIENT_NODE_DEDUP");
+  ::shm_unlink(NodeDedup::EnvSegmentName(0xC0FFEE).c_str());
+}

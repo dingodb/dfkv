@@ -52,6 +52,20 @@ class NodeDedup {
     int wait_ms = 500;                     // DFKV_NODE_DEDUP_WAIT_MS
     int takeover_ms = 2000;                // DFKV_NODE_DEDUP_TAKEOVER_MS
     int ttl_ms = 5000;                     // DFKV_NODE_DEDUP_TTL_MS
+    // Cooperative fetch (DFKV_CLIENT_NODE_DEDUP=coop): keys are partitioned
+    // deterministically by hash(key) % world, and only the owning rank ever
+    // claims a fetch (others go straight to the wait path). Motivation: the
+    // classic claim RACE collapses under a real inference batch — the ranks'
+    // arrival spread (~12 ms) is far below a fetch batch (~44 ms), so the
+    // first-arriving rank claims essentially the WHOLE batch and the other 7
+    // serialize behind ONE fetcher (measured live: only r0/r1 ever touched the
+    // server; hot rounds went net-negative, v1.28.0 release notes). The
+    // partition keeps the 1x fabric traffic of the rendezvous AND N-way fetch
+    // parallelism: every rank fetches 1/N of the batch concurrently, publishes
+    // its shard, and copies the rest from shm.
+    bool coop = false;
+    int rank = -1;                 // this process's TP rank (coop only)
+    int world = 0;                 // TP size (coop only; coop needs world >= 2)
   };
 
   // Entry namespaces sharing one index: a key's data payload and its exist
@@ -59,9 +73,12 @@ class NodeDedup {
   enum class Kind : uint32_t { kData = 1, kExist = 2 };
 
   // Builds Options from the environment; returns nullptr (feature off) unless
-  // DFKV_CLIENT_NODE_DEDUP=1. model_hash namespaces the segment so distinct
-  // keyspaces on one host never share entries.
-  static std::unique_ptr<NodeDedup> FromEnv(uint64_t model_hash);
+  // DFKV_CLIENT_NODE_DEDUP is "1" (classic claim-race) or "coop" (cooperative
+  // partition; needs rank/world from the client identity — with world < 2 or an
+  // unknown rank it degrades to classic). model_hash namespaces the segment so
+  // distinct keyspaces on one host never share entries.
+  static std::unique_ptr<NodeDedup> FromEnv(uint64_t model_hash, int rank = -1,
+                                            int world = 0);
   // The env-derived segment name. The shm LAYOUT VERSION is part of the name:
   // a layout change must never collide with a segment an older lib left
   // behind — v1.23.0 shipped a layout bump behind the same name, the header
@@ -101,6 +118,19 @@ class NodeDedup {
   Role ClaimExist(const BlockKey& key, bool* val);
   bool WaitExist(const BlockKey& key, bool* val);
 
+  // ---- cooperative partition (Options::coop) ----
+  bool coop() const { return coop_; }
+  // Deterministic key ownership: FNV-1a(key filename) % world == rank. Every
+  // rank computes the same answer, so exactly one rank fetches each key.
+  bool Owns(const BlockKey& key) const;
+  // Non-owner claim: READY -> kHit, missing/FETCHING -> kWait (never reserves
+  // a slot; the owner may not have arrived yet and the wait path covers that).
+  // The one exception: a FETCHING slot stale beyond takeover_ms is taken over
+  // (kFetch) so a crashed owner cannot park its keys forever.
+  Role ClaimPassive(const BlockKey& key, size_t n, char* dst);
+  Role ClaimAutoPassive(const BlockKey& key, size_t cap, char* dst, size_t* got);
+  Role ClaimExistPassive(const BlockKey& key, bool* val);
+
   // Fetch outcomes for keys claimed as kFetch (kind selects the namespace;
   // exist publishes a 1-byte payload).
   void Publish(const BlockKey& key, Kind kind, const char* data, size_t n);
@@ -124,6 +154,8 @@ class NodeDedup {
   bool CopyOut(Slot* s, size_t cap, size_t strict_n, char* dst, size_t* got) const;
   Role ClaimImpl(const BlockKey& key, Kind kind, size_t cap, size_t strict_n,
                  char* dst, size_t* got);
+  Role ClaimPassiveImpl(const BlockKey& key, Kind kind, size_t cap,
+                        size_t strict_n, char* dst, size_t* got);
   bool WaitImpl(const BlockKey& key, Kind kind, size_t cap, size_t strict_n,
                 char* dst, size_t* got);
   static uint64_t NowMs();
@@ -136,6 +168,9 @@ class NodeDedup {
   int wait_ms_ = 500;
   int takeover_ms_ = 2000;
   int ttl_ms_ = 5000;
+  bool coop_ = false;
+  int rank_ = -1;
+  int world_ = 0;
   void* map_base_ = nullptr;
   size_t map_len_ = 0;
 

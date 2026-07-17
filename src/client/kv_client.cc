@@ -192,9 +192,19 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
     t_ = owned_.get();
     DFKV_LOG_INFO("dfkv client transport=" + transport_reason_);
   }
-  // Same-host GET rendezvous (phase 5). Off unless DFKV_CLIENT_NODE_DEDUP=1;
-  // namespaced by model_hash so distinct keyspaces never share entries.
-  dedup_ = NodeDedup::FromEnv(self_hdr_.model_hash);
+  // Same-host GET rendezvous (phase 5). Off unless DFKV_CLIENT_NODE_DEDUP is
+  // "1" (classic claim race) or "coop" (rank-partitioned cooperative fetch;
+  // rank/world come from the client identity header). Namespaced by model_hash
+  // so distinct keyspaces never share entries.
+  dedup_ = NodeDedup::FromEnv(self_hdr_.model_hash,
+                              static_cast<int>(self_hdr_.tp_rank),
+                              static_cast<int>(self_hdr_.tp_size));
+  if (dedup_ && dedup_->coop()) {
+    DFKV_LOG_INFO("node-dedup: cooperative fetch on (rank=" +
+                  std::to_string(self_hdr_.tp_rank) + "/" +
+                  std::to_string(self_hdr_.tp_size) +
+                  "): each rank fetches its key partition, peers copy via shm");
+  }
   // Batch fan-out workers override (0/unset = auto; see set_batch_concurrency).
   if (const char* bc = std::getenv("DFKV_BATCH_CONCURRENCY")) {
     long x = std::strtol(bc, nullptr, 10);
@@ -686,7 +696,13 @@ std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
       continue;
     }
     bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
-    switch (dedup_->Claim(bks[i], items[i].n, static_cast<char*>(items[i].out))) {
+    // Coop partition: only the owning rank claims a fetch; the rest go straight
+    // to the wait path so N ranks fetch N disjoint shards concurrently.
+    switch (dedup_->coop() && !dedup_->Owns(bks[i])
+                ? dedup_->ClaimPassive(bks[i], items[i].n,
+                                       static_cast<char*>(items[i].out))
+                : dedup_->Claim(bks[i], items[i].n,
+                                static_cast<char*>(items[i].out))) {
       case NodeDedup::Role::kHit:
         res[i] = true;
         break;
@@ -825,7 +841,11 @@ std::vector<bool> KVClient::BatchGetAuto(const std::vector<KvGetItem>& items,
     }
     bks[i] = ToBlockKey(items[i].key, self_hdr_.model_hash);
     size_t got = 0;
-    switch (dedup_->ClaimAuto(bks[i], items[i].n, static_cast<char*>(items[i].out), &got)) {
+    switch (dedup_->coop() && !dedup_->Owns(bks[i])
+                ? dedup_->ClaimAutoPassive(bks[i], items[i].n,
+                                           static_cast<char*>(items[i].out), &got)
+                : dedup_->ClaimAuto(bks[i], items[i].n,
+                                    static_cast<char*>(items[i].out), &got)) {
       case NodeDedup::Role::kHit:
         res[i] = true;
         lens[i] = got;
@@ -950,7 +970,9 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
   for (size_t i = 0; i < N; ++i) {
     bks[i] = ToBlockKey(keys[i], self_hdr_.model_hash);
     bool val = false;
-    switch (dedup_->ClaimExist(bks[i], &val)) {
+    switch (dedup_->coop() && !dedup_->Owns(bks[i])
+                ? dedup_->ClaimExistPassive(bks[i], &val)
+                : dedup_->ClaimExist(bks[i], &val)) {
       case NodeDedup::Role::kHit:
         res[i] = val;
         break;

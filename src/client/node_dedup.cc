@@ -79,9 +79,13 @@ std::string NodeDedup::EnvSegmentName(uint64_t model_hash) {
   return name;
 }
 
-std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t model_hash) {
+std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t model_hash, int rank,
+                                              int world) {
   const char* on = std::getenv("DFKV_CLIENT_NODE_DEDUP");
-  if (!on || std::strcmp(on, "1") != 0) return nullptr;
+  if (!on) return nullptr;
+  const bool classic = std::strcmp(on, "1") == 0;
+  const bool coop = std::strcmp(on, "coop") == 0;
+  if (!classic && !coop) return nullptr;
   Options o;
   o.arena_bytes = EnvU64("DFKV_NODE_DEDUP_ARENA_MB", 512) << 20;
   o.slots = static_cast<uint32_t>(EnvU64("DFKV_NODE_DEDUP_SLOTS", 65536));
@@ -89,6 +93,17 @@ std::unique_ptr<NodeDedup> NodeDedup::FromEnv(uint64_t model_hash) {
   o.takeover_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TAKEOVER_MS", 2000));
   o.ttl_ms = static_cast<int>(EnvU64("DFKV_NODE_DEDUP_TTL_MS", 5000));
   o.name = EnvSegmentName(model_hash);
+  // Coop needs a real partition; a lone client (world < 2) or an unknown rank
+  // degrades to the classic claim race rather than silently owning nothing.
+  if (coop && world >= 2 && rank >= 0 && rank < world) {
+    o.coop = true;
+    o.rank = rank;
+    o.world = world;
+  } else if (coop) {
+    DFKV_LOG_INFO("node-dedup: coop requested but rank/world unavailable (rank=" +
+                  std::to_string(rank) + " world=" + std::to_string(world) +
+                  "), using classic claim mode");
+  }
   return Open(o);
 }
 
@@ -143,6 +158,9 @@ std::unique_ptr<NodeDedup> NodeDedup::Open(const Options& opt) {
   d->wait_ms_ = opt.wait_ms;
   d->takeover_ms_ = opt.takeover_ms;
   d->ttl_ms_ = opt.ttl_ms;
+  d->coop_ = opt.coop;
+  d->rank_ = opt.rank;
+  d->world_ = opt.world;
 
   if (creator) {
     // Fresh (ftruncate zero-fills): stamp the header last so concurrent
@@ -297,6 +315,69 @@ NodeDedup::Role NodeDedup::ClaimImpl(const BlockKey& key, Kind kind, size_t cap,
     return Role::kFetch;
   }
   return Role::kFetch;  // no slot available: plain fetch, nothing to publish
+}
+
+bool NodeDedup::Owns(const BlockKey& key) const {
+  if (!coop_) return true;
+  // Same fields as Find()'s slot hash but folded to a partition id. Every rank
+  // computes this identically, so exactly one rank owns each key. key.size is
+  // excluded on purpose: it is a payload attribute, and lockstep peers may
+  // carry it differently on the auto path — ownership must not fork on it.
+  const uint64_t h = key.id ^ (key.id >> 32) ^ (static_cast<uint64_t>(key.index) * 0x9E3779B97F4A7C15ull);
+  return static_cast<int>(h % static_cast<uint64_t>(world_)) == rank_;
+}
+
+NodeDedup::Role NodeDedup::ClaimPassiveImpl(const BlockKey& key, Kind kind,
+                                            size_t cap, size_t strict_n,
+                                            char* dst, size_t* got) {
+  if (cap == 0 || cap > arena_bytes_ / 2) return Role::kFetch;  // oversize: no dedup
+  const uint64_t now = NowMs();
+  if (Slot* s = Find(key, kind)) {
+    const uint32_t st = s->state.load(std::memory_order_acquire);
+    if (st == kStateReady) {
+      if (now - s->fetch_start_ms.load(std::memory_order_relaxed) <=
+              static_cast<uint64_t>(ttl_ms_) &&
+          CopyOut(s, cap, strict_n, dst, got)) {
+        hits_.fetch_add(1, std::memory_order_relaxed);
+        return Role::kHit;
+      }
+      // Expired/torn: the OWNER refreshes it; we just wait for that.
+      return Role::kWait;
+    }
+    if (st == kStateFetching) {
+      const uint64_t started = s->fetch_start_ms.load(std::memory_order_relaxed);
+      if (now - started <= static_cast<uint64_t>(takeover_ms_)) return Role::kWait;
+      // Owner looks dead: same takeover CAS as the classic path, so a crashed
+      // owner cannot park its partition forever.
+      uint64_t expect = started;
+      if (s->fetch_start_ms.compare_exchange_strong(expect, now,
+                                                    std::memory_order_acq_rel)) {
+        fetches_.fetch_add(1, std::memory_order_relaxed);
+        return Role::kFetch;
+      }
+      return Role::kWait;
+    }
+  }
+  // No slot yet: the owner has not arrived. Never reserve from the passive
+  // side — WaitImpl spins on the missing slot and the caller's timeout
+  // fallback (direct fetch) bounds an owner that never comes.
+  return Role::kWait;
+}
+
+NodeDedup::Role NodeDedup::ClaimPassive(const BlockKey& key, size_t n, char* dst) {
+  return ClaimPassiveImpl(key, Kind::kData, n, n, dst, nullptr);
+}
+
+NodeDedup::Role NodeDedup::ClaimAutoPassive(const BlockKey& key, size_t cap,
+                                            char* dst, size_t* got) {
+  return ClaimPassiveImpl(key, Kind::kData, cap, kAnyLen, dst, got);
+}
+
+NodeDedup::Role NodeDedup::ClaimExistPassive(const BlockKey& key, bool* val) {
+  char b = 0;
+  const Role r = ClaimPassiveImpl(key, Kind::kExist, 1, 1, &b, nullptr);
+  if (r == Role::kHit && val) *val = (b != 0);
+  return r;
 }
 
 NodeDedup::Role NodeDedup::Claim(const BlockKey& key, size_t n, char* dst) {
