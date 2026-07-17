@@ -24,7 +24,9 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List, Optional, Sequence, Tuple
 
+from . import access_log as _alog
 from .access_log import access_log
+from . import _hot_config
 from ._telemetry import config as _tcfg
 from ._telemetry import metrics as _push_metrics
 from ._telemetry import tracing as _push_tracing
@@ -246,6 +248,12 @@ class DfkvNativeClient:
                 {}, connector_type=_tcfg.TYPE_LMCACHE, tp_rank=int(g["tp_rank"]),
                 version=_tcfg.dist_version("dfkv-connector"),
                 native_version=_native_version(self._lib))
+            # Access log: parse the launch baseline (env-driven), then let a
+            # control file toggle it at runtime without restarting LMCache
+            # (opt-in via DFKV_HOT_CONFIG). docs/access_log.md -> 运行时热开关.
+            _alog.configure({}, tp_rank=int(g["tp_rank"]))
+            _hot_config.register("access_log", _alog.apply_hot)
+            _hot_config.start({}, tp_rank=int(g["tp_rank"]))
             r.result = f"ok regs={regs} transport={self.transport_mode}"
 
     # ------------------------------------------------------------------
@@ -431,6 +439,10 @@ class DfkvNativeClient:
     def close(self) -> None:
         if self._closed:
             return
+        try:
+            _hot_config.stop()
+        except Exception:  # pragma: no cover
+            pass
         with access_log("native.close", lambda: ""):
             self._closed = True
             try:

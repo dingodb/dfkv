@@ -19,7 +19,9 @@ import os
 from typing import Optional, Sequence
 
 from ._cabi import load_lib, native_version
+from . import access_log as _alog
 from .access_log import access_log
+from . import _hot_config
 from ._telemetry import config as _tcfg
 from ._telemetry import metrics as _push_metrics
 from ._telemetry import tracing as _push_tracing
@@ -132,6 +134,12 @@ class DfkvDeviceClient:
             {}, connector_type=_tcfg.TYPE_VLLM, tp_rank=_env_rank(),
             version=_tcfg.dist_version("dfkv-vllm"),
             native_version=native_version(self._lib))
+        # Access log: parse the launch baseline (env-driven), then let a control
+        # file toggle it at runtime without restarting vLLM (opt-in via
+        # DFKV_HOT_CONFIG). See docs/access_log.md -> 运行时热开关.
+        _alog.configure({}, tp_rank=_env_rank())
+        _hot_config.register("access_log", _alog.apply_hot)
+        _hot_config.start({}, tp_rank=_env_rank())
 
     @property
     def transport_mode(self) -> str:
@@ -318,6 +326,10 @@ class DfkvDeviceClient:
             return res
 
     def close(self) -> None:
+        try:
+            _hot_config.stop()
+        except Exception:
+            pass
         if getattr(self, "_h", None):
             with access_log("close", lambda: ""):
                 self._lib.dfkv_close(self._h)

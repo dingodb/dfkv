@@ -14,14 +14,21 @@ e.g.::
     register_memory(base=0x7f00, 4294967296 bytes) : ok <0.012003>
     batch_put(8 keys, 524288 bytes) : FAIL RuntimeError: dfkv_batch_put rc=-1 <0.001230>
 
-Off by default. Controlled by environment variables (read once at import),
-the SAME variables as every other dfkv access log so one setting covers all
-integrations:
+Off by default. The SAME environment variables as every other dfkv access log,
+so one setting covers all integrations:
 
     DFKV_ACCESS_LOG_ENABLED       "1" to turn on (default off)
     DFKV_ACCESS_LOG_PATH          file path; empty = stderr (default empty)
     DFKV_ACCESS_LOG_THRESHOLD_US  only log ops whose wall time exceeds this
                                   (default 0 = log every call)
+    DFKV_ACCESS_LOG_MAX_BYTES     size-rotation threshold (default 128MiB;
+                                  0 disables rotation = single unbounded file)
+    DFKV_ACCESS_LOG_BACKUP_COUNT  rotated backups to keep (default 5)
+
+The launch baseline is parsed once in :func:`configure` (called from the client
+``__init__``); after that ``access_log()`` reads the enable flag per call, so a
+control-file watcher (:mod:`._hot_config`) can toggle it at runtime WITHOUT a
+restart. See docs/access_log.md → 运行时热开关.
 
 Performance:
   - Disabled: ~100 ns/call. A frozen _NoopLog singleton is returned, so the
@@ -40,44 +47,80 @@ import logging.handlers
 import os
 import queue
 import sys
+import threading
 import time
 from typing import Any, Callable, Optional
 
+# Module state. configure() (first call in the process) snapshots the launch
+# config; apply_hot() (from the _hot_config watcher thread) may re-apply it
+# later, so all mutating paths take _lock. access_log() reads _ENABLED /
+# _THRESHOLD_US WITHOUT the lock — plain bool/int reads under the GIL; a stale
+# read at worst mislabels one op, acceptable for a diagnostic log.
+_ENABLED: bool = False
+_THRESHOLD_US: int = 0
+_logger: Optional[logging.Logger] = None
+_listener: Optional[logging.handlers.QueueListener] = None
+_configured: bool = False
+_lock = threading.Lock()
+_sink_want: Optional[tuple] = None
+_launch_cfg: dict = {}
+_tp_rank: int = 0
+_model: str = ""
 
-# Read once at import; flipping env mid-process is not supported.
-_ENABLED = os.environ.get(
-    "DFKV_ACCESS_LOG_ENABLED", "0"
-) in ("1", "true", "yes", "on")
-_LOG_PATH = os.environ.get("DFKV_ACCESS_LOG_PATH", "").strip()
-try:
-    _THRESHOLD_US = int(os.environ.get("DFKV_ACCESS_LOG_THRESHOLD_US", "0"))
-except ValueError:
-    _THRESHOLD_US = 0
+
+def _truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _build_logger() -> Optional[logging.Logger]:
-    """Build a non-blocking access logger.
+def _resolve(cfg: dict, key: str, env: str, default: Any) -> Any:
+    """extra_config key wins; then env var; then default."""
+    if cfg.get(key) is not None:
+        return cfg[key]
+    if env in os.environ:
+        return os.environ[env]
+    return default
 
-    Foreground emit only enqueues a LogRecord; a background QueueListener
-    thread does the actual write/flush. This keeps the hot path under a few
-    microseconds even at thousands of ops per second.
-    """
-    if not _ENABLED:
-        return None
-    log = logging.getLogger("dfkv.access")
-    log.setLevel(logging.INFO)
-    log.propagate = False  # keep out of root logger / vLLM's logging stack
-    if log.handlers:
-        return log  # already configured (e.g. on re-import)
 
-    if _LOG_PATH:
+def _int(cfg: dict, key: str, env: str, default: int) -> int:
+    try:
+        return int(_resolve(cfg, key, env, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _stop_listener(listener) -> None:
+    if listener is not None and getattr(listener, "_thread", None) is not None:
+        listener.stop()
+
+
+def _build_sink(path: str, max_bytes: int, backup_count: int,
+                tp_rank: int, model: str) -> None:
+    """(Re)build the logger + async QueueListener. Tears down any previous
+    listener/handlers first so a hot path change never double-writes. Caller
+    holds _lock. Size-rotation bounds disk per rank to
+    max_bytes * (backup_count + 1); max_bytes=0 disables rotation."""
+    global _logger, _listener
+    if path:
+        if "{rank}" in path or "{model}" in path:
+            path = path.format(rank=tp_rank, model=model)
+        else:
+            path = f"{path}.r{tp_rank}"
+
+    if path:
         try:
-            sink: logging.Handler = logging.FileHandler(_LOG_PATH, mode="a")
+            if max_bytes > 0:
+                sink: logging.Handler = logging.handlers.RotatingFileHandler(
+                    path, mode="a", maxBytes=max_bytes, backupCount=backup_count)
+            else:
+                sink = logging.FileHandler(path, mode="a")
         except OSError as exc:
             sys.stderr.write(
-                f"[dfkv.access] cannot open {_LOG_PATH!r}: {exc}; "
-                f"falling back to stderr\n"
-            )
+                f"[dfkv.access] cannot open {path!r}: {exc}; "
+                f"falling back to stderr\n")
             sink = logging.StreamHandler(sys.stderr)
     else:
         sink = logging.StreamHandler(sys.stderr)
@@ -86,19 +129,78 @@ def _build_logger() -> Optional[logging.Logger]:
                           datefmt="%Y-%m-%d %H:%M:%S")
     )
 
-    # Unbounded queue: enqueueing never blocks; if the listener can't keep up
-    # we'd rather grow memory than stall the hot path. In practice the queue
-    # stays empty because emit is ~10 µs and ops are ~ms.
+    _stop_listener(_listener)
+    _listener = None
+    log = logging.getLogger("dfkv.access")
+    log.setLevel(logging.INFO)
+    log.propagate = False  # keep out of root logger / vLLM's logging stack
+    for h in list(log.handlers):
+        log.removeHandler(h)
+
+    # Unbounded queue: enqueueing never blocks; the background listener does the
+    # write/flush, keeping foreground emit at a few microseconds.
     q: "queue.Queue[logging.LogRecord]" = queue.Queue(-1)
-    listener = logging.handlers.QueueListener(q, sink, respect_handler_level=False)
-    listener.start()
-    atexit.register(listener.stop)
-
+    _listener = logging.handlers.QueueListener(q, sink, respect_handler_level=False)
+    _listener.start()
+    atexit.register(_stop_listener, _listener)
     log.addHandler(logging.handlers.QueueHandler(q))
-    return log
+    _logger = log
 
 
-_logger: Optional[logging.Logger] = _build_logger()
+def _apply(cfg: Optional[dict], tp_rank: int, model: str) -> None:
+    """Resolve the access-log knobs from cfg and (re)apply. Caller holds _lock.
+    Enables/disables live; builds the sink lazily on first enable and rebuilds
+    only when path/rotation params change."""
+    global _ENABLED, _THRESHOLD_US, _sink_want
+    cfg = cfg or {}
+    _THRESHOLD_US = max(0, _int(cfg, "access_log_threshold_us",
+                                "DFKV_ACCESS_LOG_THRESHOLD_US", 0))
+    if not _truthy(_resolve(cfg, "access_log", "DFKV_ACCESS_LOG_ENABLED", False)):
+        _ENABLED = False
+        return
+    path = str(_resolve(cfg, "access_log_path", "DFKV_ACCESS_LOG_PATH", "")).strip()
+    max_bytes = _int(cfg, "access_log_max_bytes", "DFKV_ACCESS_LOG_MAX_BYTES",
+                     128 * 1024 * 1024)
+    backup_count = _int(cfg, "access_log_backup_count",
+                        "DFKV_ACCESS_LOG_BACKUP_COUNT", 5)
+    if max_bytes < 0:
+        max_bytes = 0
+    if backup_count < 0:
+        backup_count = 0
+    want = (path, max_bytes, backup_count)
+    if _logger is None or _sink_want != want:
+        _build_sink(path, max_bytes, backup_count, tp_rank, model)
+        _sink_want = want
+    _ENABLED = True
+
+
+def configure(cfg: Optional[dict] = None, tp_rank: int = 0, model: str = "") -> None:
+    """Parse the launch baseline (first call in the process wins) and apply it.
+    Snapshots the config so :func:`apply_hot` can layer live control-file
+    overrides on top and revert cleanly. cfg may be None (env-only)."""
+    global _configured, _launch_cfg, _tp_rank, _model
+    with _lock:
+        if _configured:
+            return
+        _configured = True
+        _launch_cfg = dict(cfg or {})
+        _tp_rank = tp_rank
+        _model = model
+        _apply(_launch_cfg, tp_rank, model)
+
+
+def apply_hot(overrides: Optional[dict]) -> None:
+    """Re-apply access-log knobs from control-file overrides, layered over the
+    launch baseline (absent key -> launch default, so deleting the control file
+    reverts). Thread-safe; called by the _hot_config watcher. No-op before
+    :func:`configure`."""
+    with _lock:
+        if not _configured:
+            return
+        merged = dict(_launch_cfg)
+        if overrides:
+            merged.update(overrides)
+        _apply(merged, _tp_rank, _model)
 
 
 def is_enabled() -> bool:
@@ -161,13 +263,11 @@ _NOOP = _NoopLog()
 
 
 # ---------------------------------------------------------------------------
-# Public entry: cheap singleton when disabled, real timer when enabled.
+# Public entry: cheap singleton when disabled, real timer when enabled. Reads
+# the enable flag PER CALL so the _hot_config watcher can toggle it at runtime.
 # ---------------------------------------------------------------------------
 
-if _ENABLED:
-    def access_log(op: str, args_fn: Callable[[], str] = lambda: ""):
+def access_log(op: str = "", args_fn: Callable[[], str] = lambda: ""):
+    if _ENABLED:
         return _RealLog(op, args_fn)
-else:
-    def access_log(op: str = "",
-                   args_fn: Callable[[], str] = lambda: ""):
-        return _NOOP
+    return _NOOP

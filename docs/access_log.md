@@ -104,7 +104,7 @@ access log 的启动基线在插件 `__init__` 解析后，`access_log()` 每次
 
 **默认关闭（opt-in）**：只有显式设置了控制文件路径（`DFKV_HOT_CONFIG` 环境变量或 `extra_config` 的 `hot_config_path`）才会启动 watcher；没设则一切照旧、零新线程零开销。
 
-> ⚠️ 热开关目前**仅 SGLang HiCache 连接器**支持。vLLM 直连 / LMCache 连接器的 `DFKV_ACCESS_LOG_*` 仍是启动期一次性解析，改了要重启（其 access log 行格式与本文一致，仅无热加载）。
+> ✅ **三个连接器都支持**（SGLang HiCache / vLLM 直连 / LMCache）——同一个 `DFKV_HOT_CONFIG` 控制文件、同一套语义。vLLM/LMCache 连接器在客户端 `__init__` 里读启动基线（env 驱动）后即挂 watcher；控制文件里同样只有 `access_log` 家族这些观测 knob 会热生效。
 
 | 作用 | `extra_config` 键 | 环境变量 | 默认 |
 |---|---|---|---|
@@ -172,12 +172,15 @@ DFKV_BUILD=$(pwd)/build python3 test/python/test_dfkv_hicache.py   # 含 access-
 python3 -m unittest test_dfkv_hicache.DfkvAccessLogRotationTest -v
 # 热开关（纯 Python，无需 node/so/GPU）：
 python3 -m unittest test_dfkv_hot_config -v
+# vLLM/LMCache 连接器热开关 + vendored watcher 一致性：
+python3 -m unittest test_connector_access_log_hot test_telemetry_vendor_sync -v
 ```
 
 ## 实现位置
 
 - [integration/hicache/dfkv_access_log.py](../integration/hicache/dfkv_access_log.py) — `configure()`（启动基线，幂等）/ `apply_hot()`（热覆盖）/ `access_log()` 上下文管理器、noop 单例、异步队列、格式化辅助。
-- [integration/hicache/dfkv_hot_config.py](../integration/hicache/dfkv_hot_config.py) — 控制文件 watcher（后台守护线程）+ 通用 `register()` 注册表；opt-in（`DFKV_HOT_CONFIG` 设了才启动）。
+- [integration/hicache/dfkv_hot_config.py](../integration/hicache/dfkv_hot_config.py) — **canonical** 控制文件 watcher（后台守护线程）+ 通用 `register()` 注册表；opt-in（`DFKV_HOT_CONFIG` 设了才启动）。vLLM/LMCache 各 vendor 一份 byte-identical 的 `_hot_config.py`（`deploy/sync_telemetry.sh` 同步，`test/python/test_telemetry_vendor_sync.py` 守门）。
+- vLLM/LMCache 连接器的 `access_log.py`（各自独立文件，机制同 hicache）+ `_hot_config.py`（vendored），接线在 `dfkv_client.py` / `native_client.py` 的 `__init__`（`configure`+`register`+`start`）与 `close()`（`stop`）。
 - [integration/hicache/dfkv_hicache.py](../integration/hicache/dfkv_hicache.py) — `__init__` 里调 `configure()`、`register("access_log", apply_hot)` 并 `start()` watcher，并用 `with access_log(...)` 包住各继承接口。
 - [test/python/test_dfkv_hicache.py](../test/python/test_dfkv_hicache.py) — `DfkvAccessLogTest`（接口逐 op 日志）+ `DfkvAccessLogRotationTest`（滚动/清理）测试类。
 - [test/python/test_dfkv_hot_config.py](../test/python/test_dfkv_hot_config.py) — 热开关 + watcher 文件生命周期（纯 Python，无 native 依赖）。

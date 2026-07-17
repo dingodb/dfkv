@@ -34,5 +34,27 @@ class VendorSyncTest(unittest.TestCase):
                     "{} drifted from canonical; run deploy/sync_telemetry.sh".format(path))
 
 
+# Standalone hot-config watcher: canonical dfkv_hot_config.py -> _hot_config.py
+# vendored byte-identical into each connector package root.
+HOT_CANON = os.path.join(ROOT, "integration", "hicache", "dfkv_hot_config.py")
+HOT_VENDORED = [
+    os.path.join(ROOT, "integration", "vllm", "src", "dfkv_vllm", "_hot_config.py"),
+    os.path.join(ROOT, "integration", "lmcache", "src", "dfkv_connector", "_hot_config.py"),
+]
+
+
+class HotConfigVendorSyncTest(unittest.TestCase):
+    def test_vendored_hot_config_is_byte_identical(self):
+        with open(HOT_CANON, "rb") as fh:
+            canon = fh.read()
+        for path in HOT_VENDORED:
+            self.assertTrue(os.path.exists(path), "missing vendored file: " + path)
+            with open(path, "rb") as fh:
+                got = fh.read()
+            self.assertEqual(
+                got, canon,
+                "{} drifted from canonical; run deploy/sync_telemetry.sh".format(path))
+
+
 if __name__ == "__main__":
     unittest.main()
