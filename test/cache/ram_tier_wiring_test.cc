@@ -204,3 +204,42 @@ TEST(RamTierWiring, PutAdmissionGateRejectsWithCacheFull) {
   s.reset();
   fs::remove_all(dir);
 }
+
+// The uring prep path partitions keys up front: RAM-resident -> decline
+// (kInvalid, sync arena serve), absent -> async disk read. The absent branch
+// never reaches GetPrep, so it must count the RAM miss itself — without that,
+// the default read path reports dfkv_ram_miss_total == 0 forever while hits
+// accumulate, and hit/(hit+miss) reads as a fake 100% (seen in production:
+// 985k hits / 0 misses across a 15TB read campaign).
+TEST(RamTierWiring, UringPrepPathCountsRamMisses) {
+  ::setenv("DFKV_RAM_TIER", "1", 1);
+  ::setenv("DFKV_RAM_TIER_BYTES", "8388608", 1);
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_ramwire_prep";
+  auto s = Start(dir, &addr);
+  TcpTransport t;
+  std::string v(4096, 'q');
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("resident"), v.data(), v.size()), Status::kOk);
+
+  const BlockKey rk = ToBlockKey("resident");
+  const BlockKey ak = ToBlockKey("absent-key");
+  KVStore::RangePrep prep;
+
+  // RAM-resident: prep declines so the serve loop falls back to the arena.
+  // Consulted-and-present is NOT a miss.
+  const long miss0 = MetricVal(s->MetricsText(), "dfkv_ram_miss_total");
+  EXPECT_EQ(s->RangeDirectPrep(rk.id, rk.index, rk.size, 0, v.size(), 1 << 20, &prep),
+            Status::kInvalid);
+  EXPECT_EQ(MetricVal(s->MetricsText(), "dfkv_ram_miss_total"), miss0);
+
+  // Absent everywhere: RAM consulted and absent -> exactly one RAM miss,
+  // regardless of the disk outcome (kNotFound here).
+  EXPECT_EQ(s->RangeDirectPrep(ak.id, ak.index, ak.size, 0, 16, 1 << 20, &prep),
+            Status::kNotFound);
+  EXPECT_EQ(MetricVal(s->MetricsText(), "dfkv_ram_miss_total"), miss0 + 1);
+
+  s.reset();
+  ::unsetenv("DFKV_RAM_TIER");
+  ::unsetenv("DFKV_RAM_TIER_BYTES");
+  fs::remove_all(dir);
+}
