@@ -124,6 +124,14 @@ class RamTier {
   bool Contains(const BlockKey& key) const;
   bool Remove(const BlockKey& key);  // drop from RAM (cache); true if present
 
+  // Explicit miss accounting for GET paths that consult the tier via Contains()
+  // instead of GetPrep(). The uring prep path partitions keys up front
+  // (RAM-resident -> sync arena serve, absent -> async disk read); its absent
+  // branch never reaches GetPrep, so without this the dominant read path
+  // under-reports misses to zero. Contains() itself must NOT count: the exist
+  // path probes it too, and exist probes are not GETs.
+  void CountMiss() { misses_.fetch_add(1, std::memory_order_relaxed); }
+
   // Registers the arena's RDMA MR (set once by the RDMA server after reg_mr).
   void SetArenaMr(void* mr);
   char* arena() const { return arena_; }

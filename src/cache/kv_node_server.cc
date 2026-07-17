@@ -575,6 +575,12 @@ Status KvNodeServer::RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize
     if (out) *out = KVStore::RangePrep{};
     return Status::kInvalid;
   }
+  // RAM consulted and absent -> this GET is a RAM-tier miss regardless of the
+  // disk outcome (mirrors GetPrep's accounting on the sync path). Without this
+  // the uring path -- the default since v1.20.0 opt-in / v1.27.0 default-on --
+  // reports dfkv_ram_miss_total == 0 forever while hits accumulate, so
+  // hit/(hit+miss) reads as a fake 100%.
+  if (ram_) ram_->CountMiss();
   Status st = group_.RangeDirectPrep(key, offset, length, io_cap, out);
   // Only miss/io-error are final here; a kOk prep is accounted on read completion
   // (RangeDirectComplete) because the async read can still fail.
