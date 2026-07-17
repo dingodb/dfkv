@@ -149,6 +149,14 @@ class KvNodeServer {
   std::atomic<size_t> open_connections_{0};
   Sampler lat_sampler_{64};        // 1-in-64 latency sampling (near-zero hot-path cost)
   LatencyHist get_lat_, put_lat_;  // server-side op latency (sampled)
+  // Exist HANDLER latency (Contains + IsCached under the shard/reclaim locks).
+  // Separate from get: exist is a key-only probe with a completely different
+  // latency profile, and its tail is the first thing to check when L3 prefetch
+  // stalls (a slow exist blocks the prefetch decision). This measures the
+  // handler body only; serve-loop queueing (a large GET draining ahead of an
+  // exist on the same connection) is a separate, connection-ordered cost the
+  // client's control-lane QP split is meant to avoid.
+  LatencyHist exist_lat_;
   std::string members_;  // advertised cluster membership (kMembers)
   uint64_t max_request_payload_ = 0;  // 0 = resolve default lazily (see .cc)
   std::string node_id_, node_group_;       // identity for Prometheus labels (optional)
