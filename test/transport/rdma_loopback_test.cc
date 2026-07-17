@@ -897,7 +897,9 @@ struct RdmaUringNode {
           return st;
         });
     rsrv->set_range_complete_handler(
-        [this](bool ok, size_t bytes) { srv->RangeDirectComplete(ok, bytes); });
+        [this](bool ok, size_t bytes, double elapsed_sec) {
+          srv->RangeDirectComplete(ok, bytes, elapsed_sec);
+        });
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
   }
@@ -994,6 +996,18 @@ TEST(RdmaLoopback, UringAsyncGetManyConcurrentInOrder) {
       EXPECT_FALSE(mgr[i]) << "absent key should miss: " << mkeys[i];
     }
   }
+
+  // The async (uring) read path now feeds op="get" latency: after this many
+  // disk-backed GETs the 1/64 sampler must have recorded at least one sample,
+  // where before this change the default read path was latency-blind. (When the
+  // shell forces DFKV_SERVER_URING=0 the sync RangeDirect samples the same
+  // series, so the assertion holds through both serve loops.)
+  const std::string mtext = node.srv->MetricsText();
+  auto gp = mtext.find("dfkv_op_latency_seconds_count{op=\"get\"}");
+  ASSERT_NE(gp, std::string::npos) << mtext;
+  long gcnt = std::stol(mtext.substr(
+      gp + std::string("dfkv_op_latency_seconds_count{op=\"get\"}").size()));
+  EXPECT_GT(gcnt, 0) << "uring GET path recorded no op=\"get\" latency sample";
 
   ::unsetenv("DFKV_SERVER_URING");
   ::unsetenv("DFKV_SERVER_URING_DEPTH");

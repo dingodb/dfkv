@@ -107,7 +107,9 @@ class KvNodeServer {
                          uint64_t offset, uint64_t length, size_t io_cap,
                          KVStore::RangePrep* out);
   // Account a completed prep-based GET (called after the async read finishes).
-  void RangeDirectComplete(bool ok, size_t bytes_read);
+  // elapsed_sec = submit->completion wall time; sampled into get_lat_ so the
+  // default (uring) read path is no longer absent from op="get" latency.
+  void RangeDirectComplete(bool ok, size_t bytes_read, double elapsed_sec);
   // Balance a prep whose RangePrep::token != 0 (slab pins the slot across the
   // async read); routed to the owning engine via the token's disk-index byte.
   void RangePrepRelease(uint64_t token) { group_.RangeRelease(token); }

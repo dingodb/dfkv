@@ -601,13 +601,18 @@ Status KvNodeServer::RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize
   return st;
 }
 
-void KvNodeServer::RangeDirectComplete(bool ok, size_t bytes_read) {
+void KvNodeServer::RangeDirectComplete(bool ok, size_t bytes_read,
+                                       double elapsed_sec) {
   if (ok) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
   } else {
     get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
+  // Sample the async (uring) read latency into the SAME op="get" histogram the
+  // synchronous RangeDirect feeds — before this the default read path since
+  // v1.27.0 contributed no latency samples at all.
+  if (lat_sampler_.ShouldSample()) get_lat_.Observe(elapsed_sec);
 }
 
 bool KvNodeServer::RamRangePrep(uint64_t id, uint32_t index, uint32_t ksize,

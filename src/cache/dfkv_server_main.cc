@@ -255,8 +255,8 @@ int main(int argc, char** argv) {
           return st;
         });
     rsrv->set_range_complete_handler(
-        [&srv](bool ok, size_t bytes_read) {
-          srv.RangeDirectComplete(ok, bytes_read);
+        [&srv](bool ok, size_t bytes_read, double elapsed_sec) {
+          srv.RangeDirectComplete(ok, bytes_read, elapsed_sec);
         });
     // RAM hot tier (P3 B5-3): when enabled, register the arena as a pool MR and
     // wire the zero-copy serve hooks so a RAM hit is scatter-sent straight from
