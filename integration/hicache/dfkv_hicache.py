@@ -28,8 +28,10 @@ from typing import List, Optional
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
 from dfkv_access_log import (access_log, configure as _configure_access_log,
+                            apply_hot as _access_log_apply_hot,
                             fmt_bytes as _fmt_bytes, fmt_pools as _fmt_pools,
                             fmt_pool_results as _fmt_pool_results)
+import dfkv_hot_config as _hot_config
 from dfkv_metrics import Metrics as _Metrics, ClientStatsPoller as _ClientStatsPoller
 from dfkv_telemetry import metrics as _push_metrics, config as _tcfg
 from dfkv_telemetry import tracing as _tracing
@@ -198,6 +200,11 @@ class DfkvHiCache(HiCacheStorage):
         # Access log: idempotent per process (first instance wins). Configured
         # here so tp_rank/model are available for the {rank} path placeholder.
         _configure_access_log(cfg, tp_rank=self.tp_rank, model=self.model)
+        # Hot-reload: a background watcher lets ops flip access_log (and future
+        # observability knobs) live via a control file — no SGLang restart. Only
+        # zero-correctness-impact knobs are hot; structural/native knobs are not.
+        _hot_config.register("access_log", _access_log_apply_hot)
+        _hot_config.start(cfg, tp_rank=self.tp_rank)
         self._alog_tag = f"r{self.tp_rank}"
         # Client-side read/write counters (Prometheus when available). Lets ops
         # confirm SGLang->dfkv volume from /metrics instead of parsing access logs.
@@ -377,6 +384,10 @@ class DfkvHiCache(HiCacheStorage):
             lambda: _read_snapshot(self._lib, self._h), peer_poll_s)
 
     def __del__(self):
+        try:
+            _hot_config.stop()
+        except Exception:
+            pass
         try:
             if getattr(self, "_poller", None):
                 self._poller.stop()

@@ -54,15 +54,25 @@ import logging.handlers
 import os
 import queue
 import sys
+import threading
 import time
 from typing import Any, Callable, Optional
 
-# Module state, populated by configure() (first call in the process wins).
+# Module state. configure() (first call in the process) snapshots the launch
+# config; apply_hot() (from the hot-config watcher thread, dfkv_hot_config) may
+# re-apply it later, so all mutating paths take _lock. access_log() reads
+# _ENABLED / _THRESHOLD_US WITHOUT the lock — plain bool/int reads under the GIL;
+# a stale read at worst mislabels one op, acceptable for a diagnostic log.
 _ENABLED: bool = False
 _THRESHOLD_US: int = 0
 _logger: Optional[logging.Logger] = None
 _listener: Optional[logging.handlers.QueueListener] = None
 _configured: bool = False
+_lock = threading.Lock()
+_sink_want: Optional[tuple] = None   # (path, max_bytes, backup_count) the live sink was built for
+_launch_cfg: dict = {}               # snapshot from configure(); apply_hot() layers file overrides on top
+_tp_rank: int = 0
+_model: str = ""
 
 
 def _truthy(v: Any) -> bool:
@@ -89,32 +99,27 @@ def _stop_listener(listener) -> None:
         listener.stop()
 
 
-def configure(cfg: Optional[dict], tp_rank: int = 0, model: str = "") -> None:
-    """Initialize the access logger from an extra_config dict (runtime).
-
-    Idempotent: the first call in the process builds (or skips) the logger and
-    later calls are no-ops, so it is safe to call from every
-    ``DfkvHiCache.__init__``. In SGLang each process owns one backend instance,
-    so divergent configs in one process don't occur in practice.
-    """
-    global _ENABLED, _THRESHOLD_US, _logger, _listener, _configured
-    if _configured:
-        return
-    _configured = True
-
-    cfg = cfg or {}
-    enabled = _truthy(_resolve(cfg, "access_log", "DFKV_ACCESS_LOG_ENABLED", False))
-    path = str(_resolve(cfg, "access_log_path", "DFKV_ACCESS_LOG_PATH", "")).strip()
+def _int(cfg: dict, key: str, env: str, default: int) -> int:
     try:
-        _THRESHOLD_US = int(_resolve(cfg, "access_log_threshold_us",
-                                     "DFKV_ACCESS_LOG_THRESHOLD_US", 0))
+        return int(_resolve(cfg, key, env, default))
     except (TypeError, ValueError):
-        _THRESHOLD_US = 0
+        return default
 
-    if not enabled:
-        _ENABLED = False
-        return
 
+def _build_sink(path: str, max_bytes: int, backup_count: int,
+                tp_rank: int, model: str) -> None:
+    """(Re)build the logger + async QueueListener for the given sink params.
+
+    Tears down any previous listener/handlers first so a hot path change never
+    double-writes. Sets _logger / _listener. Caller holds _lock.
+
+    Size-based rotation keeps an enabled log from growing a single file
+    unbounded: at max_bytes it rolls acc.log -> acc.log.1 -> ... up to
+    backup_count, then overwrites the oldest (disk per rank bounded by
+    max_bytes * (backup_count + 1)). max_bytes=0 disables rotation (legacy
+    single unbounded file, an escape hatch).
+    """
+    global _logger, _listener
     if path:
         if "{rank}" in path or "{model}" in path:
             path = path.format(rank=tp_rank, model=model)
@@ -122,32 +127,6 @@ def configure(cfg: Optional[dict], tp_rank: int = 0, model: str = "") -> None:
             # auto-suffix so per-rank processes never share one file:
             # access.log -> access.log.r0, access.log.r1, ...
             path = f"{path}.r{tp_rank}"
-
-    log = logging.getLogger("dfkv.access")
-    log.setLevel(logging.INFO)
-    log.propagate = False  # keep out of root logger / SGLang's stack
-    if log.handlers:  # already configured (defensive, e.g. on re-import)
-        _logger = log
-        _ENABLED = True
-        return
-
-    # Size-based rotation so an enabled access log can never grow a single file
-    # unbounded. max_bytes=0 disables rotation (legacy single-file behavior, an
-    # escape hatch). Disk per rank is bounded by max_bytes * (backup_count + 1).
-    try:
-        max_bytes = int(_resolve(cfg, "access_log_max_bytes",
-                                 "DFKV_ACCESS_LOG_MAX_BYTES", 128 * 1024 * 1024))
-    except (TypeError, ValueError):
-        max_bytes = 128 * 1024 * 1024
-    try:
-        backup_count = int(_resolve(cfg, "access_log_backup_count",
-                                    "DFKV_ACCESS_LOG_BACKUP_COUNT", 5))
-    except (TypeError, ValueError):
-        backup_count = 5
-    if max_bytes < 0:
-        max_bytes = 0
-    if backup_count < 0:
-        backup_count = 0
 
     if path:
         try:
@@ -169,6 +148,15 @@ def configure(cfg: Optional[dict], tp_rank: int = 0, model: str = "") -> None:
                           datefmt="%Y-%m-%d %H:%M:%S")
     )
 
+    # Tear down a prior listener/handlers (a hot path/rotation change rebuilds).
+    _stop_listener(_listener)
+    _listener = None
+    log = logging.getLogger("dfkv.access")
+    log.setLevel(logging.INFO)
+    log.propagate = False  # keep out of root logger / SGLang's stack
+    for h in list(log.handlers):
+        log.removeHandler(h)
+
     # Unbounded queue: enqueueing never blocks; if the listener can't keep up
     # we'd rather grow memory than stall the hot path. In practice the queue
     # stays empty because emit is ~10 us and ops are ~ms.
@@ -176,10 +164,69 @@ def configure(cfg: Optional[dict], tp_rank: int = 0, model: str = "") -> None:
     _listener = logging.handlers.QueueListener(q, sink, respect_handler_level=False)
     _listener.start()
     atexit.register(_stop_listener, _listener)
-
     log.addHandler(logging.handlers.QueueHandler(q))
     _logger = log
+
+
+def _apply(cfg: Optional[dict], tp_rank: int, model: str) -> None:
+    """Resolve the access-log knobs from cfg and (re)apply them. Caller holds
+    _lock. Enables/disables live; builds the sink lazily on first enable and
+    rebuilds only when path/rotation params change."""
+    global _ENABLED, _THRESHOLD_US, _sink_want
+    cfg = cfg or {}
+    _THRESHOLD_US = max(0, _int(cfg, "access_log_threshold_us",
+                                "DFKV_ACCESS_LOG_THRESHOLD_US", 0))
+    if not _truthy(_resolve(cfg, "access_log", "DFKV_ACCESS_LOG_ENABLED", False)):
+        _ENABLED = False   # keep the sink around for a cheap re-enable
+        return
+    path = str(_resolve(cfg, "access_log_path", "DFKV_ACCESS_LOG_PATH", "")).strip()
+    max_bytes = _int(cfg, "access_log_max_bytes", "DFKV_ACCESS_LOG_MAX_BYTES",
+                     128 * 1024 * 1024)
+    backup_count = _int(cfg, "access_log_backup_count",
+                        "DFKV_ACCESS_LOG_BACKUP_COUNT", 5)
+    if max_bytes < 0:
+        max_bytes = 0
+    if backup_count < 0:
+        backup_count = 0
+    want = (path, max_bytes, backup_count)
+    if _logger is None or _sink_want != want:
+        _build_sink(path, max_bytes, backup_count, tp_rank, model)
+        _sink_want = want
     _ENABLED = True
+
+
+def configure(cfg: Optional[dict], tp_rank: int = 0, model: str = "") -> None:
+    """Initialize the access logger from an extra_config dict (runtime).
+
+    Idempotent: the first call in the process snapshots the launch config and
+    applies it; later calls are no-ops, so it is safe to call from every
+    ``DfkvHiCache.__init__``. The snapshot lets :func:`apply_hot` (driven by the
+    dfkv_hot_config file watcher) layer live file overrides on top and revert
+    cleanly to launch behavior when the control file is removed.
+    """
+    global _configured, _launch_cfg, _tp_rank, _model
+    with _lock:
+        if _configured:
+            return
+        _configured = True
+        _launch_cfg = dict(cfg or {})
+        _tp_rank = tp_rank
+        _model = model
+        _apply(_launch_cfg, tp_rank, model)
+
+
+def apply_hot(overrides: Optional[dict]) -> None:
+    """Re-apply access-log knobs from a dict of live control-file overrides,
+    layered over the launch config (absent key -> launch default, so deleting
+    the control file reverts everything). Thread-safe; called by the
+    dfkv_hot_config watcher. No-op before :func:`configure` has run."""
+    with _lock:
+        if not _configured:
+            return
+        merged = dict(_launch_cfg)
+        if overrides:
+            merged.update(overrides)
+        _apply(merged, _tp_rank, _model)
 
 
 def is_enabled() -> bool:

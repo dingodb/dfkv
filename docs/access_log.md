@@ -39,7 +39,8 @@
 
 - 开关取值接受 `1/true/yes/on`（大小写不敏感）或 JSON 里的 `1`/布尔。
 - `access_log_threshold_us` 设成比如 `1000`，则只记录耗时 ≥ 1ms 的操作，排查长尾很方便。
-- 配置在插件 `__init__` 里**运行时解析一次**（每进程首个实例生效，幂等）；不像 dingofs 在 import 时读 env。
+- 配置在插件 `__init__` 里**解析一次**作为「启动基线」（每进程首个实例生效，幂等）；不像 dingofs 在 import 时读 env。
+- **不重启也能开关**：设了 `DFKV_HOT_CONFIG` 后，`access_log` / `access_log_path` / `access_log_threshold_us` 等可通过控制文件**运行时热生效**，见下文 [运行时热开关](#运行时热开关不重启-sglang)。
 
 ## 日志滚动与清理（自动，无需 logrotate）
 
@@ -97,6 +98,45 @@ SGLang 每个 TP rank 一个进程，会**同时写同一路径**。为避免互
 
 所以上面方式 A/B 配 `access.log`，rank 0 的实际文件是 `access.log.r0`。
 
+## 运行时热开关（不重启 SGLang）
+
+access log 的启动基线在插件 `__init__` 解析后，`access_log()` 每次调用**都读模块级开关**，所以只要能在运行时翻转开关就能免重启生效。dfkv 用**控制文件 + 后台 watcher 线程**实现（`dfkv_hot_config.py`），不占端口、不用信号、TP8 八个 rank 读同一文件一次全生效。
+
+**默认关闭（opt-in）**：只有显式设置了控制文件路径（`DFKV_HOT_CONFIG` 环境变量或 `extra_config` 的 `hot_config_path`）才会启动 watcher；没设则一切照旧、零新线程零开销。
+
+> ⚠️ 热开关目前**仅 SGLang HiCache 连接器**支持。vLLM 直连 / LMCache 连接器的 `DFKV_ACCESS_LOG_*` 仍是启动期一次性解析，改了要重启（其 access log 行格式与本文一致，仅无热加载）。
+
+| 作用 | `extra_config` 键 | 环境变量 | 默认 |
+|---|---|---|---|
+| 控制文件路径（**设了才开热加载**） | `hot_config_path` | `DFKV_HOT_CONFIG` | 空 → 热加载关闭 |
+| 轮询周期（秒） | `hot_config_poll_s` | `DFKV_HOT_CONFIG_POLL_S` | `5.0`；`≤0` 关闭 |
+
+**用法**：启动时只需多给一个控制文件路径（值本身可以先不存在）：
+
+```bash
+DFKV_HOT_CONFIG=/etc/dfkv/hot.json \
+DFKV_ACCESS_LOG_PATH=/var/log/dfkv/access.log \
+sglang serve ...        # 启动时 access_log 仍是关的
+```
+
+事故来了要抓日志时，**不重启**，写一下控制文件即可（最多 `hot_config_poll_s` 秒后八个 rank 全部生效）：
+
+```bash
+# 开（只抓 ≥1ms 的慢调用，减量）
+echo '{"access_log": true, "access_log_threshold_us": 1000}' > /etc/dfkv/hot.json
+# 排查完关掉：删文件即完全回到启动基线（此处基线是「关」）
+rm -f /etc/dfkv/hot.json
+```
+
+**语义**：控制文件是「实时覆盖层」，叠加在启动基线之上——
+
+- 文件里**出现**的键覆盖启动值；**缺失**的键回落到启动基线值。
+- **删除文件 = 清空覆盖**，所有热 knob 干净回到启动基线（上例即回到「关」）。
+- 文件格式错误会被**忽略**（保留上一份好配置）并下个周期重试，不会中断服务。
+- `access_log_path` / 滚动参数变了会安全重建 sink（旧 listener 先停），不双写。
+
+**范围（Phase 1）**：只有**零正确性影响的观测类** knob 可热生效——目前是 access_log 家族。结构/连接类（`rdma` / `lib` / `register` / `node_dedup`）和 **C 客户端里 `static const` 缓存的** knob（`peer_cooldown` / `get_miss_retries` / `node_dedup_log` …）**仍需重启**：它们在 native 客户端构造期或首个 op 就冻结了，Python 侧翻转 env 无效，属单独的 native 改动（Phase 2）。
+
 ## 日志格式与各 op 的结果含义
 
 `<op>(<参数>) : <结果> <耗时秒>`。覆盖的接口与对应 `<结果>`：
@@ -130,10 +170,14 @@ SGLang 每个 TP rank 一个进程，会**同时写同一路径**。为避免互
 DFKV_BUILD=$(pwd)/build python3 test/python/test_dfkv_hicache.py   # 含 access-log + 滚动用例
 # 滚动用例不依赖 node/so，可单独快速跑：
 python3 -m unittest test_dfkv_hicache.DfkvAccessLogRotationTest -v
+# 热开关（纯 Python，无需 node/so/GPU）：
+python3 -m unittest test_dfkv_hot_config -v
 ```
 
 ## 实现位置
 
-- [integration/hicache/dfkv_access_log.py](../integration/hicache/dfkv_access_log.py) — `configure()` / `access_log()` 上下文管理器、noop 单例、异步队列、格式化辅助。
-- [integration/hicache/dfkv_hicache.py](../integration/hicache/dfkv_hicache.py) — `__init__` 里调 `configure()`，并用 `with access_log(...)` 包住各继承接口。
+- [integration/hicache/dfkv_access_log.py](../integration/hicache/dfkv_access_log.py) — `configure()`（启动基线，幂等）/ `apply_hot()`（热覆盖）/ `access_log()` 上下文管理器、noop 单例、异步队列、格式化辅助。
+- [integration/hicache/dfkv_hot_config.py](../integration/hicache/dfkv_hot_config.py) — 控制文件 watcher（后台守护线程）+ 通用 `register()` 注册表；opt-in（`DFKV_HOT_CONFIG` 设了才启动）。
+- [integration/hicache/dfkv_hicache.py](../integration/hicache/dfkv_hicache.py) — `__init__` 里调 `configure()`、`register("access_log", apply_hot)` 并 `start()` watcher，并用 `with access_log(...)` 包住各继承接口。
 - [test/python/test_dfkv_hicache.py](../test/python/test_dfkv_hicache.py) — `DfkvAccessLogTest`（接口逐 op 日志）+ `DfkvAccessLogRotationTest`（滚动/清理）测试类。
+- [test/python/test_dfkv_hot_config.py](../test/python/test_dfkv_hot_config.py) — 热开关 + watcher 文件生命周期（纯 Python，无 native 依赖）。
