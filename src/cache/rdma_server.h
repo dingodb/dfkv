@@ -71,7 +71,14 @@ class RdmaServer {
       uint64_t length, size_t io_cap, RangePrepResult* out)>;
   // Optional accounting hook invoked once an async read completes (mirrors the
   // hit/io-error counters the synchronous RangeDirect bumps).
-  using RangeCompleteHandler = std::function<void(bool ok, size_t bytes_read)>;
+  // elapsed_sec = wall time from prep (read submit) to completion, so the
+  // accounting hook can observe the default (uring) path's disk-read latency —
+  // the synchronous RangeDirect samples get_lat_ itself, but the async path
+  // never did, leaving dfkv_op_latency_seconds{op="get"} blind to the default
+  // read path since v1.27.0. Negative/zero-cost when the sampler skips (the
+  // serve loop only stamps sampled reads).
+  using RangeCompleteHandler =
+      std::function<void(bool ok, size_t bytes_read, double elapsed_sec)>;
   // Releases a prep's release_token (slab slot pin) once its read is done.
   using RangeReleaseHandler = std::function<void(uint64_t token)>;
 

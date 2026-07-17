@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -35,6 +36,14 @@ namespace {
 static_assert(wire_limits::kIoAlign == rdma::kDirectIoAlign,
               "wire_limits must mirror the RDMA direct-IO alignment");
 using wire_limits::ResolveMaxPayload;
+
+// Monotonic seconds for the async-read submit->complete latency stamp. Read
+// twice per deferred GET (prep + completion), both off the SSD-bound path, so
+// the vDSO clock read is amortized away.
+inline double NowSteadySec() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 size_t ControlCapFor(size_t max_payload) {
   constexpr size_t kDefaultControlCap = 8u << 20;
@@ -504,6 +513,10 @@ void RdmaServer::Serve(int boot_fd) {
         uint64_t prep_token = 0;  // slab slot hold; released where fd is closed
         size_t head = 0;
         size_t payload_len = 0;
+        // Steady-clock seconds at prep (read submit), 0 = unsampled. Only the
+        // 1/64-sampled async reads are stamped; completion observes get_lat_ so
+        // the default uring read path is no longer latency-blind.
+        double submit_sec = 0.0;
         Reply reply;         // used when read_idx < 0
       };
       std::vector<UringReader::ReadDesc> descs;
@@ -568,6 +581,7 @@ void RdmaServer::Serve(int boot_fd) {
               qd.prep_token = pr.release_token;
               qd.head = pr.head;
               qd.payload_len = pr.payload_len;
+              qd.submit_sec = NowSteadySec();  // read submit -> completion latency
               deferred = true;
             } else if (pst == Status::kOk && pr.fd >= 0) {
               ::close(pr.fd);  // zero-len / oversize: handled by sync build below
@@ -646,7 +660,8 @@ void RdmaServer::Serve(int boot_fd) {
             qd.prep_token = 0;
           }
           if (range_complete_handler_)
-            range_complete_handler_(ok, ok ? qd.payload_len : 0);
+            range_complete_handler_(ok, ok ? qd.payload_len : 0,
+                                    NowSteadySec() - qd.submit_sec);
           char* sb = ep.sbuf(qd.send_slot);
           if (ok) {
             EncodeResp(sb, Status::kOk, qd.payload_len);
