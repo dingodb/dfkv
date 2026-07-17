@@ -82,10 +82,14 @@ class _Watcher(threading.Thread):
                 data = json.load(f)
         except FileNotFoundError:
             return {}
-        except (OSError, ValueError) as exc:
+        except Exception as exc:
+            # Catch-all on purpose: a garbage/binary file (UnicodeDecodeError,
+            # JSONDecodeError), a pathologically nested one (RecursionError), a
+            # permission/IO error (OSError) — none of it may crash or kill the
+            # watcher thread. Keep the last good config and retry next tick.
             sys.stderr.write(
                 f"[dfkv.hot] r{self._tp_rank} bad control file {self._path!r}: "
-                f"{exc}; keeping current config\n")
+                f"{type(exc).__name__}: {exc}; keeping current config\n")
             return None
         return data if isinstance(data, dict) else {}
 
