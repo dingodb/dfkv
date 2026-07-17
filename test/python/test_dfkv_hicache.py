@@ -1095,15 +1095,18 @@ class DfkvClientRegistrationTest(unittest.TestCase):
 
 
 class TestNodeDedupDefaults(unittest.TestCase):
-    """resolve_node_dedup policy (phase 9): auto-on for MLA+TP>1 only, with
-    explicit extra-config > env > auto precedence."""
+    """resolve_node_dedup policy (R2, 2026-07-17): default OFF for every
+    topology — the phase-9 MLA+TP>1 auto-on was refuted by the full-workload
+    A/B (hot rounds +19-36% TTFT worse with rendezvous vs -43% TTFT better
+    without). Explicit extra-config > env > default precedence unchanged."""
 
     def _r(self, cfg, env, mla, tp):
         from dfkv_hicache import resolve_node_dedup
         return resolve_node_dedup(cfg, env, mla, tp)
 
-    def test_auto_enables_for_mla_tp_gt1(self):
-        self.assertEqual(self._r(None, None, True, 8), ("1", True))
+    def test_no_auto_for_mla_tp_gt1(self):
+        # The phase-9 auto-on case: now stays off unless explicitly enabled.
+        self.assertEqual(self._r(None, None, True, 8), (None, False))
 
     def test_no_auto_for_mha(self):
         self.assertEqual(self._r(None, None, False, 8), (None, False))
@@ -1111,7 +1114,10 @@ class TestNodeDedupDefaults(unittest.TestCase):
     def test_no_auto_for_tp1(self):
         self.assertEqual(self._r(None, None, True, 1), (None, False))
 
-    def test_env_beats_auto(self):
+    def test_explicit_optin_via_config(self):
+        self.assertEqual(self._r("1", None, True, 8), ("1", False))
+
+    def test_env_stands(self):
         # operator already set it (either way): leave untouched, no auto log
         self.assertEqual(self._r(None, "0", True, 8), (None, False))
         self.assertEqual(self._r(None, "1", False, 1), (None, False))

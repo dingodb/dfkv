@@ -37,7 +37,7 @@ exist 命中 **≠** 数据真被拉回。SGLang HiCache 的 `prefetch-policy=ti
 - 客户端会合（**本期新增遥测**）：`dfkv_connector_dedup_hits_total` / `_fetches_total` / `_wait_hits_total` / `_wait_timeouts_total`（GPU 目标另有 `dfkv_connector_gpu_dedup_*`）。
 
 **判读**：
-- `dedup_hits + wait_hits` 占比高 = 同机 TP rank 的锁步读被会合到 1×（好）；`fetches` 接近请求数 = 会合没生效，8× 读放大在白吃带宽 → 确认 `DFKV_CLIENT_NODE_DEDUP=1`（MLA+TP>1 现默认开）。
+- 会合（node-dedup）**默认关**（R2 A/B 实测 2026-07-17：推理批形状下会合协调开销反噬——dedup-on 热轮 TTFT +19-36% 恶化、批 p99 22s；dedup-off 直连 8× 读放大反而 TTFT −43%、吞吐 +50-71%）。仅多节点环 fabric 带宽吃紧时显式开 `DFKV_CLIENT_NODE_DEDUP=1`，且必须实测热轮为正收益。开了之后才看 `dedup_hits/wait_hits/fetches` 三兄弟。
 - `wait_timeouts` 高 = 会合等待超时回退直连 → 读回带宽跟不上，见第③层。
 
 ---
@@ -63,7 +63,7 @@ exist 命中 **≠** 数据真被拉回。SGLang HiCache 的 `prefetch-policy=ti
 |---|---|---|---|
 | exist 命中率低、环快满 | ① | `used_bytes/cap`、`watermark_evictions` | 容量水位 + 别写满 |
 | exist 命中率低、环不满 | ① | `model_name`/`model_hash` | keyspace 对齐 |
-| exist 高但读回量小 | ② | `dedup_*`、`bytes_read` | 开 dedup、查 prefetch timeout |
+| exist 高但读回量小 | ② | `bytes_read`、access log | 查 prefetch timeout、确认 dedup 未误开 |
 | 热轮慢于冷轮 | ③ | 冷/热吞吐、读回 GB/s | 多节点、prefetch overlap |
 | 热轮仍大量写入 | ③ | `bytes_written` 热轮增量 | backup exist 门 |
 | lookup 尾延迟爆 | ②/③ | access log `batch_exists` p99 | rdma_depth=32、控制 lane |
