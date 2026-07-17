@@ -12,12 +12,12 @@ TEST(ClientMetrics, CountsServedErrorsTransitionsAndRenders) {
   const std::string p = "10.0.0.1:12000";
   // a healthy check, then a served response
   EXPECT_TRUE(h.Healthy(p, 1000));
-  h.MarkGood(p);
+  h.MarkGood(p, 0);
   // an IO error marks it bad (healthy->bad edge), then a skip while in cooldown
   h.MarkBad(p, 1000);
   EXPECT_FALSE(h.Healthy(p, 1500));   // still in cooldown -> skip
   // recovery: a later served response clears it (bad->good edge)
-  h.MarkGood(p);
+  h.MarkGood(p, 0);
 
   EXPECT_EQ(h.served(), 2u);
   EXPECT_EQ(h.errors(), 1u);
