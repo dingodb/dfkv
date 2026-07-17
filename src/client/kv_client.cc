@@ -733,48 +733,70 @@ std::vector<bool> KVClient::BatchGetDirect(const std::vector<KvGetItem>& items) 
     return std::vector<bool>(hit.begin(), hit.end());
   }
   // RDMA: group by (node, n) so each group shares the Range length, then pipeline.
-  std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
-  for (size_t i = 0; i < N; ++i) {
-    std::string node = Route(items[i].key);
-    if (node.empty()) continue;
-    by[{node, items[i].n}].push_back(i);
+  // Resolve one set of item indices -> hit[]. Reused for the miss-retry pass.
+  auto run_pass = [&](const std::vector<size_t>& todo) {
+    std::map<std::pair<std::string, size_t>, std::vector<size_t>> by;
+    for (size_t i : todo) {
+      std::string node = Route(items[i].key);
+      if (node.empty()) continue;
+      by[{node, items[i].n}].push_back(i);
+    }
+    std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
+    RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
+      const std::string& node = groups[g].first.first;
+      uint64_t now = NowMs();
+      if (!health_.Healthy(node, now)) return;
+      const size_t n = groups[g].first.second;
+      const std::vector<size_t>& idx = groups[g].second;
+      std::vector<BlockKey> keys;
+      std::vector<RangeDst> dsts;
+      keys.reserve(idx.size());
+      dsts.reserve(idx.size());
+      for (size_t k : idx) {
+        keys.push_back(ToBlockKey(items[k].key, self_hdr_.model_hash));
+        dsts.push_back(RangeDst{items[k].out, n});
+      }
+      // Zero-copy + zero-touch: the payload lands straight in items[].out (CPU never
+      // reads it); hdrs[] gets the value header for geometry verification only.
+      std::vector<std::string> hdrs;
+      std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
+      bool resp = false, ioerr = false;
+      // kInvalid (oversize/per-item guard) is neither: it must not clear the
+      // peer cooldown (resp) nor trip MarkBad (ioerr).
+      for (Status s : sts) {
+        if (s == Status::kIOError) ioerr = true;
+        else if (s == Status::kOk || s == Status::kNotFound) resp = true;
+      }
+      if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
+      for (size_t m = 0; m < idx.size(); ++m) {
+        if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
+        ValueHeader h;
+        if (!ValueHeader::Parse(hdrs[m].data(), hdrs[m].size(), &h)) continue;
+        if (!HeaderMatches(self_hdr_, h)) continue;
+        if (h.payload_len != n) continue;
+        hit[idx[m]] = 1;
+      }
+    });
+  };
+  std::vector<size_t> all(N);
+  for (size_t i = 0; i < N; ++i) all[i] = i;
+  run_pass(all);
+  // Bounded miss-retry (R4): under concurrent reads a resident block can transiently
+  // read absent for a few hundred microseconds during the RAM->disk flush/reclaim
+  // handoff (a shard-lock op briefly hides it from BOTH tiers; the server serves it
+  // on the very next attempt -- server cache_miss stays 0, quiescent reads never
+  // miss). One re-resolve of the missed subset recovers it. Guarded to a MINORITY
+  // of the batch so a genuinely cold batch (mostly missing) is not re-fetched
+  // wholesale -- the transient is a sprinkle in an otherwise-hit batch. Off with
+  // DFKV_GET_MISS_RETRIES=0.
+  static const int kGetMissRetries =
+      static_cast<int>(EnvSize("DFKV_GET_MISS_RETRIES", 1));
+  for (int r = 0; r < kGetMissRetries; ++r) {
+    std::vector<size_t> missed;
+    for (size_t i = 0; i < N; ++i) if (!hit[i]) missed.push_back(i);
+    if (missed.empty() || missed.size() > N / 2) break;  // none, or a cold batch
+    run_pass(missed);
   }
-  std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>> groups = ShardReadGroups(std::vector<std::pair<std::pair<std::string, size_t>, std::vector<size_t>>>(by.begin(), by.end()));
-  RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
-    const std::string& node = groups[g].first.first;
-    uint64_t now = NowMs();
-    if (!health_.Healthy(node, now)) return;
-    const size_t n = groups[g].first.second;
-    const std::vector<size_t>& idx = groups[g].second;
-    std::vector<BlockKey> keys;
-    std::vector<RangeDst> dsts;
-    keys.reserve(idx.size());
-    dsts.reserve(idx.size());
-    for (size_t k : idx) {
-      keys.push_back(ToBlockKey(items[k].key, self_hdr_.model_hash));
-      dsts.push_back(RangeDst{items[k].out, n});
-    }
-    // Zero-copy + zero-touch: the payload lands straight in items[].out (CPU never
-    // reads it); hdrs[] gets the value header for geometry verification only.
-    std::vector<std::string> hdrs;
-    std::vector<Status> sts = t_->RangeInto(node, keys, dsts, ValueHeader::kSize, &hdrs);
-    bool resp = false, ioerr = false;
-    // kInvalid (oversize/per-item guard) is neither: it must not clear the
-    // peer cooldown (resp) nor trip MarkBad (ioerr).
-    for (Status s : sts) {
-      if (s == Status::kIOError) ioerr = true;
-      else if (s == Status::kOk || s == Status::kNotFound) resp = true;
-    }
-    if (resp) health_.MarkGood(node, NowMs()); else if (ioerr) health_.MarkBad(node, NowMs());
-    for (size_t m = 0; m < idx.size(); ++m) {
-      if (sts[m] != Status::kOk || hdrs[m].size() < ValueHeader::kSize) continue;
-      ValueHeader h;
-      if (!ValueHeader::Parse(hdrs[m].data(), hdrs[m].size(), &h)) continue;
-      if (!HeaderMatches(self_hdr_, h)) continue;
-      if (h.payload_len != n) continue;
-      hit[idx[m]] = 1;
-    }
-  });
   uint64_t bytes = 0;
   for (size_t i = 0; i < N; ++i) if (hit[i]) bytes += items[i].n;
   return RecordBatch(OpMetrics::kGet, t0, hit, bytes);
