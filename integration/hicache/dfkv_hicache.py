@@ -46,18 +46,24 @@ def _truthy(v) -> bool:
 def resolve_node_dedup(cfg_value, env_value, is_mla: bool, tp_size: int):
     """Decide DFKV_CLIENT_NODE_DEDUP: (value_to_set | None, auto_enabled).
 
-    Precedence: explicit extra-config beats the env, the env beats the auto
-    default. The auto default enables the same-host rendezvous exactly for
-    the topology it exists for — MLA (TP-replicated KV) with tp_size > 1;
-    other topologies never rendezvous (per-rank keys differ) and are spared
-    the /dev/shm arena. Pure function so the policy is unit-testable.
+    Precedence: explicit extra-config beats the env, the env beats the
+    default. The default is OFF (R2 A/B verdict, 2026-07-17): on the full
+    GLM-5.2 100k-token workload the shm rendezvous inverted the L3 value —
+    dedup-on hot rounds ran +19-36% TTFT WORSE than cold with 22s p99 batch
+    tails, while dedup-off hot rounds beat cold by 43% TTFT / +50-71%
+    throughput. The 8x direct-read amplification is cheaper than the
+    rendezvous coordination (publish copies through the 512MiB arena +
+    wait-timeout fallbacks) at inference batch shapes; the v1.26.0
+    conditional auto-on was validated only on microbenchmarks. Rendezvous
+    stays available explicitly (node_dedup=1 / DFKV_CLIENT_NODE_DEDUP=1)
+    for fabric-constrained multi-node rings until the publish path is
+    redesigned (zero-copy publish, per-key streaming). Pure function so the
+    policy is unit-testable.
     """
     if cfg_value is not None:
         return ("1" if _truthy(cfg_value) else "0"), False
     if env_value is not None:
         return None, False  # operator's env stands as-is
-    if is_mla and tp_size > 1:
-        return "1", True
     return None, False
 
 
@@ -256,13 +262,12 @@ class DfkvHiCache(HiCacheStorage):
                 os.environ.setdefault("DFKV_RDMA_NUMA", "1")
             # Same-host GET rendezvous (phase 5): dedups TP-replicated L3 loads
             # across the rank processes of one node (HiCache destinations are
-            # HOST memory — the host flavor applies). Since phase 9 it is ON BY
-            # DEFAULT exactly for the topology it exists for: MLA (replicated
-            # KV) with tp_size > 1 — the measured 8x lockstep read case. Other
-            # topologies gain nothing (per-rank keys never rendezvous) and are
-            # spared the 512 MiB /dev/shm arena. Explicit settings always win:
-            # extra-config `node_dedup` beats the env, the env beats the auto
-            # default; "0" anywhere disables.
+            # HOST memory — the host flavor applies). Default OFF since the R2
+            # A/B (2026-07-17): at inference batch shapes the rendezvous
+            # inverted the L3 benefit (see resolve_node_dedup docstring for
+            # the measured numbers); direct 8x reads are cheaper until the
+            # publish path is redesigned. Explicit settings always win:
+            # extra-config `node_dedup` beats the env; "1" opts back in.
             _dedup, _auto = resolve_node_dedup(
                 cfg.get("node_dedup"), os.environ.get("DFKV_CLIENT_NODE_DEDUP"),
                 self.is_mla, self.tp_size)
