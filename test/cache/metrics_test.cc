@@ -166,3 +166,33 @@ TEST(Metrics, RemoteStatsOp) {
   EXPECT_NE(text.find("dfkv_cache_put_total 1"), std::string::npos) << text;
   s->Stop();
 }
+
+// exist latency histogram: the exist handler body is sampled into a distinct
+// op="exist" series (separate from get/put). Its tail is the first signal to
+// check when L3 prefetch stalls — before this it was invisible in metrics and
+// only surfaced in the client access log by chance.
+TEST(Metrics, ExistLatencyHistogramPresent) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_existlat";
+  auto s = Start(dir, &addr);
+  TcpTransport t;
+  std::string v(100, 'x');
+  ASSERT_EQ(t.Cache(addr, ToBlockKey("k"), v.data(), v.size()), Status::kOk);
+  // Drive enough exist probes that the sampler (1/64) records at least one.
+  bool e = false;
+  for (int i = 0; i < 4096; ++i) {
+    ASSERT_EQ(t.Exist(addr, ToBlockKey("k"), &e), Status::kOk);
+    ASSERT_EQ(t.Exist(addr, ToBlockKey("absent"), &e), Status::kOk);
+  }
+  std::string text = s->MetricsText();
+  // The op="exist" latency series exists and is distinct from get/put.
+  EXPECT_NE(text.find("dfkv_op_latency_seconds_count{op=\"exist\"}"),
+            std::string::npos) << text;
+  // Extract the exist count and assert the sampler recorded something.
+  auto pos = text.find("dfkv_op_latency_seconds_count{op=\"exist\"}");
+  ASSERT_NE(pos, std::string::npos);
+  long cnt = std::stol(text.substr(pos + std::string(
+      "dfkv_op_latency_seconds_count{op=\"exist\"}").size()));
+  EXPECT_GT(cnt, 0) << "sampler recorded no exist latency over 8192 probes";
+  s->Stop();
+}

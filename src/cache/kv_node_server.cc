@@ -251,8 +251,10 @@ std::string KvNodeServer::MetricsText() const {
     std::string put_lbl = std::string("op=\"put\"") + (idlabels.empty() ? "" : "," + idlabels);
     s += "# HELP dfkv_op_latency_seconds Sampled server op latency seconds\n";
     s += "# TYPE dfkv_op_latency_seconds histogram\n";
+    std::string exist_lbl = std::string("op=\"exist\"") + (idlabels.empty() ? "" : "," + idlabels);
     s += get_lat_.RenderBody("dfkv_op_latency_seconds", get_lbl);
     s += put_lat_.RenderBody("dfkv_op_latency_seconds", put_lbl);
+    s += exist_lat_.RenderBody("dfkv_op_latency_seconds", exist_lbl);
   }
   // Slab engine internals, emitted only for slab so a file-engine scrape is
   // unchanged. The dio_*_fallback counters are the "page cache silently crept
@@ -409,7 +411,9 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
       if (samp) get_lat_.Observe(NowSec() - t0);
       break;
     }
-    case WireOp::kExist:
+    case WireOp::kExist: {
+      bool samp = lat_sampler_.ShouldSample();
+      double t0 = samp ? NowSec() : 0.0;
       // A RAM-resident block (possibly RAM-only, not yet flushed) must count as
       // present, else Exist would report absent for a just-written key.
       if ((ram_ && ram_->Contains(key)) || group_.IsCached(key)) {
@@ -417,7 +421,12 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
       } else {
         st = Status::kNotFound; exist_miss_.fetch_add(1, std::memory_order_relaxed);
       }
+      // Handler-body latency: both branches take the RAM shard lock (Contains)
+      // and/or the disk group's cached-set lock (IsCached), which a slab reclaim
+      // or flush can hold — the tail here is a lock-contention signal.
+      if (samp) exist_lat_.Observe(NowSec() - t0);
       break;
+    }
     case WireOp::kRemove: {
       // Drop from both tiers. RamTier::Remove is best-effort (a still-flushing or
       // in-flight slot declines and is reclaimed later under pressure); the L2
