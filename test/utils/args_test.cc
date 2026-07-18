@@ -108,7 +108,8 @@ TEST(Args, ServerFlagFacadesAllAccepted) {
       "--rdma-depth", "--rdma-numa", "--rdma-idle-ms",
       "--rdma-op-timeout-ms", "--server-uring",
       "--server-uring-depth", "--ram-flush-threads",
-      "--ram-tier-numa", "--slab-table-sync-ms", "--log"};
+      "--ram-tier-numa", "--ram-tier-shards", "--slab-table-sync-ms",
+      "--slab-reclaim-ms", "--ram-reclaim-ms", "--log"};
   // Every facade flag parses cleanly (non-empty value, ok=true).
   for (const auto& f : server_valued) {
     Argv a({"prog", f, "1"});

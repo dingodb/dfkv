@@ -217,6 +217,7 @@ a stock `v1.7.0` node behaves exactly like `v1.6.x`.
 |---------|-------------|---------|-------|
 | slab storage engine | `--store-engine=slab` / `DFKV_STORE_ENGINE=slab` | `file` | needs clean-disk cold start |
 | RAM hot tier | `DFKV_RAM_TIER=1` (+ `DFKV_RAM_TIER_BYTES`) | off | write-through + RDMA zero-copy GET |
+| RAM tier lock shards | `--ram-tier-shards` / `DFKV_RAM_TIER_SHARDS` | 8 | 1-64; per-shard lock is the >8-connection concurrency ceiling; auto-halved while a shard would hold <32 extents |
 | RDMA transport | build `-DDFKV_WITH_RDMA=ON`, `DFKV_RDMA=1` | TCP | device by name `DFKV_RDMA_DEV` |
 | io_uring async GET | build `-DDFKV_WITH_URING`, `DFKV_SERVER_URING=1` | off | disk-read path only |
 

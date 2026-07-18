@@ -64,6 +64,7 @@ int main(int argc, char** argv) {
       "  --server-uring-depth <n>  io_uring SQ depth (env DFKV_SERVER_URING_DEPTH)\n"
       "  --ram-flush-threads <n>   RAM tier flush thread count (env DFKV_RAM_FLUSH_THREADS)\n"
       "  --ram-tier-numa <n>  RAM tier NUMA node (env DFKV_RAM_TIER_NUMA)\n"
+      "  --ram-tier-shards <n>  RAM tier lock shards, 1-64 (env DFKV_RAM_TIER_SHARDS; default 8)\n"
       "  --slab-table-sync-ms <n>  slab table sync cadence ms (env DFKV_SLAB_TABLE_SYNC_MS)\n"
       "  --slab-reclaim-ms <n>  slab background free-slot reclaimer cadence ms, 0 = off (env DFKV_SLAB_RECLAIM_MS)\n"
       "  --ram-reclaim-ms <n>   RAM tier background reclaimer cadence ms, 0 = off (env DFKV_RAM_RECLAIM_MS)\n"
@@ -85,7 +86,7 @@ int main(int argc, char** argv) {
                    "--rdma-depth", "--rdma-numa", "--rdma-idle-ms",
                    "--rdma-op-timeout-ms", "--server-uring",
                    "--server-uring-depth", "--ram-flush-threads",
-                   "--ram-tier-numa", "--slab-table-sync-ms",
+                   "--ram-tier-numa", "--ram-tier-shards", "--slab-table-sync-ms",
                    "--slab-reclaim-ms", "--ram-reclaim-ms", "--log"});
   std::string dir = args.Get("--dir", "/tmp/dfkv_node");
   std::string rdma_dev = args.Get("--rdma-dev", "");
@@ -150,6 +151,11 @@ int main(int argc, char** argv) {
     ::setenv("DFKV_RAM_FLUSH_THREADS", ram_flush_threads.c_str(), 1);
   std::string ram_tier_numa = args.Get("--ram-tier-numa", "");
   if (!ram_tier_numa.empty()) ::setenv("DFKV_RAM_TIER_NUMA", ram_tier_numa.c_str(), 1);
+  // RAM tier lock shards (1-64; the tier halves it while a shard would hold
+  // <32 extents, so small arenas degrade to fewer shards).
+  std::string ram_tier_shards = args.Get("--ram-tier-shards", "");
+  if (!ram_tier_shards.empty())
+    ::setenv("DFKV_RAM_TIER_SHARDS", ram_tier_shards.c_str(), 1);
   // Slab table sync cadence (ms).
   std::string slab_table_sync_ms = args.Get("--slab-table-sync-ms", "");
   if (!slab_table_sync_ms.empty())
