@@ -232,23 +232,16 @@ jobs:
           find "$PKG/python" "$PKG/integration" -type d \( -name '__pycache__' -o -name '*.egg-info' -o -name '.pytest_cache' \) -prune -exec rm -rf {} + 2>/dev/null || true
           cp README.md VERSION LICENSE "$PKG/"
           # 打包自检：静态解析 python/ 内所有本地 dfkv_* import，缺一个文件就 fail。
-          # （sglang 不在 runner 里装不了，真 import 跑不了，只能做依赖闭包检查——
-          #   正是这道门能在 CI 阶段拦住 v1.31.0 漏 dfkv_hot_config.py 这类事故。）
-          python3 - "$PKG/python" <<'PYEOF'
-          import pathlib, re, sys
-          pkg = pathlib.Path(sys.argv[1])
-          missing = set()
-          for f in pkg.glob("*.py"):
-              for m in re.finditer(r"^\s*(?:import|from)\s+(dfkv_\w+)", f.read_text(), re.M):
-                  name = m.group(1)
-                  if not ((pkg / f"{name}.py").is_file() or (pkg / name).is_dir()):
-                      missing.add(f"{f.name} -> {name}")
-          if missing:
-              print("ERROR: packaged python/ has unresolved local imports:")
-              print("\n".join(sorted(missing)))
-              sys.exit(1)
-          print("package import-closure check OK")
-          PYEOF
+          # （sglang 不在 runner 里装不了，真 import 跑不了；容器也没有 python3——
+          #   用纯 shell 做依赖闭包检查，正是这道门能拦住 v1.31.0 漏 dfkv_hot_config.py 这类事故。）
+          mods=$(grep -rhoE '^[[:space:]]*(import|from)[[:space:]]+dfkv_[A-Za-z0-9_]+' \
+                   --include='*.py' "$PKG/python/" | awk '{print $2}' | sort -u)
+          for m in $mods; do
+            if [ ! -e "$PKG/python/$m.py" ] && [ ! -d "$PKG/python/$m" ]; then
+              echo "ERROR: packaged python/ missing local import: $m"; exit 1
+            fi
+          done
+          echo "package import-closure check OK ($(echo "$mods" | tr '\n' ' '))"
           tar czf "${PKG}.tar.gz" "$PKG"
           sha256sum "${PKG}.tar.gz"
       - name: Upload artifacts
