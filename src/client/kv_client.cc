@@ -49,7 +49,7 @@ class FanoutPool {
   void Run(size_t n, size_t workers, const std::function<void(size_t)>& fn) {
     if (n == 0) return;
     if (workers > n) workers = n;
-    if (workers > kMaxThreads) workers = kMaxThreads;
+    if (workers > MaxThreads()) workers = MaxThreads();
     if (workers <= 1) {  // serial path: exceptions propagate as before
       for (size_t i = 0; i < n; ++i) fn(i);
       return;
@@ -58,11 +58,20 @@ class FanoutPool {
     job->n = n;
     job->fn = fn;  // one std::function copy per batch (vs a thread per worker)
     const size_t helpers = workers - 1;
-    EnsureThreads(helpers);
+    size_t want;
     {
       std::lock_guard<std::mutex> lk(mu_);
       for (size_t i = 0; i < helpers; ++i) queue_.push_back(job);
+      want = queue_.size();
     }
+    // Demand-aware sizing: grow toward the OUTSTANDING helper-job backlog, not
+    // this call's helper count. The old EnsureThreads(helpers) meant the pool
+    // never exceeded workers-1 threads (~4 for a 5-node ring) no matter how
+    // many callers ran concurrently — helper jobs queued behind each other,
+    // arrived late, found no indices and dropped out, and every caller
+    // processed its node groups nearly serially (per-call latency = sum of
+    // groups instead of max). Capped at MaxThreads().
+    EnsureThreads(want);
     cv_.notify_all();
     Work(*job);  // caller participates; late helpers find no indices and drop out
     std::unique_lock<std::mutex> lk(job->m);
@@ -96,7 +105,7 @@ class FanoutPool {
 
   void EnsureThreads(size_t want) {
     std::lock_guard<std::mutex> lk(mu_);
-    while (threads_ < want && threads_ < kMaxThreads) {
+    while (threads_ < want && threads_ < MaxThreads()) {
       std::thread([this, i = threads_] { NameThisThread("kv-fan-", i); Loop(); }).detach();
       ++threads_;
     }
@@ -115,7 +124,23 @@ class FanoutPool {
     }
   }
 
-  static constexpr size_t kMaxThreads = 32;
+  // Pool ceiling. The old constexpr 32 quietly serialized wide fan-out under
+  // many concurrent Batch* callers (callers × node-groups >> 32: helpers queue
+  // behind other jobs, groups fall back to caller-serial and per-call latency
+  // grows from max(group) to sum(group)). Env-tunable (DFKV_FANOUT_THREADS,
+  // clamped [1, 1024]) so high-concurrency clients can raise it; default
+  // unchanged at 32.
+  static size_t MaxThreads() {
+    static const size_t v = [] {
+      const char* e = std::getenv("DFKV_FANOUT_THREADS");
+      if (e && *e) {
+        long x = std::strtol(e, nullptr, 10);
+        if (x >= 1 && x <= 1024) return static_cast<size_t>(x);
+      }
+      return size_t{32};
+    }();
+    return v;
+  }
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Job>> queue_;

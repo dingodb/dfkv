@@ -155,18 +155,50 @@ int main(int argc, char** argv) {
   }
   if (op == "get" || op == "both") {
     fails = 0;
+    // One contiguous, page-aligned destination arena for ALL threads, declared
+    // once via RegisterMemory: every dst then resolves to the pre-registered
+    // pool MR (the production connectors' registered-host-pool shape). The old
+    // per-thread std::string buffers exceeded the per-connection user-MR cache
+    // (threads*batch addrs vs cap ~64) once calls rotate over pooled
+    // connections, so under load nearly every GET paid an ad-hoc 4MiB
+    // ibv_reg_mr+dereg (gup pins + mmap_lock) — measured as second-scale call
+    // tails that capped throughput. Falls back to the old buffers if the
+    // allocation fails.
+    const size_t stride = (size + 4095) & ~size_t{4095};
+    char* arena = static_cast<char*>(std::aligned_alloc(4096, threads * batch * stride));
+    if (arena) c.RegisterMemory(arena, threads * batch * stride);
+    std::atomic<size_t> arena_slot{0};
     double s = RunPhase(units, threads, [&](size_t u) {
       size_t base = u * batch, w = std::min(batch, count - base);
-      // Reuse per-thread destination buffers across calls so the RDMA MR cache
-      // hits (models SGLang HiCache's stable registered host pool / zero-copy).
+      thread_local char* mybuf = nullptr;
       thread_local std::vector<std::string> outs;
-      if (outs.size() < batch) { outs.resize(batch); for (auto& o : outs) o.resize(size); }
+      if (arena) {
+        if (!mybuf) mybuf = arena + arena_slot.fetch_add(1) * batch * stride;
+      } else if (outs.size() < batch) {
+        outs.resize(batch); for (auto& o : outs) o.resize(size);
+      }
       std::vector<KvGetItem> items(w);
-      for (size_t j = 0; j < w; ++j) items[j] = {key(base + j), &outs[j][0], size};
+      for (size_t j = 0; j < w; ++j)
+        items[j] = {key(base + j), arena ? mybuf + j * stride : &outs[j][0], size};
+      // DFKV_BENCH_STALL_MS: log wall-clock timestamps of slow calls to stderr
+      // so stalls can be time-correlated across processes/nodes (diagnostics).
+      static const long stall_ms = [] {
+        const char* e = std::getenv("DFKV_BENCH_STALL_MS");
+        return e && *e ? std::strtol(e, nullptr, 10) : 0;
+      }();
+      const auto st0 = std::chrono::system_clock::now();
       auto hits = c.BatchGet(items);
+      if (stall_ms > 0) {
+        const auto st1 = std::chrono::system_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(st1 - st0).count();
+        if (ms >= static_cast<double>(stall_ms))
+          std::fprintf(stderr, "STALL %.3f dur=%.1fms u=%zu\n",
+                       std::chrono::duration<double>(st1.time_since_epoch()).count(), ms, u);
+      }
       size_t f = 0; for (bool h : hits) if (!h) ++f; return f;
     }, &lat, &fails);
     Report("GET", count, size, threads, batch, s, lat, fails.load());
+    std::free(arena);
   }
   return 0;
 }

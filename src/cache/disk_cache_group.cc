@@ -4,8 +4,27 @@
 #include <map>
 
 #include "cache/disk_slab_store.h"
+#include "utils/log.h"
 
 namespace dfkv {
+
+namespace {
+// DFKV_DISK_HASH_WEIGHT: ketama vnode multiplier for the intra-server disk
+// ring, clamped [1, 64]. Default 1 keeps the historical placement (existing
+// cache entries stay routable); raising it re-routes a share of old keys
+// (misses, refilled on demand) in exchange for a much flatter per-disk load.
+int DiskHashWeight() {
+  static const int v = [] {
+    const char* e = std::getenv("DFKV_DISK_HASH_WEIGHT");
+    if (e && *e) {
+      long x = std::strtol(e, nullptr, 10);
+      if (x >= 1 && x <= 64) return static_cast<int>(x);
+    }
+    return 1;
+  }();
+  return v;
+}
+}  // namespace
 
 DiskCacheGroup::DiskCacheGroup(Options opt) {
   size_t n = opt.cache_dirs.empty() ? 1 : opt.cache_dirs.size();
@@ -61,9 +80,28 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
     }
     by_id_[dir] = store.get();
     disks_.push_back(std::move(store));
-    ring_.AddNode(dir);  // disk id = its dir path
+    // Disk id = its dir path. The hash weight multiplies ketama vnodes
+    // (160/weight-unit): at the default weight 1 the realized per-disk key
+    // share on a 6-disk group varies ±20%, so the hottest disk saturates at
+    // ~83% of aggregate disk bandwidth (measured: one disk at aqu-sz 600+
+    // while its five peers idle at 20-50, capping a 6x6.9GB/s server at
+    // ~33GB/s cold-read). Weight 10 (1600 vnodes/disk) shrinks the share
+    // spread to ~±6%. Env-tunable; NOTE changing it re-routes existing keys
+    // (cache semantics: old entries become misses, not corruption).
+    ring_.AddNode(dir, DiskHashWeight());
   }
   ring_.Build();
+  if (disks_.size() > 1) {
+    // Realized routing-share spread (min/max ring points per disk): the ops
+    // signal for placement skew — a hot disk saturates first and gates the
+    // whole group's cold-read throughput.
+    auto pts = ring_.NodePointCounts();
+    size_t mn = SIZE_MAX, mx = 0;
+    for (const auto& [_, c] : pts) { if (c < mn) mn = c; if (c > mx) mx = c; }
+    DFKV_LOG_INFO("disk ring: " + std::to_string(disks_.size()) + " disks, weight=" +
+                  std::to_string(DiskHashWeight()) + ", points min=" + std::to_string(mn) +
+                  " max=" + std::to_string(mx));
+  }
 }
 
 StoreEngine* DiskCacheGroup::Route(const BlockKey& key) const {
