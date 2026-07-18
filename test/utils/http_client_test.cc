@@ -43,9 +43,9 @@ TEST(HttpClient, TcpRoundTripAgainstLoopbackServer) {
 
   std::thread th([srv] {
     int c = accept(srv, nullptr, nullptr);
-    char buf[4096]; ::read(c, buf, sizeof(buf));
+    char buf[4096]; EXPECT_GT(::read(c, buf, sizeof(buf)), 0);
     const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"ok\":\"yes\"}\n";
-    ::write(c, resp, std::strlen(resp));
+    EXPECT_EQ(::write(c, resp, std::strlen(resp)), (ssize_t)std::strlen(resp));
     ::close(c);
   });
 
@@ -77,11 +77,11 @@ TEST(HttpClient, TcpRoundTripChunkedResponse) {
   int port = ntohs(a.sin_port);
   std::thread th([srv] {
     int c = accept(srv, nullptr, nullptr);
-    char buf[4096]; ::read(c, buf, sizeof(buf));
+    char buf[4096]; EXPECT_GT(::read(c, buf, sizeof(buf)), 0);
     const char* resp =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
         "6\r\n{\"ok\":\r\n6\r\n\"yes\"}\r\n0\r\n\r\n";  // 2 chunks of 6 bytes + terminator
-    ::write(c, resp, std::strlen(resp));
+    EXPECT_EQ(::write(c, resp, std::strlen(resp)), (ssize_t)std::strlen(resp));
     ::close(c);
   });
   TcpHttpTransport t("127.0.0.1:" + std::to_string(port), 2000);
@@ -104,9 +104,9 @@ TEST(HttpClient, ShortContentLengthBodyFailsLoud) {
   int port = ntohs(a.sin_port);
   std::thread th([srv] {
     int c = accept(srv, nullptr, nullptr);
-    char buf[4096]; ::read(c, buf, sizeof(buf));
+    char buf[4096]; EXPECT_GT(::read(c, buf, sizeof(buf)), 0);
     const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly-9-by";  // promises 100, sends 9 then closes
-    ::write(c, resp, std::strlen(resp));
+    EXPECT_EQ(::write(c, resp, std::strlen(resp)), (ssize_t)std::strlen(resp));
     ::close(c);
   });
   TcpHttpTransport t("127.0.0.1:" + std::to_string(port), 2000);

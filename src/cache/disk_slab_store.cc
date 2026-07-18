@@ -229,7 +229,12 @@ bool DiskSlabStore::OpenOrInit() {
   } else {
     int tfd = ::open(tbl_path.c_str(), O_RDWR);
     if (tfd < 0) return false;
-    ::ftruncate(tfd, static_cast<off_t>(tbl_bytes));  // ensure full size (idempotent)
+    // Ensure full size (idempotent); a table we cannot size is a broken store,
+    // same as the create path above.
+    if (::ftruncate(tfd, static_cast<off_t>(tbl_bytes)) != 0) {
+      ::close(tfd);
+      return false;
+    }
     table_fd_ = tfd;
   }
 
@@ -243,8 +248,11 @@ bool DiskSlabStore::OpenOrInit() {
     int fd = ::open(ep.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) return false;
     off_t sz = ::lseek(fd, 0, SEEK_END);
-    if (sz < static_cast<off_t>(opt_.extent_bytes))
-      ::ftruncate(fd, static_cast<off_t>(opt_.extent_bytes));
+    if (sz < static_cast<off_t>(opt_.extent_bytes) &&
+        ::ftruncate(fd, static_cast<off_t>(opt_.extent_bytes)) != 0) {
+      ::close(fd);
+      return false;
+    }
     // Materialize the extent (idempotent): DIO OVERWRITES of allocated/unwritten
     // ranges parallelize on XFS; allocating writes into ftruncate holes would
     // serialize on the exclusive iolock (measured 4.2 vs 2.0 GB/s at 8 writers).

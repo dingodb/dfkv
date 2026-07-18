@@ -26,8 +26,14 @@ inline void NameThisThread(const char* name) {
 // Indexed flavor for worker pools: "<prefix><idx>", truncated to the kernel's
 // 15-char limit ("rt-flush-12", "kv-fan-7").
 inline void NameThisThread(const char* prefix, size_t idx) {
-  char buf[16];
+  // pthread_setname_np fails (ERANGE) on names >15 chars rather than
+  // truncating, so the name must be clamped. Format into a buffer wide enough
+  // for any real prefix + 20-digit idx (a 16-byte buffer makes snprintf do the
+  // clamp, but trips -Wformat-truncation at every inlined call site), then
+  // clamp to the kernel limit explicitly.
+  char buf[32];
   std::snprintf(buf, sizeof(buf), "%s%zu", prefix, idx);
+  buf[15] = '\0';
   NameThisThread(buf);
 }
 

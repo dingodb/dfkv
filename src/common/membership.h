@@ -44,11 +44,13 @@ struct MemberInfo {
   // storage engine, capacity, RAM tier, RDMA dev ...). Empty = unknown / older peer.
   // Purely informational: surfaced by `dfkvctl ring` for fleet audit (version skew,
   // silently-skipped upgrades, engine mismatch) without per-node ssh.
-  std::string info;
+  std::string info{};
   // Dynamic stats (STA1); has_stats=false = legacy peer / no report yet.
   // LAST members on purpose: MemberInfo is aggregate-initialized positionally
-  // in tests/tools, and appending keeps those initializers valid.
-  MemberStats stats;
+  // in tests/tools, and appending keeps those initializers valid. The explicit
+  // {} initializers keep those shorter positional inits warning-free
+  // (-Wmissing-field-initializers skips NSDMI'd members).
+  MemberStats stats{};
   bool has_stats = false;
   // tcp_port and info ride OPTIONAL trailing extensions in Encode/DecodeMembers, so peers
   // that don't send them still interoperate. Both are intentionally EXCLUDED from

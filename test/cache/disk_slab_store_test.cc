@@ -140,9 +140,9 @@ TEST_F(DiskSlabTest, TornTableRecordReadsAsFreeNotResurrected) {
     // "SLTB" little-endian = 53 54 4C 42
     if (m[0] == 0x53 && m[1] == 0x54 && m[2] == 0x4C && m[3] == 0x42) {
       uint8_t byte = 0;
-      ::pread(fd, &byte, 1, o + 12);
+      ASSERT_EQ(::pread(fd, &byte, 1, o + 12), 1);
       byte ^= 0xFF;
-      ::pwrite(fd, &byte, 1, o + 12);
+      ASSERT_EQ(::pwrite(fd, &byte, 1, o + 12), 1);
       corrupted = true;
       break;
     }

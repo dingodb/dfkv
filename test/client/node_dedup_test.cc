@@ -151,8 +151,9 @@ TEST(NodeDedup, LappedArenaNeverServesOverwrittenBytes) {
   // still carry the exact original value (possible if the slot was recycled
   // and republished, which this workload doesn't do).
   std::string out(v.size(), '\1');
-  if (a->Claim(K(6), v.size(), &out[0]) == NodeDedup::Role::kHit)
+  if (a->Claim(K(6), v.size(), &out[0]) == NodeDedup::Role::kHit) {
     EXPECT_EQ(out, v);
+  }
 }
 
 TEST(NodeDedup, CrossProcessRendezvous) {

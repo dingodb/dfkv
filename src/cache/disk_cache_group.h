@@ -28,7 +28,7 @@ class DiskCacheGroup {
     // Backend: "file" (KVStore, default) or "slab" (DiskSlabStore). Empty =>
     // read DFKV_STORE_ENGINE (default "file"). Selectable so slab lands off by
     // default with zero production impact.
-    std::string engine;
+    std::string engine{};
   };
 
   explicit DiskCacheGroup(Options opt);
