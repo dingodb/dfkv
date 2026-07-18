@@ -461,9 +461,9 @@ std::vector<Status> DiskSlabStore::CacheDirectBatch(
     }
   }
   // -- IO: payloads (uring one-submit when possible), then records --
+#ifdef DFKV_WITH_URING
   size_t direct_n = 0;
   for (size_t i = 0; i < N; ++i) if (st[i].active && st[i].direct) direct_n++;
-#ifdef DFKV_WITH_URING
   bool did_uring = false;
   if (uring_write_enabled_ && direct_n >= 2) {
     // One submission ring PER THREAD: the previous single shared ring + mutex
