@@ -194,7 +194,11 @@ class RdmaServer {
   std::vector<Conn> conns_;
   std::unordered_set<rdma::RcEndpoint*> live_eps_;
   // Lifetime device ref + one-time pool-MR registration (see Start()).
-  std::unique_ptr<rdma::RcEndpoint> anchor_ep_;
+  // One anchor per configured rail (--rdma-dev comma list): each holds a
+  // lifetime device ref + the pool-region MRs, so neither first-touch nor
+  // idle-reclaim of the last data connection ever re-pins the arena.
+  std::vector<std::unique_ptr<rdma::RcEndpoint>> anchors_;
+  std::vector<std::string> anchor_devs_;  // parsed from dev_name_ (>=1 entries)
   std::atomic<uint64_t> uring_reads_{0}, uring_init_fallbacks_{0};
   std::atomic<uint64_t> completions_{0}, completion_errors_{0}, active_conns_{0},
       idle_reclaims_{0};
