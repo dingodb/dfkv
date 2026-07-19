@@ -195,6 +195,43 @@ docs/       ARCHITECTURE.md (layers · storage engines · RAM hot tier · wire p
 - **HiCache v2** (PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
 - **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
 
+## Recommended tuning (v1.34+)
+
+Validated on a 5-node ring (8×B200 hosts, 6× Gen4 NVMe + 8×400G IB per node,
+128 GiB RAM arena): cold read 97 → **156 GB/s**, hot read 48 → **97 GB/s**
+single-pair / **147 GB/s** mesh, cold-read p99 0.9–2.2 s → **~50 ms**.
+Every knob below defaults to the historical behavior — this section is what to
+*change*, not what happens out of the box.
+
+**Server** (per cache node):
+
+| Knob | Recommended | Why |
+|---|---|---|
+| `--rdma-dev` | comma list of **all** local rails (e.g. `ib7s400p0,...,ib7s400p7`) | v1.34 pins one anchor per listed device at startup (arena MRs registered once, logged); without it, idle reclaim of a rail's last connection drops the device and the next burst pays a serialized re-registration storm. First entry = default for legacy clients. Startup pays N× arena registration (~8 s each for 128 GiB). |
+| `DFKV_DISK_HASH_WEIGHT` | `10` | Flattens the intra-server disk ring share from ±20 % to ±3 % so the hottest disk stops gating the whole node (+5–6 % cold read, ~2× lower p99). **Re-routes existing keys** (cache miss + refill) — flip together with a restart/upgrade window. |
+| `--rdma-depth` | `4` (keep) | Deeper is not a throughput knob (see datapath notes); it only grows pinned memory. |
+| `--ram-tier` / `--ram-tier-bytes` / `--ram-tier-shards` | on / sized to the node / `16` for ≥100 GiB arenas | Large arenas contend on the shard locks under mixed load (+40 % mixed R/W at 16 shards on a 128 GiB arena); small (≤16 GiB) arenas are fine at the default 8. |
+| `--store-engine` | `slab` | Index rebuilds on restart; removes file-per-block hazards. |
+
+**Production client** (inference connectors, one process per TP rank):
+
+| Knob | Recommended | Why |
+|---|---|---|
+| `DFKV_RDMA_DEV` | best: **rail affinity per rank** — inject `ib7s400p{local_rank}` per process; simpler: the full comma list + `DFKV_RDMA_NUMA=1` | Each rank uses the NIC closest to its GPU; the bootstrap dev frame makes the server answer on the same rail automatically. Verify the device names exist inside the container first. |
+| `DFKV_RDMA_DEPTH` | `4` | Pairs with the server's posted depth (window = min of both, negotiated). |
+| `DFKV_FANOUT_THREADS` | unset (default 32) | Only wide single-process clients (benchmarks, many concurrent Batch* callers) need more. |
+
+Order matters when rolling this out: upgrade **servers to v1.34+ first**, then
+widen clients to multi-rail — pre-1.34 servers have no anchor on non-default
+rails and will exhibit the idle re-registration storm described above.
+
+**Benchmark reproduction** (`dfkv_bench`): `DFKV_RDMA=1` (explicit, or it
+silently measures TCP), 8-rail `DFKV_RDMA_DEV`, `DFKV_RDMA_DEPTH=4`,
+`DFKV_FANOUT_THREADS=256`; cold-read sweet spot `--threads 16 --batch 8
+--size 4194304` per client node. Keep `--count` ≤ the seed's written key count,
+and let the drives settle ~10 min after bulk writes before cold-read A/Bs (FTL
+GC depresses cold reads ~25 %).
+
 ## Status
 TDD; **264 C++ ctest entries (default) / 288 (RDMA+io_uring) + Python plugin &
 connector tests green**, 0 warnings, **ThreadSanitizer-clean**.
