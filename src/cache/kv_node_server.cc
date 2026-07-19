@@ -222,6 +222,9 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_read_coalesce_timeouts_total", "counter",
          "Coalesce waiters that timed out and fell back to their own read",
          read_coalescer_.timeouts());
+  metric("dfkv_read_coalesce_recur_total", "counter",
+         "Reads that hit a recurrence tombstone (drift-window promotion evidence)",
+         read_coalescer_.recur_hits());
   metric("dfkv_accepts_total", "counter", "TCP connections accepted", AcceptCount());
   metric("dfkv_evictions_total", "counter", "Objects evicted (capacity pressure)",
          group_.Evictions());
@@ -703,15 +706,17 @@ void KvNodeServer::RangeDirectComplete(bool ok, size_t bytes_read,
   if (flight) {
     BlockKey key{0, 0, 0};
     bool whole = false;
+    bool recurrent = false;
     const bool had_waiters = read_coalescer_.CompleteAsync(
         flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
-        &whole);
-    // Fan-in admission gate: promote ONLY pages with convoy evidence (>=1
-    // waiter joined during the read). A convoy page's laggard ranks, repeat
+        &whole, &recurrent);
+    // Admission gate: promote ONLY pages with convoy evidence — an in-flight
+    // waiter (overlap) or a recurrence-tombstone hit (same range re-read
+    // within the drift window; v2). A convoy page's laggard ranks, repeat
     // cold reads and post-restart replays are then served from the arena; a
     // one-off cold read never pollutes the RAM tier (the num_extents churn
     // lesson). Durable install: costs no flush bandwidth, evictable at once.
-    if (ok && had_waiters && whole && ram_ && data && bytes_read)
+    if (ok && (had_waiters || recurrent) && whole && ram_ && data && bytes_read)
       ram_->PutDurable(key, data, bytes_read);
   }
   // Sample the async (uring) read latency into the SAME op="get" histogram the

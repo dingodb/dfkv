@@ -41,11 +41,13 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #include "common/kv_types.h"
 #include "common/status.h"
@@ -96,6 +98,22 @@ class ReadCoalescer {
     f->key = k;
     f->whole = whole_value;
     f->leader_tid = std::this_thread::get_id();
+    // Recurrence window (v2): a convoy whose ranks drift past the in-flight
+    // window never produces a waiter, so v1's fan-in gate missed it entirely.
+    // A completed no-waiter whole read leaves a key FINGERPRINT (not payload —
+    // that is what keeps the window seconds-cheap) for RecurMs(); finding it
+    // here means this same range is being read AGAIN within the window, which
+    // is promotion evidence just as strong as an overlap.
+    if (whole_value) {
+      auto it = recents_.find(k);
+      if (it != recents_.end()) {
+        if (std::chrono::steady_clock::now() <= it->second) {
+          f->recurrent = true;
+          recur_hits_.fetch_add(1, std::memory_order_relaxed);
+        }
+        recents_.erase(it);
+      }
+    }
     map_.emplace(k, f);
     const uint64_t t = ++token_seq_;
     tokens_.emplace(t, std::move(f));
@@ -107,10 +125,16 @@ class ReadCoalescer {
   // waiters fall back to their own disk reads. Returns true if at least one
   // waiter had joined — the fan-in evidence the caller's RAM-promotion
   // admission gate keys on — and fills *key / *whole from registration.
-  // Idempotent per token; unknown tokens return false.
+  // A successful whole-value completion with NO waiter leaves a recurrence
+  // tombstone (key fingerprint, not payload) for RecurMs(): a second identical
+  // read inside that window is recurrence evidence, so ITS completion promotes
+  // even without an in-flight overlap (the drift-tolerant half of the gate;
+  // see TryRegisterAsync). Idempotent per token; unknown tokens return false.
   bool CompleteAsync(uint64_t token, Status st, const char* data, size_t len,
-                     BlockKey* key = nullptr, bool* whole = nullptr) {
+                     BlockKey* key = nullptr, bool* whole = nullptr,
+                     bool* recurrent = nullptr) {
     std::shared_ptr<Flight> f;
+    bool waiters = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
       auto it = tokens_.find(token);
@@ -119,8 +143,28 @@ class ReadCoalescer {
       tokens_.erase(it);
       auto mit = map_.find(f->key);
       if (mit != map_.end() && mit->second == f) map_.erase(mit);
+      waiters = f->waiters.load(std::memory_order_acquire) > 0;
+      // Lay the recurrence tombstone for a successful lone whole read: no
+      // waiter (nothing promoted this page) and not itself a recurrence hit
+      // (its completion promotes, RAM covers later arrivals). Fingerprints
+      // only — bounded by kRecurCap with amortized FIFO expiry.
+      if (RecurMs() > 0 && st == Status::kOk && f->whole && !waiters &&
+          !f->recurrent) {
+        const auto dl = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(RecurMs());
+        recents_[f->key] = dl;
+        recent_fifo_.emplace_back(f->key, dl);
+        const auto now = std::chrono::steady_clock::now();
+        while (!recent_fifo_.empty() &&
+               (recent_fifo_.front().second < now ||
+                recent_fifo_.size() > kRecurCap)) {
+          auto rit = recents_.find(recent_fifo_.front().first);
+          if (rit != recents_.end() && rit->second == recent_fifo_.front().second)
+            recents_.erase(rit);
+          recent_fifo_.pop_front();
+        }
+      }
     }
-    const bool waiters = f->waiters.load(std::memory_order_acquire) > 0;
     if (waiters && st == Status::kOk && data && len) {
       f->data = AlignedAlloc(len);
       if (f->data) std::memcpy(f->data.get(), data, len);
@@ -135,6 +179,7 @@ class ReadCoalescer {
     leaders_.fetch_add(1, std::memory_order_relaxed);
     if (key) *key = BlockKey{f->key.id, f->key.index, f->key.ksize};
     if (whole) *whole = f->whole;
+    if (recurrent) *recurrent = f->recurrent;
     return waiters;
   }
 
@@ -229,6 +274,7 @@ class ReadCoalescer {
   size_t leaders() const { return leaders_.load(std::memory_order_relaxed); }
   size_t coalesced() const { return coalesced_.load(std::memory_order_relaxed); }
   size_t timeouts() const { return timeouts_.load(std::memory_order_relaxed); }
+  size_t recur_hits() const { return recur_hits_.load(std::memory_order_relaxed); }
 
  private:
   struct Flight {
@@ -240,6 +286,7 @@ class ReadCoalescer {
     std::shared_ptr<char> data;  // 4096-aligned scratch (leader's read target)
     Key key{};
     bool whole = false;
+    bool recurrent = false;  // registered while a recurrence tombstone was live
     std::thread::id leader_tid;
     std::atomic<int> waiters{0};
   };
@@ -266,11 +313,31 @@ class ReadCoalescer {
     return ms;
   }
 
+  // Recurrence window length. Default 1000 ms: the free-run 8-process bench
+  // convoy (worst-case drift; production ranks are layer-locked) spreads a
+  // page's reads over <=~500 ms, so 1s covers it with margin, and the window
+  // holds fingerprints (64 B), not payloads, so seconds-scale is nearly free.
+  // DFKV_READ_COALESCE_RECUR_MS overrides; 0 disables (v1 overlap-only gate).
+  static int RecurMs() {
+    static const int ms = [] {
+      const char* e = std::getenv("DFKV_READ_COALESCE_RECUR_MS");
+      if (e && *e) {
+        long v = std::strtol(e, nullptr, 10);
+        if (v >= 0 && v <= 60000) return static_cast<int>(v);
+      }
+      return 1000;
+    }();
+    return ms;
+  }
+  static constexpr size_t kRecurCap = 65536;  // fingerprint bound (~4 MiB worst)
+
   std::mutex mu_;
   std::unordered_map<Key, std::shared_ptr<Flight>, KeyHash> map_;
   std::unordered_map<uint64_t, std::shared_ptr<Flight>> tokens_;
+  std::unordered_map<Key, std::chrono::steady_clock::time_point, KeyHash> recents_;
+  std::deque<std::pair<Key, std::chrono::steady_clock::time_point>> recent_fifo_;
   uint64_t token_seq_ = 0;
-  std::atomic<size_t> leaders_{0}, coalesced_{0}, timeouts_{0};
+  std::atomic<size_t> leaders_{0}, coalesced_{0}, timeouts_{0}, recur_hits_{0};
 };
 
 }  // namespace dfkv

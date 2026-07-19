@@ -28,18 +28,9 @@ BlockKey K(uint64_t id) { return BlockKey{id, 0, 1}; }
 // test-friendly value before any test can latch the 500ms default.
 [[maybe_unused]] const bool kEnvSet = [] {
   ::setenv("DFKV_READ_COALESCE_TIMEOUT_MS", "200", 1);
+  ::setenv("DFKV_READ_COALESCE_RECUR_MS", "200", 1);  // recurrence-window tests
   return true;
 }();
-
-// Spin until the coalescer reports an in-flight read (a follower has to join
-// while the leader is still open) or the deadline passes.
-bool WaitInFlight(ReadCoalescer& c, const BlockKey& k, uint64_t off, uint64_t len) {
-  for (int i = 0; i < 2000; ++i) {
-    if (c.InFlight(k, off, len)) return true;
-    std::this_thread::sleep_for(1ms);
-  }
-  return false;
-}
 
 TEST(ReadCoalescer, AsyncFlightHandsPayloadToFollower) {
   ReadCoalescer c;
@@ -53,7 +44,7 @@ TEST(ReadCoalescer, AsyncFlightHandsPayloadToFollower) {
   size_t got_len = 0;
   std::thread follower([&] {
     Status st = c.Read(K(1), 0, v.size(), &got[0], got.size(), &got_len,
-                       [&](char* buf, size_t cap, size_t* n) {
+                       [&](char* buf, size_t, size_t* n) {
                          own_reads.fetch_add(1);
                          std::memcpy(buf, v.data(), v.size());
                          *n = v.size();
@@ -206,3 +197,62 @@ TEST(ReadCoalescer, SyncLeaderReportsFanIn) {
 }
 
 }  // namespace
+
+// v2 recurrence window: a lone whole-value read leaves a key fingerprint; a
+// re-read within DFKV_READ_COALESCE_RECUR_MS reports recurrence evidence on
+// completion (the drift-tolerant promotion gate). Env pinned to 200ms below.
+TEST(ReadCoalescer, RecurrenceTombstoneReportsOnReRead) {
+  ReadCoalescer c;
+  const char v[8] = "payload";
+  uint64_t t1 = c.TryRegisterAsync(K(20), 0, 8, /*whole=*/true);
+  ASSERT_NE(t1, 0u);
+  EXPECT_FALSE(c.CompleteAsync(t1, Status::kOk, v, 8));  // lone read: tombstone laid
+  BlockKey key{0, 0, 0};
+  bool whole = false, recur = false;
+  uint64_t t2 = c.TryRegisterAsync(K(20), 0, 8, true);   // re-read inside window
+  ASSERT_NE(t2, 0u);
+  EXPECT_EQ(c.recur_hits(), 1u);
+  c.CompleteAsync(t2, Status::kOk, v, 8, &key, &whole, &recur);
+  EXPECT_TRUE(recur);      // promotion evidence without any in-flight waiter
+  EXPECT_TRUE(whole);
+  EXPECT_EQ(key.id, 20u);
+  // The hit consumed the tombstone, and a recurrent completion lays none
+  // (promotion put the page in RAM): a third read reports no recurrence.
+  uint64_t t3 = c.TryRegisterAsync(K(20), 0, 8, true);
+  ASSERT_NE(t3, 0u);
+  recur = false;
+  c.CompleteAsync(t3, Status::kOk, v, 8, nullptr, nullptr, &recur);
+  EXPECT_FALSE(recur);
+}
+
+TEST(ReadCoalescer, RecurrenceTombstoneExpires) {
+  ReadCoalescer c;
+  const char v[8] = "payload";
+  uint64_t t1 = c.TryRegisterAsync(K(21), 0, 8, true);
+  c.CompleteAsync(t1, Status::kOk, v, 8);
+  std::this_thread::sleep_for(250ms);  // past the 200ms env-pinned window
+  bool recur = true;
+  uint64_t t2 = c.TryRegisterAsync(K(21), 0, 8, true);
+  ASSERT_NE(t2, 0u);
+  c.CompleteAsync(t2, Status::kOk, v, 8, nullptr, nullptr, &recur);
+  EXPECT_FALSE(recur);
+}
+
+TEST(ReadCoalescer, NoTombstoneForPartialFailedOrFannedReads) {
+  ReadCoalescer c;
+  const char v[8] = "payload";
+  // Partial (whole=false) completion: no tombstone.
+  uint64_t t1 = c.TryRegisterAsync(K(22), 4, 4, false);
+  c.CompleteAsync(t1, Status::kOk, v, 4);
+  bool recur = true;
+  uint64_t t2 = c.TryRegisterAsync(K(22), 4, 4, false);
+  c.CompleteAsync(t2, Status::kOk, v, 4, nullptr, nullptr, &recur);
+  EXPECT_FALSE(recur);
+  // Failed/aborted completion: no tombstone.
+  uint64_t t3 = c.TryRegisterAsync(K(23), 0, 8, true);
+  c.CompleteAsync(t3, Status::kIOError, nullptr, 0);
+  recur = true;
+  uint64_t t4 = c.TryRegisterAsync(K(23), 0, 8, true);
+  c.CompleteAsync(t4, Status::kOk, v, 8, nullptr, nullptr, &recur);
+  EXPECT_FALSE(recur);
+}
