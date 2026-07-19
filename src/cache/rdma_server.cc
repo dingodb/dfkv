@@ -62,6 +62,18 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg, const std::string& dev_n
     const char* e = std::getenv("DFKV_RDMA_DEV");
     if (e && *e) dev_name_ = e;
   }
+  // --rdma-dev accepts a comma list (multi-rail): every listed device gets a
+  // lifetime anchor in Start(); the FIRST entry stays the default for legacy
+  // clients whose bootstrap dev frame is empty.
+  for (size_t i = 0; i <= dev_name_.size();) {
+    size_t c = dev_name_.find(',', i);
+    if (c == std::string::npos) c = dev_name_.size();
+    std::string d = dev_name_.substr(i, c - i);
+    if (!d.empty()) anchor_devs_.push_back(d);
+    i = c + 1;
+  }
+  if (anchor_devs_.empty()) anchor_devs_.push_back("");
+  dev_name_ = anchor_devs_.front();
 }
 
 RdmaServer::~RdmaServer() { Stop(); }
@@ -95,12 +107,19 @@ Status RdmaServer::Start(int port) {
   // different rail still pays that rail's first registration
   // (SharedAddPoolMr logs slow ones).
   if (!user_regions_.empty()) {
-    anchor_ep_ = std::make_unique<rdma::RcEndpoint>();
-    if (anchor_ep_->Open(dev_name_.empty() ? nullptr : dev_name_.c_str(), 4096, 1)) {
-      anchor_ep_->EnsurePoolMrs(user_regions_);
-    } else {
-      anchor_ep_.reset();  // no usable device: Serve would fail the same way
+    for (const auto& d : anchor_devs_) {
+      auto a = std::make_unique<rdma::RcEndpoint>();
+      if (a->Open(d.empty() ? nullptr : d.c_str(), 4096, 1)) {
+        a->EnsurePoolMrs(user_regions_);  // arena-scale pin: once, here, reported
+        anchors_.push_back(std::move(a));
+      }
+      // An unusable listed rail is skipped (clients requesting it fail the
+      // same way with or without an anchor); the default rail failing is the
+      // legacy no-anchor behavior.
     }
+    if (anchor_devs_.size() > 1)
+      DFKV_LOG_INFO("rdma multi-rail anchors: " + std::to_string(anchors_.size()) +
+                    "/" + std::to_string(anchor_devs_.size()) + " devices pinned");
   }
   running_ = true;
   accept_thread_ = std::thread([this] { NameThisThread("rdma-accept"); AcceptLoop(); });
@@ -121,7 +140,7 @@ void RdmaServer::Stop() {
     conns.swap(conns_);
   }
   for (auto& c : conns) if (c.th.joinable()) c.th.join();
-  anchor_ep_.reset();  // drop the lifetime device ref (frees pool MRs last)
+  anchors_.clear();  // drop the lifetime device refs (frees pool MRs last)
 }
 
 // Join and drop any Serve threads that have already finished. Called from
