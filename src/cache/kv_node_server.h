@@ -17,6 +17,7 @@
 
 #include "cache/disk_cache_group.h"
 #include "cache/ram_tier.h"
+#include "cache/read_coalescer.h"
 #include "utils/latency_hist.h"
 
 namespace dfkv {
@@ -141,6 +142,12 @@ class KvNodeServer {
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
+  // Read-side convoy collapse (env DFKV_READ_COALESCE=1; see read_coalescer.h).
+  ReadCoalescer read_coalescer_;
+  bool coalesce_enabled_ = [] {
+    const char* e = std::getenv("DFKV_READ_COALESCE");
+    return e && *e && *e != '0';
+  }();
   // depth metrics: errors by op, live connections, sampled op latency
   std::atomic<size_t> put_io_err_{0}, get_io_err_{0}, invalid_ops_{0};
   // PUT admission gate (I6): reject with kCacheFull once this many disk writes
