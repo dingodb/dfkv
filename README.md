@@ -221,6 +221,25 @@ Every knob below defaults to the historical behavior — this section is what to
 | `DFKV_RDMA_DEPTH` | `4` | Pairs with the server's posted depth (window = min of both, negotiated). |
 | `DFKV_FANOUT_THREADS` | unset (default 32) | Only wide single-process clients (benchmarks, many concurrent Batch* callers) need more. |
 
+**Read-side convoy collapse (v1.35+, opt-in)** — for MLA + TP-N inference
+rings, where every rank is a separate process fetching the SAME page and the
+NVMe otherwise eats N identical reads per page (measured 1:1 disk:wire on a
+TP8 replay; with the knobs below: **~2.4 device reads per duplicated page,
+repeat reads of promoted pages hit zero disk**):
+
+| Knob | Recommended | Why |
+|---|---|---|
+| `DFKV_READ_COALESCE` | `1` | Master switch. Concurrent identical GETs share one disk read (sync + io_uring paths), and a whole-value read with convoy evidence is promoted into the RAM arena as a born-durable resident (zero flush cost, evictable at once). Unset = exact pre-1.35 data path. |
+| `DFKV_READ_COALESCE_RECUR_MS` | `1000` (default) | Recurrence window: a lone whole read leaves a 64-byte key fingerprint; an identical read inside the window promotes on completion even when rank drift missed the in-flight overlap. Fingerprints, not payloads — widening it costs ~nothing (64 Ki-entry bound). `0` restores the overlap-only gate. |
+| `DFKV_READ_COALESCE_TIMEOUT_MS` | `500` (default) | Follower wait bound; a waiter whose leader connection dies falls back to its own read instead of hanging. |
+
+Watch `dfkv_read_coalesce_{leaders,coalesced,recur,timeouts}_total` and
+`dfkv_ram_promoted_total`; `timeouts` staying at 0 and `promoted` tracking
+`recur` are the healthy signature. Requires the RAM tier (`--ram-tier`) for
+promotion; coalescing alone works without it. Note for env-file deployments:
+the file is *sourced*, so new knobs must be explicitly **exported** by the
+start script or a systemd drop-in to reach the server process.
+
 Order matters when rolling this out: upgrade **servers to v1.34+ first**, then
 widen clients to multi-rail — pre-1.34 servers have no anchor on non-default
 rails and will exhibit the idle re-registration storm described above.
