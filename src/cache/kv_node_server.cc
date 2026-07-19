@@ -214,6 +214,10 @@ std::string KvNodeServer::MetricsText() const {
          bytes_written_.load(std::memory_order_relaxed));
   metric("dfkv_bytes_read_total", "counter", "Payload bytes read",
          bytes_read_.load(std::memory_order_relaxed));
+  metric("dfkv_read_coalesce_leaders_total", "counter",
+         "Disk reads executed on behalf of a convoy", read_coalescer_.leaders());
+  metric("dfkv_read_coalesced_total", "counter",
+         "GETs served from an in-flight identical read", read_coalescer_.coalesced());
   metric("dfkv_accepts_total", "counter", "TCP connections accepted", AcceptCount());
   metric("dfkv_evictions_total", "counter", "Objects evicted (capacity pressure)",
          group_.Evictions());
@@ -398,7 +402,27 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
         }
       }
       if (!ram_served) {
-        st = group_.Range(key, offset, length, out_data);
+        if (coalesce_enabled_) {
+          // TCP convoy collapse: leader reads via group_.Range into a scratch
+          // string sized by the store; followers copy the shared bytes.
+          const size_t cap = length ? length : (64u << 20);
+          out_data->resize(cap);
+          size_t n = 0;
+          st = read_coalescer_.Read(key, offset, length, out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
+              [&](char* buf, size_t bcap, size_t* on) {
+                std::string tmp;
+                Status s = group_.Range(key, offset, length, &tmp);
+                if (s == Status::kOk) {
+                  size_t m = tmp.size() < bcap ? tmp.size() : bcap;
+                  std::memcpy(buf, tmp.data(), m);
+                  *on = m;
+                }
+                return s;
+              });
+          out_data->resize(st == Status::kOk ? n : 0);
+        } else {
+          st = group_.Range(key, offset, length, out_data);
+        }
         if (st == Status::kOk) {
           cache_hit_.fetch_add(1, std::memory_order_relaxed);
           bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
@@ -483,7 +507,15 @@ Status KvNodeServer::RangeInto(uint64_t id, uint32_t index, uint32_t ksize,
       return Status::kOk;
     }
   }
-  Status st = group_.RangeInto(key, offset, length, dst, dst_cap, out_len);
+  Status st;
+  if (coalesce_enabled_) {
+    st = read_coalescer_.Read(key, offset, length, dst, dst_cap, out_len,
+        [&](char* buf, size_t cap, size_t* n) {
+          return group_.RangeInto(key, offset, length, buf, cap, n);
+        });
+  } else {
+    st = group_.RangeInto(key, offset, length, dst, dst_cap, out_len);
+  }
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
@@ -559,7 +591,22 @@ Status KvNodeServer::RangeDirect(uint64_t id, uint32_t index, uint32_t ksize,
       return Status::kOk;
     }
   }
-  Status st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data, out_len);
+  Status st;
+  if (coalesce_enabled_) {
+    // Leader reads into the shared scratch, every rank's convoy copy lands in
+    // its own registered io_buf; *out_data must point at io_buf either way.
+    st = read_coalescer_.Read(key, offset, length, io_buf, io_cap, out_len,
+        [&](char* buf, size_t cap, size_t* n) {
+          const char* p = nullptr;
+          Status s = group_.RangeDirect(key, offset, length, buf, cap, &p, n);
+          if (s == Status::kOk && p && p != buf && *n > 0)
+            std::memcpy(buf, p, *n < cap ? *n : cap);
+          return s;
+        });
+    if (st == Status::kOk && out_data) *out_data = io_buf;
+  } else {
+    st = group_.RangeDirect(key, offset, length, io_buf, io_cap, out_data, out_len);
+  }
   if (st == Status::kOk) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(*out_len, std::memory_order_relaxed);
@@ -581,6 +628,13 @@ Status KvNodeServer::RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize
   // RDMA serve loop falls back to the synchronous RangeDirect, which serves it
   // from the arena. (Only reached when the RAM tier is enabled.)
   if (ram_ && ram_->Contains(key)) {
+    if (out) *out = KVStore::RangePrep{};
+    return Status::kInvalid;
+  }
+  // An identical read is already on the disk: decline the async prep so the
+  // serve loop falls back to the synchronous RangeDirect, which joins the
+  // in-flight read instead of issuing a duplicate NVMe fetch.
+  if (coalesce_enabled_ && read_coalescer_.InFlight(key, offset, length)) {
     if (out) *out = KVStore::RangePrep{};
     return Status::kInvalid;
   }
