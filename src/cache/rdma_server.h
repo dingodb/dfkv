@@ -65,6 +65,12 @@ class RdmaServer {
     // 0 = no hold. A slot-based engine (slab) pins the slot for the read's
     // duration; passed to range_release_handler_ wherever fd is closed.
     uint64_t release_token = 0;
+    // 0 = no flight. Read-coalescer registration made at prep time: the serve
+    // loop passes it to range_complete_handler_ with the payload once the async
+    // read finishes, or to range_flight_abort_handler_ on any teardown path
+    // where the read never completes — a registered flight MUST reach exactly
+    // one of the two, or a convoy follower waits out its full timeout.
+    uint64_t flight = 0;
   };
   using RangePrepHandler = std::function<Status(
       uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
@@ -77,10 +83,20 @@ class RdmaServer {
   // never did, leaving dfkv_op_latency_seconds{op="get"} blind to the default
   // read path since v1.27.0. Negative/zero-cost when the sampler skips (the
   // serve loop only stamps sampled reads).
+  // `flight` is the prep's coalescer registration (0 = none) and `data` points
+  // at the payload bytes in the connection's direct buffer (nullptr on
+  // failure) — valid only for the duration of the call, which runs BEFORE the
+  // reply send, so the handler may copy from it (coalesced waiters, RAM
+  // promotion) but must not retain it.
   using RangeCompleteHandler =
-      std::function<void(bool ok, size_t bytes_read, double elapsed_sec)>;
+      std::function<void(bool ok, size_t bytes_read, double elapsed_sec,
+                         uint64_t flight, const char* data)>;
   // Releases a prep's release_token (slab slot pin) once its read is done.
   using RangeReleaseHandler = std::function<void(uint64_t token)>;
+  // Aborts a prep's flight registration on paths where the async read never
+  // completes (poisoned ring teardown, connection death): waiters fall back to
+  // their own reads instead of hanging until timeout.
+  using RangeFlightAbortHandler = std::function<void(uint64_t flight)>;
 
   // dev_name empty => env DFKV_RDMA_DEV, else first device.
   explicit RdmaServer(Handler handler, size_t max_msg = (64u << 20),
@@ -101,6 +117,9 @@ class RdmaServer {
   }
   void set_range_release_handler(RangeReleaseHandler h) {
     range_release_handler_ = std::move(h);
+  }
+  void set_range_flight_abort_handler(RangeFlightAbortHandler h) {
+    range_flight_abort_handler_ = std::move(h);
   }
 
   // --- RAM hot-tier zero-copy GET (P3 B5-3, ADDITIVE + OFF unless wired) --------
@@ -177,6 +196,7 @@ class RdmaServer {
   RangePrepHandler range_prep_handler_;
   RangeCompleteHandler range_complete_handler_;
   RangeReleaseHandler range_release_handler_;
+  RangeFlightAbortHandler range_flight_abort_handler_;
   RamRangeHandler ram_range_handler_;
   RamReleaseHandler ram_release_handler_;
   std::vector<std::pair<void*, size_t>> user_regions_;  // RAM arena pool MRs (RegisterMemory)

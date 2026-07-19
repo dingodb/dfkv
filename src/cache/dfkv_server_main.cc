@@ -250,20 +250,30 @@ int main(int argc, char** argv) {
         [&srv](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
                size_t cap, dfkv::RdmaServer::RangePrepResult* out) {
           dfkv::KVStore::RangePrep p;
-          Status st = srv.RangeDirectPrep(id, idx, ks, off, len, cap, &p);
+          Status st = srv.RangeDirectPrep(id, idx, ks, off, len, cap, &p,
+                                          &out->flight);
           if (st == Status::kOk) {
             out->fd = p.fd;
             out->aligned_off = p.aligned_off;
             out->aligned_len = p.aligned_len;
             out->head = p.head;
             out->payload_len = p.payload_len;
+            // Slab slot hold (0 on the file engine). Dropping this token was a
+            // real leak: the serve loop can only release what it was handed,
+            // so every uring GET left its slot pinned+inflight forever.
+            out->release_token = p.token;
           }
           return st;
         });
+    rsrv->set_range_release_handler(
+        [&srv](uint64_t tok) { srv.RangePrepRelease(tok); });
     rsrv->set_range_complete_handler(
-        [&srv](bool ok, size_t bytes_read, double elapsed_sec) {
-          srv.RangeDirectComplete(ok, bytes_read, elapsed_sec);
+        [&srv](bool ok, size_t bytes_read, double elapsed_sec, uint64_t flight,
+               const char* data) {
+          srv.RangeDirectComplete(ok, bytes_read, elapsed_sec, flight, data);
         });
+    rsrv->set_range_flight_abort_handler(
+        [&srv](uint64_t flight) { srv.RangeFlightAbort(flight); });
     // RAM hot tier (P3 B5-3): when enabled, register the arena as a pool MR and
     // wire the zero-copy serve hooks so a RAM hit is scatter-sent straight from
     // the arena (no copy into the connection buffer, no disk). No-op if off.

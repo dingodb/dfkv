@@ -292,6 +292,46 @@ bool RamTier::Put(const BlockKey& key, const void* data, size_t len) {
   return true;
 }
 
+bool RamTier::PutDurable(const BlockKey& key, const void* data, size_t len) {
+  if (!arena_) return false;
+  if (data == nullptr && len != 0) return false;
+  const std::string fn = key.Filename();
+  Shard& s = ShardFor(fn);
+
+  uint64_t offset = 0;
+  uint32_t cap = 0;
+  {
+    std::lock_guard<std::mutex> lk(s.mu);
+    if (s.index.count(fn) || s.writing.count(fn)) return true;  // already resident
+    SlabAllocator::SlotRef ref;
+    std::vector<std::string> evicted;
+    if (!s.alloc->Put(fn, len, &ref, &evicted)) return false;  // best-effort skip
+    for (const auto& ev : evicted) s.index.erase(ev);
+    // Pin only for the copy window: the slot is not in the index yet, but the
+    // allocator knows it and an unpinned slot could be CLOCK-evicted mid-copy.
+    s.alloc->Pin(fn);
+    s.writing.insert(fn);
+    offset = s.base_off + ref.extent * extent_bytes_ + ref.offset;
+    cap = ref.slot_size;
+  }
+
+  std::memcpy(arena_ + offset, data, len);
+
+  {
+    std::lock_guard<std::mutex> lk(s.mu);
+    Entry e;
+    e.offset = offset;
+    e.len = static_cast<uint32_t>(len);
+    e.cap = cap;
+    e.durable = true;  // already on disk: no flushq, no flush-pin
+    s.index[fn] = e;
+    s.writing.erase(fn);
+    s.alloc->Unpin(fn);  // refcount 0 => evictable immediately
+  }
+  promotes_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 bool RamTier::GetPrep(const BlockKey& key, uint64_t offset, uint64_t length,
                       Hit* out) {
   if (shards_.empty()) return false;  // failed-construction guard (ok()==false)

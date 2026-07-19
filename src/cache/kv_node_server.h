@@ -104,13 +104,28 @@ class KvNodeServer {
   // issues the pread (io_uring) into its io_buf and closes out->fd afterward.
   // Updates miss/io-error counters; the hit/bytes-read counters are bumped by
   // RangeDirectComplete once the read result is known.
+  // On a deferrable hit with read-coalescing enabled, registers the read as an
+  // async flight and returns its token via *out_flight (0 = none): the caller
+  // MUST route the token to RangeDirectComplete (read finished, ok or not) or
+  // RangeFlightAbort (read never ran). A prep that loses the registration race
+  // to an identical in-flight read declines with kInvalid so the serve loop
+  // falls back to the sync path, which joins the flight.
   Status RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize,
                          uint64_t offset, uint64_t length, size_t io_cap,
-                         KVStore::RangePrep* out);
+                         KVStore::RangePrep* out,
+                         uint64_t* out_flight = nullptr);
   // Account a completed prep-based GET (called after the async read finishes).
   // elapsed_sec = submit->completion wall time; sampled into get_lat_ so the
   // default (uring) read path is no longer absent from op="get" latency.
-  void RangeDirectComplete(bool ok, size_t bytes_read, double elapsed_sec);
+  // `data` = payload bytes in the caller's direct buffer (nullptr on failure),
+  // valid only during the call: completes the flight (waiters copy from it)
+  // and, when the flight had fan-in AND covered the whole value, promotes the
+  // page into the RAM tier as a durable resident.
+  void RangeDirectComplete(bool ok, size_t bytes_read, double elapsed_sec,
+                           uint64_t flight, const char* data);
+  // Abort a flight whose read never completed (connection teardown): waiters
+  // fall back to their own reads immediately.
+  void RangeFlightAbort(uint64_t flight);
   // Balance a prep whose RangePrep::token != 0 (slab pins the slot across the
   // async read); routed to the owning engine via the token's disk-index byte.
   void RangePrepRelease(uint64_t token) { group_.RangeRelease(token); }

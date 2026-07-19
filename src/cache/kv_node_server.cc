@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 
 #include <vector>
@@ -218,6 +219,9 @@ std::string KvNodeServer::MetricsText() const {
          "Disk reads executed on behalf of a convoy", read_coalescer_.leaders());
   metric("dfkv_read_coalesced_total", "counter",
          "GETs served from an in-flight identical read", read_coalescer_.coalesced());
+  metric("dfkv_read_coalesce_timeouts_total", "counter",
+         "Coalesce waiters that timed out and fell back to their own read",
+         read_coalescer_.timeouts());
   metric("dfkv_accepts_total", "counter", "TCP connections accepted", AcceptCount());
   metric("dfkv_evictions_total", "counter", "Objects evicted (capacity pressure)",
          group_.Evictions());
@@ -308,6 +312,8 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_miss_total", "counter", "GETs that missed RAM (fell to disk)", ram_->Misses());
     metric("dfkv_ram_put_total", "counter", "PUTs accepted into the RAM hot tier", ram_->Puts());
     metric("dfkv_ram_put_bypass_total", "counter", "PUTs bypassing RAM (flush backpressure)", ram_->PutBypass());
+    metric("dfkv_ram_promoted_total", "counter",
+           "Coalesced cold reads promoted into RAM as durable residents", ram_->Promoted());
     metric("dfkv_ram_flushed_total", "counter", "RAM slots flushed to disk (now durable)", ram_->Flushed());
     metric("dfkv_ram_flush_dropped_total", "counter", "RAM slots dropped after flush failure", ram_->FlushDropped());
     metric("dfkv_ram_evictions_total", "counter", "RAM slots evicted under capacity pressure", ram_->Evictions());
@@ -402,10 +408,13 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
         }
       }
       if (!ram_served) {
-        if (coalesce_enabled_) {
+        // length==0 stays on the plain path: its scratch would have to be
+        // sized at the max-value worst case (a 64 MiB zeroed allocation per
+        // request), which costs more than the duplicate read it would save.
+        if (coalesce_enabled_ && length > 0) {
           // TCP convoy collapse: leader reads via group_.Range into a scratch
           // string sized by the store; followers copy the shared bytes.
-          const size_t cap = length ? length : (64u << 20);
+          const size_t cap = length;
           out_data->resize(cap);
           size_t n = 0;
           st = read_coalescer_.Read(key, offset, length, out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
@@ -621,8 +630,10 @@ Status KvNodeServer::RangeDirect(uint64_t id, uint32_t index, uint32_t ksize,
 
 Status KvNodeServer::RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize,
                                      uint64_t offset, uint64_t length,
-                                     size_t io_cap, KVStore::RangePrep* out) {
+                                     size_t io_cap, KVStore::RangePrep* out,
+                                     uint64_t* out_flight) {
   BlockKey key{id, index, ksize};
+  if (out_flight) *out_flight = 0;
   // A RAM-resident key has no fd to hand io_uring (and may be RAM-only, not yet
   // on disk). Decline the async prep (kInvalid) WITHOUT counting a miss so the
   // RDMA serve loop falls back to the synchronous RangeDirect, which serves it
@@ -652,21 +663,65 @@ Status KvNodeServer::RangeDirectPrep(uint64_t id, uint32_t index, uint32_t ksize
   } else if (st == Status::kIOError) {
     get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
+  // Register the flight ONLY under the exact conditions the RDMA serve loop
+  // defers on (readable fd, non-zero payload, fits the connection buffer):
+  // any other prep outcome is served by the sync fallback, which joins flights
+  // itself — registering one here that no async read will ever complete would
+  // strand its waiters.
+  if (st == Status::kOk && coalesce_enabled_ && out_flight && out->fd >= 0 &&
+      out->payload_len != 0 && out->aligned_len <= io_cap &&
+      out->aligned_len <= std::numeric_limits<unsigned>::max()) {
+    // Whole-value reads only are promotable: RAM-tier entries are full
+    // [ValueHeader|payload] blobs, so installing a sub-range would corrupt
+    // every later reader of the key.
+    const bool whole = offset == 0 && out->value_len != 0 &&
+                       out->payload_len == out->value_len;
+    uint64_t t = read_coalescer_.TryRegisterAsync(key, offset, length, whole);
+    if (t == 0) {
+      // Lost the race to an identical read registered since the InFlight()
+      // check above: decline the async prep; the sync fallback joins the
+      // flight instead of issuing a duplicate NVMe fetch.
+      ::close(out->fd);
+      if (out->token) group_.RangeRelease(out->token);
+      *out = KVStore::RangePrep{};
+      return Status::kInvalid;
+    }
+    *out_flight = t;
+  }
   return st;
 }
 
 void KvNodeServer::RangeDirectComplete(bool ok, size_t bytes_read,
-                                       double elapsed_sec) {
+                                       double elapsed_sec, uint64_t flight,
+                                       const char* data) {
   if (ok) {
     cache_hit_.fetch_add(1, std::memory_order_relaxed);
     bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
   } else {
     get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
+  if (flight) {
+    BlockKey key{0, 0, 0};
+    bool whole = false;
+    const bool had_waiters = read_coalescer_.CompleteAsync(
+        flight, ok ? Status::kOk : Status::kIOError, data, bytes_read, &key,
+        &whole);
+    // Fan-in admission gate: promote ONLY pages with convoy evidence (>=1
+    // waiter joined during the read). A convoy page's laggard ranks, repeat
+    // cold reads and post-restart replays are then served from the arena; a
+    // one-off cold read never pollutes the RAM tier (the num_extents churn
+    // lesson). Durable install: costs no flush bandwidth, evictable at once.
+    if (ok && had_waiters && whole && ram_ && data && bytes_read)
+      ram_->PutDurable(key, data, bytes_read);
+  }
   // Sample the async (uring) read latency into the SAME op="get" histogram the
   // synchronous RangeDirect feeds — before this the default read path since
   // v1.27.0 contributed no latency samples at all.
   if (lat_sampler_.ShouldSample()) get_lat_.Observe(elapsed_sec);
+}
+
+void KvNodeServer::RangeFlightAbort(uint64_t flight) {
+  read_coalescer_.CompleteAsync(flight, Status::kIOError, nullptr, 0);
 }
 
 bool KvNodeServer::RamRangePrep(uint64_t id, uint32_t index, uint32_t ksize,

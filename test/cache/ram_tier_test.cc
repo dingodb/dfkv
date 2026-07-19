@@ -404,3 +404,39 @@ TEST(RamTier, ShardCountCanExceedLegacyCapOf16) {
   ::unsetenv("DFKV_RAM_TIER_SHARDS");
   ::unsetenv("DFKV_RAM_TIER_EXTENT_BYTES");
 }
+
+// PutDurable: read-promotion entry. The slot is born durable — never enqueued
+// for flush (zero DIO write cost) and immediately evictable/removable (no
+// flush-pin). Dedup semantics match Put.
+TEST(RamTier, PutDurableNoFlushIOAndImmediatelyEvictable) {
+  FlushSink sink;
+  sink.close();  // any enqueued flush would block forever -> test would hang
+  RamTier rt(Opts(64 * 4096), sink.fn());
+  ASSERT_TRUE(rt.ok());
+  std::string v = "promoted-cold-page";
+  ASSERT_TRUE(rt.PutDurable(K(90), v.data(), v.size()));
+  EXPECT_EQ(rt.Promoted(), 1u);
+  EXPECT_EQ(rt.FlushBacklog(), 0u);  // never touched the flush queue
+  {
+    std::lock_guard<std::mutex> lk(sink.m);
+    EXPECT_EQ(sink.calls, 0);        // zero flush IO
+  }
+  RamTier::Hit h;
+  ASSERT_TRUE(rt.GetPrep(K(90), 0, v.size(), &h));
+  EXPECT_EQ(std::string(h.ptr, h.len), v);
+  rt.Release(h.token);
+  // No flush-pin held: Remove (which declines on any pin) succeeds at once.
+  EXPECT_TRUE(rt.Remove(K(90)));
+  EXPECT_FALSE(rt.Contains(K(90)));
+}
+
+TEST(RamTier, PutDurableDedupsAgainstResident) {
+  FlushSink sink;
+  RamTier rt(Opts(64 * 4096), sink.fn());
+  std::string v(500, 'p');
+  ASSERT_TRUE(rt.Put(K(91), v.data(), v.size()));
+  const uint64_t used = rt.UsedBytes();
+  EXPECT_TRUE(rt.PutDurable(K(91), v.data(), v.size()));  // resident -> no-op true
+  EXPECT_EQ(rt.UsedBytes(), used);                        // no second slot
+  EXPECT_EQ(rt.Promoted(), 0u);                           // dedup is not a promotion
+}

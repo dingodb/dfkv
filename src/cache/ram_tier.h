@@ -116,6 +116,15 @@ class RamTier {
   // slots) or if len exceeds the shard -- caller then does the normal disk write.
   bool Put(const BlockKey& key, const void* data, size_t len);
 
+  // Read-promotion entry: install a value that is ALREADY durable on disk
+  // (a coalesced cold read with fan-in evidence). Same allocation/index logic
+  // as Put, but the slot is born durable — never enqueued for flush, never
+  // holds a flush-pin, so it costs zero DIO write bandwidth and is evictable
+  // by CLOCK the moment no send is in flight. Best-effort: a full shard
+  // declines (false) and the promotion is silently skipped; promoted slots can
+  // never crowd out the write path's flush resources.
+  bool PutDurable(const BlockKey& key, const void* data, size_t len);
+
   // On hit, pins the slot (send-pin) and returns its arena location. The caller
   // MUST call Release(hit.token) when the RDMA send completes. Miss => false.
   bool GetPrep(const BlockKey& key, uint64_t offset, uint64_t length, Hit* out);
@@ -142,6 +151,7 @@ class RamTier {
   uint64_t Hits() const { return hits_.load(std::memory_order_relaxed); }
   uint64_t Misses() const { return misses_.load(std::memory_order_relaxed); }
   uint64_t Puts() const { return puts_.load(std::memory_order_relaxed); }
+  uint64_t Promoted() const { return promotes_.load(std::memory_order_relaxed); }
   uint64_t PutBypass() const { return put_bypass_.load(std::memory_order_relaxed); }
   uint64_t Flushed() const { return flushed_.load(std::memory_order_relaxed); }
   uint64_t FlushDropped() const { return flush_dropped_.load(std::memory_order_relaxed); }
@@ -221,7 +231,7 @@ class RamTier {
   std::mutex reclaim_mu_;
   bool reclaim_stop_ = false;
 
-  std::atomic<uint64_t> hits_{0}, misses_{0}, puts_{0}, put_bypass_{0};
+  std::atomic<uint64_t> hits_{0}, misses_{0}, puts_{0}, put_bypass_{0}, promotes_{0};
   std::atomic<uint64_t> flushed_{0}, flush_dropped_{0}, reclaimed_{0}, rebalanced_{0};
 };
 

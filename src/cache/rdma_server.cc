@@ -530,6 +530,7 @@ void RdmaServer::Serve(int boot_fd) {
         int read_idx = -1;   // >=0: index into descs (async read); -1: sync reply
         int fd = -1;         // owned (async only); closed after the batch read
         uint64_t prep_token = 0;  // slab slot hold; released where fd is closed
+        uint64_t flight = 0;      // coalescer registration; completed or aborted
         size_t head = 0;
         size_t payload_len = 0;
         // Steady-clock seconds at prep (read submit), 0 = unsampled. Only the
@@ -598,6 +599,7 @@ void RdmaServer::Serve(int boot_fd) {
               descs.push_back(d);
               qd.fd = pr.fd;
               qd.prep_token = pr.release_token;
+              qd.flight = pr.flight;
               qd.head = pr.head;
               qd.payload_len = pr.payload_len;
               qd.submit_sec = NowSteadySec();  // read submit -> completion latency
@@ -606,6 +608,8 @@ void RdmaServer::Serve(int boot_fd) {
               ::close(pr.fd);  // zero-len / oversize: handled by sync build below
               if (pr.release_token && range_release_handler_)
                 range_release_handler_(pr.release_token);
+              if (pr.flight && range_flight_abort_handler_)
+                range_flight_abort_handler_(pr.flight);
             }
           }
 
@@ -678,9 +682,15 @@ void RdmaServer::Serve(int boot_fd) {
             if (range_release_handler_) range_release_handler_(qd.prep_token);
             qd.prep_token = 0;
           }
-          if (range_complete_handler_)
+          // Runs BEFORE the reply send on purpose: coalesced waiters and the
+          // RAM promotion copy from the dbuf payload, and the buffer is reused
+          // the moment the scatter SEND is posted.
+          if (range_complete_handler_) {
             range_complete_handler_(ok, ok ? qd.payload_len : 0,
-                                    NowSteadySec() - qd.submit_sec);
+                                    NowSteadySec() - qd.submit_sec, qd.flight,
+                                    ok ? ep.dbuf(qd.recv_slot) + qd.head : nullptr);
+            qd.flight = 0;  // completed: the teardown sweep must not abort it
+          }
           char* sb = ep.sbuf(qd.send_slot);
           if (ok) {
             EncodeResp(sb, Status::kOk, qd.payload_len);
@@ -699,10 +709,13 @@ void RdmaServer::Serve(int boot_fd) {
         }
       }
 
-      // Connection ending: close any fds still owned by un-emitted queue entries.
+      // Connection ending: close any fds still owned by un-emitted queue
+      // entries, and abort their flights so coalesced waiters on other
+      // connections stop waiting NOW instead of eating the full timeout.
       for (auto& qd : queue) {
         if (qd.fd >= 0) ::close(qd.fd);
         if (qd.prep_token && range_release_handler_) range_release_handler_(qd.prep_token);
+        if (qd.flight && range_flight_abort_handler_) range_flight_abort_handler_(qd.flight);
       }
     }
     // Release RAM-hit pins for sends that never completed (conn tore down) so the

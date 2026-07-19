@@ -30,6 +30,9 @@ struct RangePrep {
   size_t aligned_len = 0;   // O_DIRECT-aligned read length (multiple of 4096)
   size_t head = 0;          // offset of requested bytes within the aligned read
   size_t payload_len = 0;   // exact requested bytes (after clamp to file size)
+  size_t value_len = 0;     // full stored value size — lets the server tell a
+                            // whole-value read (offset 0, payload_len ==
+                            // value_len) from a sub-range (RAM promotion gate)
   // 0 = nothing to release. A slot-based engine (slab) must hold the slot
   // against eviction/remove while the caller's async read is in flight -- the
   // caller passes this back via RangeRelease once the read is done (KVStore's

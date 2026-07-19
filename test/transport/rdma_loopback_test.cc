@@ -889,17 +889,23 @@ struct RdmaUringNode {
         [this](uint64_t id, uint32_t idx, uint32_t ks, uint64_t off, uint64_t len,
                size_t cap, RdmaServer::RangePrepResult* o) {
           KVStore::RangePrep p;
-          Status st = srv->RangeDirectPrep(id, idx, ks, off, len, cap, &p);
+          Status st = srv->RangeDirectPrep(id, idx, ks, off, len, cap, &p, &o->flight);
           if (st == Status::kOk) {
             o->fd = p.fd; o->aligned_off = p.aligned_off; o->aligned_len = p.aligned_len;
             o->head = p.head; o->payload_len = p.payload_len;
+            o->release_token = p.token;
           }
           return st;
         });
     rsrv->set_range_complete_handler(
-        [this](bool ok, size_t bytes, double elapsed_sec) {
-          srv->RangeDirectComplete(ok, bytes, elapsed_sec);
+        [this](bool ok, size_t bytes, double elapsed_sec, uint64_t flight,
+               const char* data) {
+          srv->RangeDirectComplete(ok, bytes, elapsed_sec, flight, data);
         });
+    rsrv->set_range_release_handler(
+        [this](uint64_t tok) { srv->RangePrepRelease(tok); });
+    rsrv->set_range_flight_abort_handler(
+        [this](uint64_t f) { srv->RangeFlightAbort(f); });
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
   }

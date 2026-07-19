@@ -584,6 +584,7 @@ Status KVStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
   // From here a failure must close raw_fd (the caller only owns it on kOk).
   auto fail = [&](Status s) { ::close(raw_fd); return s; };
   if (offset > fsize) return fail(Status::kInvalid);
+  out->value_len = static_cast<size_t>(fsize);
   uint64_t n = length;
   if (n > fsize - offset) n = fsize - offset;
   if (n == 0) {  // valid zero-length hit: nothing to read, no fd to keep

@@ -656,6 +656,7 @@ Status DiskSlabStore::RangeDirectPrep(const BlockKey& key, uint64_t offset,
     ReleaseInflightLocked(key, fn);
     return s;
   };
+  out->value_len = plen;
   if (offset >= plen) { out->payload_len = 0; return bail(Status::kOk); }  // zero-len hit, fd=-1
   const uint64_t n = std::min(length ? length : (plen - offset),
                               static_cast<uint64_t>(plen - offset));
