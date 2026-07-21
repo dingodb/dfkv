@@ -22,6 +22,27 @@
 namespace dfkv {
 
 namespace {
+// Summarize a membership change as "+A -R (added: ...; removed: ...)", comparing
+// new node ids against the currently-adopted ones. Empty when there is no id
+// churn (e.g. only an address/weight changed). Ids only; small lists spelled out
+// so an operator sees exactly which node joined or left.
+std::string MembershipDelta(const std::map<std::string, std::string>& old_m,
+                            const std::map<std::string, std::string>& new_m) {
+  std::vector<std::string> added, removed;
+  for (const auto& kv : new_m) if (!old_m.count(kv.first)) added.push_back(kv.first);
+  for (const auto& kv : old_m) if (!new_m.count(kv.first)) removed.push_back(kv.first);
+  if (added.empty() && removed.empty()) return {};
+  auto join = [](const std::vector<std::string>& v) {
+    std::string s;
+    for (size_t i = 0; i < v.size(); ++i) { if (i) s += ","; s += v[i]; }
+    return s;
+  };
+  std::string s = "+" + std::to_string(added.size()) + " -" + std::to_string(removed.size());
+  if (!added.empty()) s += " (added: " + join(added) + ")";
+  if (!removed.empty()) s += " (removed: " + join(removed) + ")";
+  return s;
+}
+
 // Max payload segments per scatter-gather key: the guards below use the LIVE
 // Transport::MaxSgPayloadSegs() (negotiated max_sge - 1 on RDMA; 29 on TCP),
 // and the connector reads the same value through dfkv_max_sg_segs, so its
@@ -233,6 +254,27 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
   }
 }
 
+void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) {
+  const size_t count = addr.size();
+  std::string delta;
+  {
+    std::lock_guard<std::mutex> lk(ring_mu_);
+    delta = MembershipDelta(addr_, addr);  // vs the previously-adopted view
+    ring_ = std::move(ring);
+    addr_ = std::move(addr);
+  }
+  // A membership change is rare (epoch-gated) and worth one line: its presence
+  // confirms discovery populated the ring; its ABSENCE at startup is the fastest
+  // tell that the ring is empty and every op is silently missing. The delta
+  // (added/removed node ids) makes a scale-up or a node loss obvious at a glance.
+  if (count == 0)
+    DFKV_LOG_WARN("ring: adopted EMPTY membership (0 nodes) — puts/gets route to nowhere (ok=0)");
+  else if (delta.empty())
+    DFKV_LOG_INFO("ring: " + std::to_string(count) + " member(s) (unchanged)");
+  else
+    DFKV_LOG_INFO("ring: " + std::to_string(count) + " member(s) " + delta);
+}
+
 void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> members) {
   ConHash ring;
   std::map<std::string, std::string> addr;
@@ -241,9 +283,7 @@ void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> membe
     addr[name] = a;
   }
   ring.Build();
-  std::lock_guard<std::mutex> lk(ring_mu_);
-  ring_ = std::move(ring);
-  addr_ = std::move(addr);
+  AdoptRing(std::move(ring), std::move(addr));
 }
 
 void KVClient::SetMembers(const std::vector<MemberInfo>& members) {
@@ -254,9 +294,7 @@ void KVClient::SetMembers(const std::vector<MemberInfo>& members) {
     addr[m.id] = m.ip + ":" + std::to_string(m.port);
   }
   ring.Build();
-  std::lock_guard<std::mutex> lk(ring_mu_);
-  ring_ = std::move(ring);
-  addr_ = std::move(addr);
+  AdoptRing(std::move(ring), std::move(addr));
 }
 
 void KVClient::StartMdsDiscovery(std::vector<std::string> mds_eps,
@@ -373,6 +411,25 @@ std::string KVClient::MetricsSnapshot() const {
     s += "# HELP dfkv_client_gpu_dedup_wait_timeouts_total Waits that fell back to a direct fetch\n";
     s += "# TYPE dfkv_client_gpu_dedup_wait_timeouts_total counter\n";
     s += "dfkv_client_gpu_dedup_wait_timeouts_total " + std::to_string(gd->wait_timeouts()) + "\n";
+  }
+  // MDS discovery / placement-ring health. An empty ring means every put/get
+  // routes to nowhere and silently reports ok=0, so surface both the current
+  // ring size and MDS reachability — the fastest tell of a bad mds_endpoint.
+  {
+    size_t members;
+    { std::lock_guard<std::mutex> lk(ring_mu_); members = addr_.size(); }
+    s += "# HELP dfkv_client_ring_members Placement-ring members currently adopted from MDS discovery\n";
+    s += "# TYPE dfkv_client_ring_members gauge\n";
+    s += "dfkv_client_ring_members " + std::to_string(members) + "\n";
+  }
+  if (poller_) {
+    s += "# HELP dfkv_client_mds_unreachable_polls_total MDS list-members polls that failed (endpoint unreachable or RPC error)\n";
+    s += "# TYPE dfkv_client_mds_unreachable_polls_total counter\n";
+    s += "dfkv_client_mds_unreachable_polls_total " +
+         std::to_string(poller_->unreachable_polls_total()) + "\n";
+    s += "# HELP dfkv_client_mds_reachable 1 if the most recent MDS poll succeeded, 0 during an outage\n";
+    s += "# TYPE dfkv_client_mds_reachable gauge\n";
+    s += "dfkv_client_mds_reachable " + std::string(poller_->reachable() ? "1" : "0") + "\n";
   }
   if (t_) s += t_->MetricsText();
   return s;

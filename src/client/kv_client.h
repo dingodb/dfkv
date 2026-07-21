@@ -186,6 +186,10 @@ class KVClient {
   std::string Route(const std::string& key) const;
   uint64_t NowMs() const;
   void ProbeLoop();
+  // Swap in a freshly-built ring under ring_mu_ and log the membership delta
+  // (added/removed node ids) vs the previously-adopted view. Shared by both
+  // SetMembers overloads so static and MDS-discovery paths log identically.
+  void AdoptRing(ConHash ring, std::map<std::string, std::string> addr);
   // The plain (no-dedup) batch bodies; the public methods wrap them with the
   // same-host rendezvous when DFKV_CLIENT_NODE_DEDUP=1 (see node_dedup.h).
   std::vector<bool> BatchGetDirect(const std::vector<KvGetItem>& items);

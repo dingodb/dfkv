@@ -47,3 +47,48 @@ TEST(DynamicMembers, AddingNodeReroutesNewKeys) {
   EXPECT_TRUE(c.Get("p2_0", &out[0], out.size()));
   a->srv->Stop(); b->srv->Stop();
 }
+
+// AdoptRing()/MembershipDelta: a membership change must log WHICH node ids
+// joined/left, so a scale-up or a node loss is obvious at a glance. The logger
+// writes to stderr; capture it around each SetMembers. No servers/ops are
+// needed — only the ring rebuild runs (the probe + MDS discovery threads stay
+// off unless their env knobs are set), so nothing else pollutes the capture.
+TEST(DynamicMembers, SetMembersLogsAddRemoveDelta) {
+  using P = std::vector<std::pair<std::string, std::string>>;
+  KVClient c(P{{"n1", "127.0.0.1:1"}, {"n2", "127.0.0.1:2"}}, Hdr());
+
+  // add n3
+  testing::internal::CaptureStderr();
+  c.SetMembers(P{{"n1", "127.0.0.1:1"}, {"n2", "127.0.0.1:2"}, {"n3", "127.0.0.1:3"}});
+  std::string log = testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("3 member(s) +1 -0"), std::string::npos) << log;
+  EXPECT_NE(log.find("added: n3"), std::string::npos) << log;
+  EXPECT_EQ(log.find("removed:"), std::string::npos) << log;
+
+  // remove n1
+  testing::internal::CaptureStderr();
+  c.SetMembers(P{{"n2", "127.0.0.1:2"}, {"n3", "127.0.0.1:3"}});
+  log = testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("2 member(s) +0 -1"), std::string::npos) << log;
+  EXPECT_NE(log.find("removed: n1"), std::string::npos) << log;
+
+  // rolling replace: n2 out, n4 in
+  testing::internal::CaptureStderr();
+  c.SetMembers(P{{"n3", "127.0.0.1:3"}, {"n4", "127.0.0.1:4"}});
+  log = testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("+1 -1"), std::string::npos) << log;
+  EXPECT_NE(log.find("added: n4"), std::string::npos) << log;
+  EXPECT_NE(log.find("removed: n2"), std::string::npos) << log;
+
+  // same ids, only the address changed -> no id churn -> "(unchanged)"
+  testing::internal::CaptureStderr();
+  c.SetMembers(P{{"n3", "127.0.0.1:33"}, {"n4", "127.0.0.1:44"}});
+  log = testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("(unchanged)"), std::string::npos) << log;
+
+  // empty membership -> WARN (the "ring is empty, ops report ok=0" case)
+  testing::internal::CaptureStderr();
+  c.SetMembers(P{});
+  log = testing::internal::GetCapturedStderr();
+  EXPECT_NE(log.find("EMPTY membership"), std::string::npos) << log;
+}
