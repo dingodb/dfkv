@@ -862,16 +862,14 @@ class DfkvStoreWorker:
                 f"role={self.kv_role},tp_size={self.tp_size},"
                 f"tp_rank={self.tp_rank},ver={_tcfg.dist_version('dfkv-vllm')}"
             )
-        model_hash = int(extra.get("model_hash", 0))
-        if model_hash == 0:
-            # mh=0 is the shared legacy keyspace with NO geometry guard beyond
-            # the byte-length check: two models with the same model_name but a
-            # different dtype/page layout can cross-read each other's blocks.
-            # (hicache derives real geometry; lmcache derives a stable hash.)
-            logger.warning(
-                "dfkv connector: model_hash is 0 (shared keyspace, no "
-                "cross-model isolation). Set kv_connector_extra_config."
-                "model_hash to a per-model value in multi-model fleets.")
+        # Refuse to start on a missing/invalid isolation identity or with no ring
+        # to connect to. mh=0 is the shared legacy keyspace with NO geometry
+        # guard beyond the byte-length check (two models with the same
+        # model_name but a different dtype/page layout can cross-read each
+        # other's blocks), so it now requires an explicit opt-in
+        # (allow_shared_keyspace=1) rather than being the silent default.
+        _tcfg.require_ring_endpoint(extra.get("members", ""), mds_endpoints)
+        model_hash = _tcfg.require_model_hash(extra)
         # Phase 9: same-host rendezvous ON BY DEFAULT for exactly the topology
         # it exists for — MLA with REPLICATED KV across tp ranks (dcp/pcp
         # shard the KV, so their per-rank keys never rendezvous). The vLLM SG

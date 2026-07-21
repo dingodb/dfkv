@@ -240,8 +240,7 @@ class DfkvHiCache(HiCacheStorage):
                         f"tp={self.tp_rank}/{self.tp_size} mla={int(self.is_mla)}") as r:
             mds = cfg.get("mds_endpoints", "")
             members = cfg.get("members", "")
-            if not mds and not members:
-                raise ValueError("dingofs hicache: extra_config needs 'mds_endpoints' (MDS discovery) or 'members' (static)")
+            _tcfg.require_ring_endpoint(members, mds)
             # RDMA write pipelining: depth>1 keeps multiple PUTs in flight on one
             # connection, hiding per-op latency (single-rank MLA writes are
             # latency-bound). The C client reads DFKV_RDMA_DEPTH when it builds the
@@ -302,7 +301,10 @@ class DfkvHiCache(HiCacheStorage):
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
             flags = _FLAG_IS_MLA if self.is_mla else 0
-            model_hash = int(cfg.get("model_hash", 0)) & 0xFFFFFFFFFFFFFFFF
+            # Refuse to start on a missing/invalid isolation identity (ring
+            # endpoint already validated above). Opt out with
+            # allow_shared_keyspace=1 for a single-model shared keyspace.
+            model_hash = _tcfg.require_model_hash(cfg)
             self._h = self._lib.dfkv_open(
                 members.encode(), model_hash,
                 int(cfg.get("page_size", 64)), int(cfg.get("dtype_tag", 0)), flags,

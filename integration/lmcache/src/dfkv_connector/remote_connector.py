@@ -32,6 +32,7 @@ from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
+from ._telemetry import config as _tcfg
 from .access_log import access_log
 from .config import parse_dfkv_url
 from .exists_cache import ExistsLRU
@@ -67,8 +68,13 @@ def _geometry_from_metadata(md: Any) -> dict:
     layer_num = int(kv_shape[0]) if len(kv_shape) > 0 else 0
     head_num = int(kv_shape[3]) if len(kv_shape) > 3 else 0
     head_dim = int(kv_shape[4]) if len(kv_shape) > 4 else 0
+    # model_name is the isolation namespace (derives model_hash); an empty one
+    # makes every deployment collide on blake2b("") — refuse to start unless the
+    # shared keyspace is opted in via env DFKV_ALLOW_SHARED_KEYSPACE=1.
+    model_name = getattr(md, "model_name", "")
+    _tcfg.require_isolation_name(model_name)
     return {
-        "model_hash": _stable_model_hash(getattr(md, "model_name", "")),
+        "model_hash": _stable_model_hash(model_name),
         "page_size": int(getattr(md, "chunk_size", 0)),
         "dtype_tag": 0,
         "flags": _FLAG_IS_MLA if getattr(md, "use_mla", False) else 0,
