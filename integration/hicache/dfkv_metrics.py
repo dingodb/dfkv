@@ -24,7 +24,8 @@ Metric names (labels: tp_rank):
 import threading
 
 try:
-    from prometheus_client import Counter as _PromCounter, Histogram as _PromHistogram
+    from prometheus_client import (Counter as _PromCounter, Gauge as _PromGauge,
+                                    Histogram as _PromHistogram)
     _HAVE_PROM = True
 except Exception:  # prometheus_client absent -> in-process counters only
     _HAVE_PROM = False
@@ -117,21 +118,42 @@ class Metrics:
 # Prometheus Counters by delta, so they aggregate across the per-TP-rank
 # processes in SGLang's multiprocess metrics mode. Off the request hot path.
 
-_CLIENT_NAMES = [
+# Counters mirrored by positive delta (monotonic across polls).
+_CLIENT_COUNTER_NAMES = [
     "dfkv_client_ops_served_total",
     "dfkv_client_io_errors_total",
     "dfkv_client_unhealthy_skips_total",
     "dfkv_client_peer_marked_bad_total",
     "dfkv_client_peer_recovered_total",
+    "dfkv_client_mds_unreachable_polls_total",
 ]
+# Gauges mirrored by set() to the current value each poll: ring size and MDS
+# reachability, so a bad/unreachable mds_endpoint is visible on the SCRAPE
+# (ring_members==0 / mds_reachable==0), not just in the client log.
+_CLIENT_GAUGE_NAMES = [
+    "dfkv_client_ring_members",
+    "dfkv_client_mds_reachable",
+]
+# The union the snapshot parser captures (per-peer labeled series stay excluded).
+_CLIENT_NAMES = _CLIENT_COUNTER_NAMES + _CLIENT_GAUGE_NAMES
 
 _CLIENT_PROM = {}
+_CLIENT_GAUGE_PROM = {}
 if _HAVE_PROM:
-    for _n in _CLIENT_NAMES:
+    for _n in _CLIENT_COUNTER_NAMES:
         try:
             _CLIENT_PROM[_n] = _PromCounter(_n, _n, ["tp_rank"])
         except Exception:
             _CLIENT_PROM = {}
+            break
+    for _n in _CLIENT_GAUGE_NAMES:
+        try:
+            # multiprocess_mode is consulted only under PROMETHEUS_MULTIPROC_DIR;
+            # 'liveall' keeps each live rank's current value (tp_rank labels them).
+            _CLIENT_GAUGE_PROM[_n] = _PromGauge(_n, _n, ["tp_rank"],
+                                                multiprocess_mode="liveall")
+        except Exception:
+            _CLIENT_GAUGE_PROM = {}
             break
 
 
@@ -143,8 +165,9 @@ class ClientStatsPoller:
         self._get_text = get_text
         self._rank = str(int(tp_rank))
         self._interval = float(interval_s)
-        self._last = {n: 0 for n in _CLIENT_NAMES}
-        self._totals = {n: 0 for n in _CLIENT_NAMES}  # in-process mirror (tests/debug)
+        self._last = {n: 0 for n in _CLIENT_COUNTER_NAMES}
+        self._totals = {n: 0 for n in _CLIENT_COUNTER_NAMES}  # in-process mirror (tests/debug)
+        self._gauges = {n: 0 for n in _CLIENT_GAUGE_NAMES}    # last-seen gauge values
         self._stop = threading.Event()
         self._thread = None
 
@@ -170,7 +193,7 @@ class ClientStatsPoller:
 
     def poll_once(self):
         vals = self._parse(self._get_text() or "")
-        for n in _CLIENT_NAMES:
+        for n in _CLIENT_COUNTER_NAMES:  # counters: mirror by positive delta
             v = vals.get(n, 0)
             d = v - self._last[n]
             if d > 0:
@@ -178,9 +201,17 @@ class ClientStatsPoller:
                 self._totals[n] += d
                 if _HAVE_PROM and n in _CLIENT_PROM:
                     _CLIENT_PROM[n].labels(self._rank).inc(d)
+        for n in _CLIENT_GAUGE_NAMES:  # gauges: mirror the current value each poll
+            v = vals.get(n, 0)
+            self._gauges[n] = v
+            if _HAVE_PROM and n in _CLIENT_GAUGE_PROM:
+                _CLIENT_GAUGE_PROM[n].labels(self._rank).set(v)
 
     def totals(self):
         return dict(self._totals)
+
+    def gauges(self):
+        return dict(self._gauges)
 
     def _loop(self):
         while not self._stop.wait(self._interval):

@@ -1022,6 +1022,27 @@ class ClientStatsPollerTest(unittest.TestCase):
         self.assertEqual(t2["dfkv_client_ops_served_total"], 8)
         self.assertEqual(t2["dfkv_client_io_errors_total"], 1)  # unchanged
 
+    def test_mirrors_mds_reachability_counter_and_gauges(self):
+        # MDS-reachability metrics: the unreachable-polls COUNTER mirrors by
+        # delta; ring_members / mds_reachable are GAUGES that track the current
+        # value (0 during an outage, then the recovered value).
+        p = self._poller([
+            ("dfkv_client_mds_unreachable_polls_total 2\n"
+             "dfkv_client_ring_members 0\n"
+             "dfkv_client_mds_reachable 0\n"),
+            ("dfkv_client_mds_unreachable_polls_total 2\n"
+             "dfkv_client_ring_members 5\n"
+             "dfkv_client_mds_reachable 1\n"),
+        ])
+        p.poll_once()  # outage: 2 failed polls, empty ring, unreachable
+        self.assertEqual(p.totals()["dfkv_client_mds_unreachable_polls_total"], 2)
+        self.assertEqual(p.gauges()["dfkv_client_ring_members"], 0)
+        self.assertEqual(p.gauges()["dfkv_client_mds_reachable"], 0)
+        p.poll_once()  # recovered: ring of 5, reachable; counter unchanged
+        self.assertEqual(p.totals()["dfkv_client_mds_unreachable_polls_total"], 2)
+        self.assertEqual(p.gauges()["dfkv_client_ring_members"], 5)
+        self.assertEqual(p.gauges()["dfkv_client_mds_reachable"], 1)
+
     def test_disabled_interval_starts_no_thread(self):
         from dfkv_metrics import ClientStatsPoller
         p = ClientStatsPoller(lambda: "", tp_rank=0, interval_s=0)
