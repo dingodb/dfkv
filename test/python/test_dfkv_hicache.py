@@ -370,6 +370,70 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(m["set_observations"], 1)
         self.assertEqual(m["get_observations"], 1)
 
+    def test_client_metrics_count_v2_set_get_exists(self):
+        # v2 (DSA side-pool) path metrics. For a V4/DSA model (GLM-5.2) the real
+        # KV rides batch_set_v2/get_v2 while batch_set_v1 only writes empty anchor
+        # markers, so the *_v1 counters stay blind — the *_v2 counters are what
+        # express the L3 write/hit rate. Mirrors the anchor+side-pool v2 flow.
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+        members, _, _ = self._node("metricsv2")
+        cfg = self._cfg(members, model="glm-5.2")
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st.register_mem_pool_host(FakeLogicalAnchorPool(self.PAGE_SIZE))
+        side = FakeMlaPool(3, self.PAGE_BYTES, self.PAGE_SIZE)
+        st.register_mem_host_pool_v2(side, "deepseek_v4_c4")
+        keys = ["v0", "v1", "v2"]
+        hi = list(range(3 * self.PAGE_SIZE))
+        st.batch_set_v1(keys, hi)  # empty anchor markers -> v1 write counter inert
+        st.batch_set_v2([PoolTransfer(name="deepseek_v4_c4",
+                                      host_indices=hi, keys=keys)])
+        st.batch_get_v2([PoolTransfer(name="deepseek_v4_c4",
+                                      host_indices=hi, keys=keys)])
+        res = st.batch_exists_v2(
+            keys, [PoolTransfer(name="deepseek_v4_c4", host_indices=hi, keys=keys)])
+        m = st._metrics.snapshot()
+        # set_v2: one call, 3 side-pool pages acked OK, bytes = 3 * page
+        self.assertEqual(m["set_v2_calls"], 1)
+        self.assertEqual(m["set_v2_pages"], 3)
+        self.assertEqual(m["set_v2_ok_pages"], 3)
+        self.assertEqual(m["set_v2_bytes"], 3 * self.PAGE_BYTES)
+        # get_v2: one call, 3 pages requested, all hit
+        self.assertEqual(m["get_v2_calls"], 1)
+        self.assertEqual(m["get_v2_pages"], 3)
+        self.assertEqual(m["get_v2_hit_pages"], 3)
+        self.assertEqual(m["get_v2_bytes"], 3 * self.PAGE_BYTES)
+        # exist_v2: probed 3 candidate keys; all 3 form the usable hit prefix.
+        # This ratio (hit/probe) is the DSA L3 hit-rate signal.
+        self.assertEqual(m["exist_v2_calls"], 1)
+        self.assertEqual(m["exist_v2_probe_pages"], 3)
+        self.assertEqual(m["exist_v2_hit_pages"], res.kv_hit_pages)
+        self.assertEqual(m["exist_v2_hit_pages"], 3)
+        # v2 latency histograms observed once per set_v2/get_v2 call
+        self.assertEqual(m["set_v2_observations"], 1)
+        self.assertEqual(m["get_v2_observations"], 1)
+        # the v1 write counter never moved: batch_set_v1 hit the anchor branch
+        # and returned before on_set — proving the *_v1 blindness these fix.
+        self.assertEqual(m["set_calls"], 0)
+
+    def test_v2_set_metrics_skip_on_mla_rank_nonzero(self):
+        # MLA rank!=0 replicates the latent, so batch_set_v2 is a no-op skip
+        # ([True] markers, no I/O). It must NOT inflate the write-ok metric.
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+        members, _, _ = self._node("metricsv2skip")
+        cfg = self._cfg(members, model="glm-5.2", tp_rank=3)  # rank!=0, MLA
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        st.register_mem_pool_host(FakeLogicalAnchorPool(self.PAGE_SIZE))
+        side = FakeMlaPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        st.register_mem_host_pool_v2(side, "deepseek_v4_c4")
+        keys = ["s0", "s1"]
+        hi = list(range(2 * self.PAGE_SIZE))
+        st.batch_set_v2([PoolTransfer(name="deepseek_v4_c4",
+                                      host_indices=hi, keys=keys)])
+        m = st._metrics.snapshot()
+        self.assertEqual(m["set_v2_calls"], 0)
+        self.assertEqual(m["set_v2_ok_pages"], 0)
+        self.assertEqual(m["set_v2_bytes"], 0)
+
     # --- PP key-isolation tests (pure logic, no server/lib needed) ---
     # _keys()/_pool_keys() are pure functions of self.{model,tp_rank,tp_size,
     # is_mla,pp_rank,pp_size,enable_pp}. Bypass __init__ (which needs libdfkv.so
