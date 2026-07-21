@@ -400,7 +400,14 @@ TEST_F(DiskSlabTest, RebindWipesStaleRecordsNoResurrectionAcrossRestart) {
   {
     bool ok = false;
     // 2 extents x 4 slots(4096): 8 class-A keys fill both extents.
-    DiskSlabStore s(Opts(2 * 4 * 4096, 4 * 4096, 4096), &ok);
+    // Reclaimer OFF: this test asserts an EXACT steal-eviction count (one
+    // extent's 4 residents). With the default 50ms reclaimer running on this
+    // full store, the background thread can free an extra resident between the
+    // steal and the IsCached check, flaking the count to 5 (seen on clang CI).
+    // Determinism here is about the steal/rebind path, not reclaiming.
+    auto o = Opts(2 * 4 * 4096, 4 * 4096, 4096);
+    o.reclaim_interval_ms = 0;
+    DiskSlabStore s(o, &ok);
     ASSERT_TRUE(ok);
     std::string a(4000, 'A');
     for (int i = 0; i < 8; ++i)
@@ -415,9 +422,11 @@ TEST_F(DiskSlabTest, RebindWipesStaleRecordsNoResurrectionAcrossRestart) {
     ASSERT_EQ(absent_after_steal.size(), 4u) << "steal evicts one extent's residents";
   }
   // Restart: the stolen extent's old keys must STAY dead; B and the surviving
-  // extent's keys must read back intact.
+  // extent's keys must read back intact. Reclaimer OFF for the same reason.
   bool ok = false;
-  DiskSlabStore s2(Opts(2 * 4 * 4096, 4 * 4096, 4096), &ok);
+  auto o2 = Opts(2 * 4 * 4096, 4 * 4096, 4096);
+  o2.reclaim_interval_ms = 0;
+  DiskSlabStore s2(o2, &ok);
   ASSERT_TRUE(ok);
   EXPECT_EQ(s2.Count(), 5u) << "4 surviving A keys + B; no resurrection";
   for (int id : absent_after_steal)
