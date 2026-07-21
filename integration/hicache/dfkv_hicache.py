@@ -294,6 +294,11 @@ class DfkvHiCache(HiCacheStorage):
                 cfg.get("backup_exist_gate",
                         os.environ.get("DFKV_BACKUP_EXIST_GATE", "1")))
             self._put_retry_recovered = 0  # last _put_flat's retry recoveries
+            # last _v2_io()'s transferred bytes + I/O seconds, read by
+            # batch_set_v2/batch_get_v2 to feed the v2 metrics (mirrors the
+            # _put_retry_recovered instance-state handoff pattern).
+            self._v2_io_bytes = 0
+            self._v2_io_seconds = 0.0
             # self._lib was loaded above (before configure) so the native version
             # could be reported; dfkv_open uses that same handle here.
             flags = _FLAG_IS_MLA if self.is_mla else 0
@@ -773,6 +778,7 @@ class DfkvHiCache(HiCacheStorage):
                 for j, sk in enumerate(self._pool_keys(name, k)):
                     sks.append(sk); sp.append(int(ptrs[i * sub + j])); ss.append(int(sizes[i * sub + j]))
             segments.append((name, len(keys), sub, start, len(sks)))
+        t0 = time.perf_counter()
         if sks and putting:
             flat = self._put_flat(sks, sp, ss)
         elif sks:
@@ -781,6 +787,11 @@ class DfkvHiCache(HiCacheStorage):
             flat = [out[i] == 1 for i in range(len(sks))]
         else:
             flat = []
+        # Expose the actual I/O cost/volume for the v2 metrics (the caller reads
+        # these). ss covers only pools that did I/O (MLA backup_skip pools were
+        # `continue`d before appending), so bytes are 0 on a pure skip.
+        self._v2_io_bytes = sum(ss)
+        self._v2_io_seconds = time.perf_counter() - t0
         for name, nkeys, sub, start, end in segments:
             results[name] = self._fold(flat[start:end], nkeys, sub)
         return results
@@ -796,6 +807,14 @@ class DfkvHiCache(HiCacheStorage):
                 r.result += f" retry_ok={self._put_retry_recovered}"
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in res.values())
+            # MLA rank!=0 replicated latent is a no-op skip ([True] markers, no
+            # I/O) — don't inflate the write-ok metric with it (mirrors
+            # batch_set_v1, which returns before on_set on backup_skip).
+            if nkeys and not (self.is_mla and self.tp_rank != 0):
+                self._metrics.on_set_v2(
+                    pages=sum(len(rs) for rs in res.values()),
+                    ok_pages=sum(sum(rs) for rs in res.values()),
+                    nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
             return res
 
     def batch_get_v2(self, transfers, extra_info=None) -> dict:
@@ -807,6 +826,11 @@ class DfkvHiCache(HiCacheStorage):
             r.result = _fmt_pool_results(res)
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in res.values())
+            if nkeys:
+                self._metrics.on_get_v2(
+                    pages=sum(len(rs) for rs in res.values()),
+                    hit_pages=sum(sum(rs) for rs in res.values()),
+                    nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
             return res
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
@@ -853,6 +877,12 @@ class DfkvHiCache(HiCacheStorage):
             r.result = (f"kv={result.kv_hit_pages}/{total} "
                         + ",".join(f"{k}={v}" for k, v in hit.items()
                                    if k != "kv")).strip()
+            # The usable hit prefix (kv_hit_pages) over the probed candidate
+            # prefix (total keys) is the L3 hit-rate signal for V4/DSA models,
+            # where the *_v1 get counters only see empty anchor markers.
+            if total:
+                self._metrics.on_exists_v2(probe_pages=total,
+                                           hit_pages=result.kv_hit_pages)
             return result
 
     # --- required abstract methods (non zero-copy / introspection) ---

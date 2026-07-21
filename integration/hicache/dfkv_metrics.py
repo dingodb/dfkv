@@ -20,6 +20,22 @@ Metric names (labels: tp_rank):
   dfkv_client_get_pages_total      KV pages requested
   dfkv_client_get_hit_pages_total  pages returned as hits
   dfkv_client_get_bytes_total      bytes requested (sum of sub-object sizes)
+
+v2 (hybrid/DSA side-pool) path. For V4/DSA models (e.g. GLM-5.2) the real KV
+rides these while the *_v1 counters see only empty anchor markers, so the L3
+write/hit rate lives here. The DSA L3 hit rate =
+exist_v2_hit_pages_total / exist_v2_probe_pages_total.
+  dfkv_client_set_v2_calls_total       batch_set_v2 calls that wrote (MLA: rank0 only)
+  dfkv_client_set_v2_pages_total       side-pool pages offered to set_v2
+  dfkv_client_set_v2_ok_pages_total    side-pool pages acked OK
+  dfkv_client_set_v2_bytes_total       bytes sent on set_v2
+  dfkv_client_get_v2_calls_total       batch_get_v2 calls
+  dfkv_client_get_v2_pages_total       side-pool pages requested
+  dfkv_client_get_v2_hit_pages_total   side-pool pages returned as hits
+  dfkv_client_get_v2_bytes_total       bytes requested on get_v2
+  dfkv_client_exist_v2_calls_total     batch_exists_v2 calls
+  dfkv_client_exist_v2_probe_pages_total  candidate KV prefix pages probed
+  dfkv_client_exist_v2_hit_pages_total    usable hit-prefix pages (kv_hit_pages)
 """
 import threading
 
@@ -41,6 +57,12 @@ if _HAVE_PROM:
         _HIST["get"] = _PromHistogram("dfkv_client_get_seconds",
                                       "batch_get_v1 call duration seconds",
                                       ["tp_rank"], buckets=_HIST_BUCKETS)
+        _HIST["set_v2"] = _PromHistogram("dfkv_client_set_v2_seconds",
+                                         "batch_set_v2 I/O duration seconds",
+                                         ["tp_rank"], buckets=_HIST_BUCKETS)
+        _HIST["get_v2"] = _PromHistogram("dfkv_client_get_v2_seconds",
+                                         "batch_get_v2 I/O duration seconds",
+                                         ["tp_rank"], buckets=_HIST_BUCKETS)
     except Exception:
         _HIST = {}
 
@@ -53,6 +75,23 @@ _SPECS = [
     ("get_pages", "dfkv_client_get_pages_total", "KV pages requested"),
     ("get_hit_pages", "dfkv_client_get_hit_pages_total", "pages returned as hits"),
     ("get_bytes", "dfkv_client_get_bytes_total", "bytes requested on get"),
+    # v2 (hybrid/DSA side-pool) path. For V4/DSA models (e.g. GLM-5.2) the real KV
+    # rides batch_set_v2/batch_get_v2 while the v1 "kv" path only writes/reads
+    # empty anchor markers, so the *_v1 counters above cannot express the L3
+    # hit/write rate for those models — these do. batch_exists_v2 is the prefix
+    # existence probe that drives the scheduler's hit prefix, so its hit rate
+    # (exist_v2_hit_pages / exist_v2_probe_pages) is the L3 hit-rate signal.
+    ("set_v2_calls", "dfkv_client_set_v2_calls_total", "batch_set_v2 calls that wrote"),
+    ("set_v2_pages", "dfkv_client_set_v2_pages_total", "side-pool pages offered to set_v2"),
+    ("set_v2_ok_pages", "dfkv_client_set_v2_ok_pages_total", "side-pool pages acked OK on set_v2"),
+    ("set_v2_bytes", "dfkv_client_set_v2_bytes_total", "bytes sent on set_v2"),
+    ("get_v2_calls", "dfkv_client_get_v2_calls_total", "batch_get_v2 calls"),
+    ("get_v2_pages", "dfkv_client_get_v2_pages_total", "side-pool pages requested on get_v2"),
+    ("get_v2_hit_pages", "dfkv_client_get_v2_hit_pages_total", "side-pool pages returned as hits on get_v2"),
+    ("get_v2_bytes", "dfkv_client_get_v2_bytes_total", "bytes requested on get_v2"),
+    ("exist_v2_calls", "dfkv_client_exist_v2_calls_total", "batch_exists_v2 calls"),
+    ("exist_v2_probe_pages", "dfkv_client_exist_v2_probe_pages_total", "candidate KV prefix pages probed by exists_v2"),
+    ("exist_v2_hit_pages", "dfkv_client_exist_v2_hit_pages_total", "usable hit-prefix pages from exists_v2 (kv_hit_pages)"),
 ]
 
 # Prometheus Counters are process-global singletons (re-creating the same name
@@ -75,7 +114,8 @@ class Metrics:
         self._rank = str(int(tp_rank))
         self._lock = threading.Lock()
         self._c = {attr: 0 for attr, _, _ in _SPECS}
-        self._obs = {"set": 0, "get": 0}  # histogram observation counts (tests/debug)
+        # histogram observation counts (tests/debug)
+        self._obs = {"set": 0, "get": 0, "set_v2": 0, "get_v2": 0}
 
     def _add(self, **deltas):
         with self._lock:
@@ -102,11 +142,26 @@ class Metrics:
         if seconds is not None:
             self._observe("get", seconds)
 
+    def on_set_v2(self, pages, ok_pages, nbytes, seconds=None):
+        self._add(set_v2_calls=1, set_v2_pages=pages, set_v2_ok_pages=ok_pages,
+                  set_v2_bytes=nbytes)
+        if seconds is not None:
+            self._observe("set_v2", seconds)
+
+    def on_get_v2(self, pages, hit_pages, nbytes, seconds=None):
+        self._add(get_v2_calls=1, get_v2_pages=pages, get_v2_hit_pages=hit_pages,
+                  get_v2_bytes=nbytes)
+        if seconds is not None:
+            self._observe("get_v2", seconds)
+
+    def on_exists_v2(self, probe_pages, hit_pages):
+        self._add(exist_v2_calls=1, exist_v2_probe_pages=probe_pages,
+                  exist_v2_hit_pages=hit_pages)
+
     def snapshot(self):
         with self._lock:
             snap = dict(self._c)
-            snap.update({"set_observations": self._obs["set"],
-                         "get_observations": self._obs["get"]})
+            snap.update({f"{op}_observations": cnt for op, cnt in self._obs.items()})
             return snap
 
 
