@@ -110,11 +110,38 @@ class FlatBuf:
 
 
 class RegistrablePool(FakeMlaPool):
-    """Fake v2 pool with a tensor-like backing buffer attribute."""
+    """Fake v2 pool with a tensor-like backing buffer attribute (no hybrid
+    accessor) — exercises the fixed-attribute fallback probe."""
 
     def __init__(self, num_pages, page_bytes, page_size=64):
         super().__init__(num_pages, page_bytes, page_size)
         self.data_buffer = FlatBuf(num_pages * page_bytes)
+
+
+class FakeDSAIndexerPool(FakeMlaPool):
+    """Stand-in for SGLang's DSAIndexerPoolHost: its backing tensor lives under
+    `index_k_with_scale_buffer`, a name NOT in the old fixed-attr probe list, so
+    it is reachable only through get_hybrid_pool_buffer(). This is the pool whose
+    registration logged "no backing buffer found" for GLM-5.2 DSA."""
+
+    def __init__(self, num_pages, page_bytes, page_size=64):
+        super().__init__(num_pages, page_bytes, page_size)
+        self.index_k_with_scale_buffer = FlatBuf(num_pages * page_bytes)
+
+    def get_hybrid_pool_buffer(self):
+        return [self.index_k_with_scale_buffer]
+
+
+class FakeDSAPagedPool(FakeMlaPool):
+    """Stand-in for DeepSeekV4PagedHostPool: kv_buffer is a LIST of per-layer
+    tensors, self-reported via get_hybrid_pool_buffer() (mirrors the real pool)."""
+
+    def __init__(self, num_pages, page_bytes, page_size=64, layers=2):
+        super().__init__(num_pages, page_bytes, page_size)
+        self.kv_buffer = [FlatBuf(num_pages * page_bytes) for _ in range(layers)]
+
+    def get_hybrid_pool_buffer(self):
+        return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
 
 class FakeLogicalAnchorPool:
@@ -601,6 +628,80 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(calls, [
             (pool.data_buffer.data_ptr(),
              pool.data_buffer.numel() * pool.data_buffer.element_size())
+        ])
+
+    def test_register_dsa_indexer_pool_via_hybrid_accessor(self):
+        # DSAIndexerPoolHost keeps its buffer under `index_k_with_scale_buffer`,
+        # not kv_buffer — reachable only via get_hybrid_pool_buffer(). The old
+        # fixed-attr probe missed it ("no backing buffer found") and every DSA
+        # indexer page fell back to per-op MR registration, which then failed in
+        # RdmaTransport::CacheFrom and flunked the whole write batch.
+        members, _, _ = self._node("dsaidx")
+        cfg = self._cfg(members, model="glm-5.2")
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        pool = FakeDSAIndexerPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        calls = []
+        st.register_memory = lambda base, size: calls.append((base, size)) or True
+        # Drive the real failing entrypoint, not just the helper.
+        st.register_mem_host_pool_v2(pool, "deepseek_v4_c4_indexer")
+        self.assertIs(st.registered_pools["deepseek_v4_c4_indexer"], pool)
+        self.assertEqual(calls, [
+            (pool.index_k_with_scale_buffer.data_ptr(),
+             pool.index_k_with_scale_buffer.numel()
+             * pool.index_k_with_scale_buffer.element_size())
+        ])
+
+    def test_register_dsa_paged_pool_registers_all_layer_buffers(self):
+        # DeepSeekV4PagedHostPool exposes a LIST of per-layer tensors; every one
+        # must be registered (the old "first attribute wins" break stopped early).
+        members, _, _ = self._node("dsapaged")
+        cfg = self._cfg(members, model="glm-5.2")
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        pool = FakeDSAPagedPool(2, self.PAGE_BYTES, self.PAGE_SIZE, layers=3)
+        calls = []
+        st.register_memory = lambda base, size: calls.append((base, size)) or True
+        self.assertEqual(st._register_pool_buffers(pool), 3)
+        self.assertEqual(
+            calls,
+            [(b.data_ptr(), b.numel() * b.element_size()) for b in pool.kv_buffer],
+        )
+
+    def test_hybrid_accessor_preferred_over_attribute_probe(self):
+        # When a pool offers get_hybrid_pool_buffer(), it is authoritative — a
+        # stale/misleading kv_buffer attribute must NOT be probed instead.
+        members, _, _ = self._node("dsaprec")
+        cfg = self._cfg(members, model="glm-5.2")
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        pool = FakeMlaPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        accessor_buf = FlatBuf(2 * self.PAGE_BYTES)
+        decoy = FlatBuf(2 * self.PAGE_BYTES)
+        pool.kv_buffer = decoy  # would be picked by the fixed-attr probe
+        pool.get_hybrid_pool_buffer = lambda: [accessor_buf]
+        calls = []
+        st.register_memory = lambda base, size: calls.append((base, size)) or True
+        st._register_pool_buffers(pool)
+        self.assertEqual(calls, [
+            (accessor_buf.data_ptr(),
+             accessor_buf.numel() * accessor_buf.element_size())
+        ])
+
+    def test_register_dedups_region_shared_across_pools(self):
+        # A DSA model registers the KV anchor plus several sidecar pools; if two
+        # pools surface the same physical tensor it must be registered once.
+        members, _, _ = self._node("dsadedup")
+        cfg = self._cfg(members, model="glm-5.2")
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        shared = FlatBuf(2 * self.PAGE_BYTES)
+        pool_a = FakeDSAIndexerPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        pool_a.index_k_with_scale_buffer = shared
+        pool_b = FakeDSAIndexerPool(2, self.PAGE_BYTES, self.PAGE_SIZE)
+        pool_b.index_k_with_scale_buffer = shared
+        calls = []
+        st.register_memory = lambda base, size: calls.append((base, size)) or True
+        self.assertEqual(st._register_pool_buffers(pool_a), 1)
+        self.assertEqual(st._register_pool_buffers(pool_b), 0)  # already registered
+        self.assertEqual(calls, [
+            (shared.data_ptr(), shared.numel() * shared.element_size())
         ])
 
 
