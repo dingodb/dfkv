@@ -306,6 +306,10 @@ class DfkvHiCache(HiCacheStorage):
                 int(cfg.get("head_dim", 0)))
             if not self._h:
                 raise RuntimeError("dfkv_open failed")
+            # (base, size) of host regions already handed to dfkv_register_memory,
+            # so a buffer shared across multiple hybrid pools (DSA registers the
+            # KV anchor plus several sidecar pools) is registered exactly once.
+            self._registered_regions = set()
             mode_b = self._lib.dfkv_transport_mode(self._h)
             self.transport_mode = (
                 mode_b.decode("utf-8", errors="replace") if mode_b else "unknown"
@@ -416,28 +420,57 @@ class DfkvHiCache(HiCacheStorage):
         return self._lib.dfkv_register_memory(
             self._h, ctypes.c_void_p(int(base)), ctypes.c_uint64(int(size))) == 0
 
-    def _register_pool_buffers(self, pool) -> int:
-        """Best-effort: register a host pool's backing buffer(s) so its pages
-        transfer zero-copy without per-op MR registration. Probes the common
-        SGLang HostKVCache backing-buffer attributes; failure is non-fatal (pages
-        just fall back to ad-hoc per-buffer registration). Returns #regions done."""
-        done = 0
+    def _pool_backing_tensors(self, pool):
+        """Yield a host pool's backing tensor(s) for RDMA registration.
+
+        Preference order mirrors SGLang's own Mooncake backend
+        (_iter_host_pool_buffers): a hybrid/DSA pool self-reports its physical
+        tensors via get_hybrid_pool_buffer(), because they do NOT all live under
+        the same attribute name -- DeepSeekV4PagedHostPool/DeepSeekV4StateHostPool
+        expose a list under `kv_buffer`, but DSAIndexerPoolHost keeps its buffer in
+        `index_k_with_scale_buffer`, and MambaPoolHost in yet others. Probing a
+        fixed attribute list (the old behaviour) missed those and logged
+        "no backing buffer found". Simple KV pools with no accessor fall back to
+        the classic attribute probe."""
+        get_buffers = getattr(pool, "get_hybrid_pool_buffer", None)
+        if callable(get_buffers):
+            for buf in get_buffers() or ():
+                if buf is not None:
+                    yield buf
+            return
         for attr in ("kv_buffer", "host_kv_buffer", "data_buffer", "buffer", "data"):
             buf = getattr(pool, attr, None)
             if buf is None:
                 continue
-            tensors = buf if isinstance(buf, (list, tuple)) else [buf]
-            for t in tensors:
-                if not (hasattr(t, "data_ptr") and hasattr(t, "numel")
-                        and hasattr(t, "element_size")):
+            for t in (buf if isinstance(buf, (list, tuple)) else [buf]):
+                if t is not None:
+                    yield t
+            return  # first attribute that yielded buffers wins
+
+    def _register_pool_buffers(self, pool) -> int:
+        """Best-effort: register a host pool's backing buffer(s) so its pages
+        transfer zero-copy without per-op MR registration. Registers EVERY tensor
+        the pool exposes (a DSA multi-pool model has several), deduping regions
+        already registered. Failure is non-fatal (pages just fall back to ad-hoc
+        per-buffer registration). Returns #regions newly registered."""
+        if not hasattr(self, "_registered_regions"):
+            self._registered_regions = set()
+        done = 0
+        for t in self._pool_backing_tensors(pool):
+            if not (hasattr(t, "data_ptr") and hasattr(t, "numel")
+                    and hasattr(t, "element_size")):
+                continue
+            try:
+                base = int(t.data_ptr())
+                size = int(t.numel()) * int(t.element_size())
+                region = (base, size)
+                if not base or not size or region in self._registered_regions:
                     continue
-                try:
-                    if self.register_memory(t.data_ptr(), t.numel() * t.element_size()):
-                        done += 1
-                except Exception:
-                    pass
-            if done:
-                break  # first attribute that yielded registrable tensors wins
+                if self.register_memory(base, size):
+                    self._registered_regions.add(region)
+                    done += 1
+            except Exception:
+                pass
         return done
 
     def register_mem_pool_host(self, mem_pool_host):
