@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "common/status.h"
+#include "utils/log.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"
 #include "utils/wire_limits.h"
@@ -88,9 +89,44 @@ bool MdsMemberPoller::PollOnce() {
   if (!have_epoch_ || epoch != last_epoch_) {
     last_epoch_ = epoch;
     have_epoch_ = true;
+    if (!ms.empty()) ever_adopted_ = true;
     cb_(ms);
   }
   return true;
+}
+
+void MdsMemberPoller::ReportHealth(bool query_ok) {
+  if (query_ok) {
+    reachable_.store(true, std::memory_order_relaxed);
+    if (consec_fail_ > 0) {
+      DFKV_LOG_INFO("mds-poll: MDS reachable again for group=" + group_ +
+                    " after " + std::to_string(consec_fail_) + " failed poll(s)");
+      consec_fail_ = 0;
+      last_fail_log_ms_ = 0;
+    }
+    return;
+  }
+  // Query failed: no MDS endpoint answered ListMembers (unreachable or RPC
+  // error). The ring is intentionally NOT cleared, but if it was never
+  // populated the client routes every op to an empty ring and silently returns
+  // ok=0 — the exact trap where a mistyped mds_endpoint looks like a write/data
+  // failure. Log rate-limited so a sustained outage stays a heartbeat.
+  ++consec_fail_;
+  unreachable_total_.fetch_add(1, std::memory_order_relaxed);
+  reachable_.store(false, std::memory_order_relaxed);
+  const uint64_t now = NowMs();
+  const bool first = (consec_fail_ == 1);
+  if (!first && (now - last_fail_log_ms_) < kFailLogEveryMs) return;
+  last_fail_log_ms_ = now;
+  const std::string base =
+      "mds-poll: cannot reach MDS for group=" + group_ + " (mds=" + eps_.Join() +
+      ", " + std::to_string(consec_fail_) + " consecutive failed poll(s))";
+  if (!ever_adopted_)
+    DFKV_LOG_WARN(base +
+                  " — ring is EMPTY (never populated); all puts/gets route to "
+                  "nowhere and report ok=0. Check mds_endpoints reachability.");
+  else
+    DFKV_LOG_WARN(base + " — serving stale ring (last known members).");
 }
 
 bool MdsMemberPoller::WaitMs(int ms) {
@@ -101,7 +137,7 @@ bool MdsMemberPoller::WaitMs(int ms) {
 
 void MdsMemberPoller::Loop() {
   while (running_.load()) {
-    PollOnce();
+    ReportHealth(PollOnce());
     if (WaitMs(poll_ms_)) return;
   }
 }

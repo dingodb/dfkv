@@ -204,3 +204,45 @@ TEST(MdsMemberPoller, FailsOverPastDeadEndpointAcrossPolls) {
   EXPECT_TRUE(ok);
   EXPECT_EQ(got.size(), 2u) << "failover to the live MDS must return its members";
 }
+
+// ReportHealth() is Loop()'s per-poll health helper (query_ok = PollOnce()'s
+// result). It is what turns a silently-unreachable MDS into a visible signal,
+// so unit-test its state machine directly — no etcd/MDS needed.
+TEST(MdsMemberPoller, ReportHealthTracksReachabilityAndCounts) {
+  MdsMemberPoller poller({"127.0.0.1:9"}, "g",
+                         [](const std::vector<MemberInfo>&) {});
+  EXPECT_TRUE(poller.reachable());
+  EXPECT_EQ(poller.unreachable_polls_total(), 0u);
+
+  // Each failed poll marks the client unreachable and bumps the counter.
+  poller.ReportHealth(false);
+  EXPECT_FALSE(poller.reachable());
+  EXPECT_EQ(poller.unreachable_polls_total(), 1u);
+  poller.ReportHealth(false);
+  EXPECT_FALSE(poller.reachable());
+  EXPECT_EQ(poller.unreachable_polls_total(), 2u);
+
+  // A successful poll flips back to reachable; the counter is monotonic.
+  poller.ReportHealth(true);
+  EXPECT_TRUE(poller.reachable());
+  EXPECT_EQ(poller.unreachable_polls_total(), 2u);
+
+  // A subsequent outage keeps counting from where it left off.
+  poller.ReportHealth(false);
+  EXPECT_FALSE(poller.reachable());
+  EXPECT_EQ(poller.unreachable_polls_total(), 3u);
+}
+
+// End-to-end: a poll against an unreachable endpoint fails, never populates the
+// ring, and (via ReportHealth, as Loop() calls it) is marked unreachable — the
+// exact scenario a mistyped mds_endpoint used to hit 100% silently.
+TEST(MdsMemberPoller, UnreachableEndpointIsSurfacedNotSilent) {
+  int fires = 0;
+  MdsMemberPoller poller({"127.0.0.1:9"}, "g",  // discard port: connect refused fast
+                         [&](const std::vector<MemberInfo>&) { ++fires; });
+  EXPECT_FALSE(poller.PollOnce()) << "unreachable MDS must fail the poll";
+  EXPECT_EQ(fires, 0) << "the ring must never be populated";
+  poller.ReportHealth(false);  // Loop() feeds PollOnce()'s result here
+  EXPECT_FALSE(poller.reachable());
+  EXPECT_GE(poller.unreachable_polls_total(), 1u);
+}

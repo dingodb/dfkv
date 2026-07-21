@@ -20,6 +20,13 @@ class MdsEndpoints {
 
   size_t size() const { return eps_.size(); }
 
+  // Comma-joined endpoint list, for diagnostics/logging only.
+  std::string Join() const {
+    std::string s;
+    for (const auto& e : eps_) { if (!s.empty()) s += ","; s += e; }
+    return s;
+  }
+
   // Returns the next endpoint whose backoff has expired, advancing the cursor.
   // If ALL are in backoff, returns the one closest to recovery (degrade, never
   // fail). Empty string only when the list itself is empty.

@@ -91,6 +91,16 @@ class MdsMemberPoller {
   uint64_t empty_view_rejected() const { return guard_.rejected_empty(); }
   uint64_t shrink_view_rejected() const { return guard_.rejected_shrink(); }
 
+  // MDS reachability, surfaced to metrics/logs. The poll thread is otherwise
+  // silent, so a mistyped/unreachable mds endpoint leaves the ring empty forever
+  // while every op just reports ok=0 with no hint why.
+  // ReportHealth() is Loop()'s per-poll helper (query_ok = PollOnce()'s result);
+  // it is public so it is unit-testable without a live MDS. The two accessors
+  // are thread-safe (atomics) for KVClient::MetricsSnapshot().
+  void ReportHealth(bool query_ok);
+  uint64_t unreachable_polls_total() const { return unreachable_total_.load(); }
+  bool reachable() const { return reachable_.load(); }
+
  private:
   bool Query(std::vector<MemberInfo>* out, uint64_t* epoch);
   void Loop();
@@ -104,6 +114,15 @@ class MdsMemberPoller {
   int io_ms_;
   uint64_t last_epoch_ = 0;
   bool have_epoch_ = false;
+  // MDS reachability diagnostics (ReportHealth). Without these a bad mds
+  // endpoint fails 100% silently — the exact trap where "ok=0" writes look like
+  // a data/write bug instead of "the ring was never populated".
+  bool ever_adopted_ = false;      // has a non-empty view ever been adopted?
+  uint64_t consec_fail_ = 0;       // consecutive failed polls (poll-thread only)
+  uint64_t last_fail_log_ms_ = 0;  // rate-limit anchor for the sustained-outage WARN
+  std::atomic<uint64_t> unreachable_total_{0};  // cumulative failed polls (metric)
+  std::atomic<bool> reachable_{true};           // last poll succeeded? (metric)
+  static constexpr uint64_t kFailLogEveryMs = 30000;  // outage heartbeat cadence
   // Suspicious-view hysteresis depth (empty and mass-shrink arms alike).
   static constexpr int kViewsToAccept = 3;
   MemberViewGuard guard_;
