@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "common/config_dump.h"
 #include "utils/log.h"  // WARN guard on Remove-while-pinned (see header contract)
 
 namespace dfkv {
@@ -31,6 +32,10 @@ SlabAllocator::SlabAllocator(Options opt) : opt_(opt) {
       else cold_window_ = static_cast<uint64_t>(v);
     }
   }
+  config_dump::RecordResolved(
+      "DFKV_SLAB_COLD_STEAL_WINDOW",
+      !cold_steal_enabled_ ? std::string("disabled")
+          : (cold_window_ ? std::to_string(cold_window_) : std::string("auto")));
 }
 
 void SlabAllocator::PushFreeLocked(Class& C, uint32_t ext, uint32_t slot) {

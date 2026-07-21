@@ -17,6 +17,7 @@
 #include "cache/kv_node_server.h"
 #include "utils/wire_limits.h"
 #include "utils/log.h"
+#include "common/config_dump.h"
 #include "mds/mds_registrar.h"
 #include "utils/metrics_http.h"
 #include "common/version.h"
@@ -183,6 +184,28 @@ int main(int argc, char** argv) {
     return 2;
   }
   (void)rdma_port;
+  // Record the direct (non-env-facade) flags for the startup config dump.
+  // Source is flag ONLY when the flag was actually passed, else default — so the
+  // dump truthfully separates externally-specified from built-in-default values.
+  // The env-facade flags above already reach environ via setenv, so Emit()'s
+  // environ scan folds them in (shown as env with their effective value).
+  {
+    namespace cd = dfkv::config_dump;
+    auto src = [&](const char* flag) {
+      return args.Has(flag) ? cd::Source::kFlag : cd::Source::kDefault;
+    };
+    cd::Record("dir", dir, src("--dir"));
+    cd::Record("port", std::to_string(port), src("--port"));
+    cd::Record("cap", std::to_string(cap), src("--cap"));
+    cd::Record("rdma_dev", rdma_dev.empty() ? "(unset)" : rdma_dev, src("--rdma-dev"));
+    cd::Record("mds", mds.empty() ? "(none)" : mds, src("--mds"));
+    cd::Record("group", group, src("--group"));
+    cd::Record("id", node_id.empty() ? "(auto)" : node_id, src("--id"));
+    cd::Record("advertise", advertise.empty() ? "(auto)" : advertise, src("--advertise"));
+    cd::Record("weight", std::to_string(weight), src("--weight"));
+    cd::Record("metrics_port", std::to_string(metrics_port), src("--metrics-port"));
+    cd::Record("metrics_bind", metrics_bind.empty() ? "(any)" : metrics_bind, src("--metrics-bind"));
+  }
   std::signal(SIGINT, OnSig);
   std::signal(SIGTERM, OnSig);
 
@@ -294,6 +317,10 @@ int main(int argc, char** argv) {
                     (rdma_dev.empty() ? "" : ", dev=" + rdma_dev));
     else
       DFKV_LOG_WARN("dfkv_server RDMA listener failed to start (no device?)");
+    // Force-resolve the RDMA depth/uring knobs so their defaults land in the
+    // config dump (they are otherwise read lazily on the serve path, after Emit).
+    (void)rsrv->PipelineDepth();
+    (void)rsrv->UseUringPath();
   }
 #endif
 
@@ -388,6 +415,7 @@ int main(int argc, char** argv) {
                   " advertise=" + advertise);
   }
 
+  dfkv::config_dump::Emit("server");
   ready_flag->store(true, std::memory_order_release);
   DFKV_LOG_INFO("dfkv_server ready (all startup stages complete)");
 

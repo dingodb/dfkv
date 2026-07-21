@@ -11,6 +11,7 @@
 #include "mds/mds_server.h"
 #include "utils/metrics_http.h"
 #include "common/version.h"
+#include "common/config_dump.h"
 
 namespace {
 volatile sig_atomic_t g_stop = 0;
@@ -50,6 +51,17 @@ int main(int argc, char** argv) {
                  args.error().c_str());
     return 2;
   }
+  {
+    namespace cd = dfkv::config_dump;
+    auto src = [&](const char* flag) {
+      return args.Has(flag) ? cd::Source::kFlag : cd::Source::kDefault;
+    };
+    cd::Record("etcd", etcd, src("--etcd"));
+    cd::Record("listen", std::to_string(port), src("--listen"));
+    cd::Record("metrics_port", std::to_string(metrics_port), src("--metrics-port"));
+    cd::Record("metrics_bind", metrics_bind.empty() ? "(any)" : metrics_bind,
+               src("--metrics-bind"));
+  }
   dfkv::MdsServer srv(etcd);
   std::signal(SIGINT, OnSig);
   std::signal(SIGTERM, OnSig);
@@ -62,11 +74,9 @@ int main(int argc, char** argv) {
   // instead of running "up" while every registration silently fails. Window is
   // env-tunable (tests use a short one); default 30 s.
   {
-    int probe_ms = 30000;
-    if (const char* e = std::getenv("DFKV_MDS_ETCD_PROBE_MS")) {
-      int v = std::atoi(e);
-      if (v >= 0) probe_ms = v;
-    }
+    int probe_ms = static_cast<int>(
+        dfkv::config_dump::EnvI64("DFKV_MDS_ETCD_PROBE_MS", 30000));
+    if (probe_ms < 0) probe_ms = 30000;  // negative => default (unchanged)
     bool up = false;
     auto t0 = std::chrono::steady_clock::now();
     for (;;) {
@@ -95,6 +105,7 @@ int main(int argc, char** argv) {
       std::printf("dfkv_mds /metrics on port %d\n", mhttp->port());
     std::fflush(stdout);
   }
+  dfkv::config_dump::Emit("mds");
   // poll flag from normal context (matches dfkv_server_main.cc)
   while (!g_stop) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
   if (mhttp) mhttp->Stop();

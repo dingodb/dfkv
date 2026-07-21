@@ -1,3 +1,4 @@
+#include "common/config_dump.h"
 #include "mds/mds_server.h"
 
 #include <cstdlib>
@@ -102,6 +103,10 @@ void MdsServer::AcceptLoop() {
     const long m = std::atol(v);
     if (m > 0) max_conns = static_cast<size_t>(m);
   }
+  // Recorded from the accept thread's prologue (runs at Start, before main
+  // reaches Emit after its network etcd probe) so the dump shows these defaults.
+  config_dump::RecordResolved("DFKV_MDS_IO_TIMEOUT_S", std::to_string(tmo_s));
+  config_dump::RecordResolved("DFKV_MDS_MAX_CONNS", std::to_string(max_conns));
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) { if (!running_) break; continue; }

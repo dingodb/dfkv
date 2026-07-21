@@ -49,6 +49,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "common/config_dump.h"
 #include "common/kv_types.h"
 #include "common/status.h"
 
@@ -56,6 +57,11 @@ namespace dfkv {
 
 class ReadCoalescer {
  public:
+  // Force-resolve the coalescer's env knobs so they land in the startup config
+  // dump instead of waiting for the first coalesced read's lazy init. Called at
+  // server startup when read-coalescing is enabled.
+  static void RecordConfig() { (void)WaitMs(); (void)RecurMs(); }
+
   struct Key {
     uint64_t id;
     uint32_t index, ksize;
@@ -303,12 +309,14 @@ class ReadCoalescer {
   // liveness on that); 500 ms is ~2 orders above a healthy NVMe read.
   static int WaitMs() {
     static const int ms = [] {
+      int out = 500;
       const char* e = std::getenv("DFKV_READ_COALESCE_TIMEOUT_MS");
       if (e && *e) {
         long v = std::strtol(e, nullptr, 10);
-        if (v >= 10 && v <= 60000) return static_cast<int>(v);
+        if (v >= 10 && v <= 60000) out = static_cast<int>(v);
       }
-      return 500;
+      config_dump::RecordResolved("DFKV_READ_COALESCE_TIMEOUT_MS", std::to_string(out));
+      return out;
     }();
     return ms;
   }
@@ -320,12 +328,14 @@ class ReadCoalescer {
   // DFKV_READ_COALESCE_RECUR_MS overrides; 0 disables (v1 overlap-only gate).
   static int RecurMs() {
     static const int ms = [] {
+      int out = 1000;
       const char* e = std::getenv("DFKV_READ_COALESCE_RECUR_MS");
       if (e && *e) {
         long v = std::strtol(e, nullptr, 10);
-        if (v >= 0 && v <= 60000) return static_cast<int>(v);
+        if (v >= 0 && v <= 60000) out = static_cast<int>(v);
       }
-      return 1000;
+      config_dump::RecordResolved("DFKV_READ_COALESCE_RECUR_MS", std::to_string(out));
+      return out;
     }();
     return ms;
   }

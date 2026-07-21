@@ -18,6 +18,7 @@
 #include "utils/log.h"
 #include "utils/thread_name.h"
 #include "transport/transport_factory.h"
+#include "common/config_dump.h"
 
 namespace dfkv {
 
@@ -151,17 +152,22 @@ class FanoutPool {
   // grows from max(group) to sum(group)). Env-tunable (DFKV_FANOUT_THREADS,
   // clamped [1, 1024]) so high-concurrency clients can raise it; default
   // unchanged at 32.
+ public:
   static size_t MaxThreads() {
     static const size_t v = [] {
+      size_t out = 32;
       const char* e = std::getenv("DFKV_FANOUT_THREADS");
       if (e && *e) {
         long x = std::strtol(e, nullptr, 10);
-        if (x >= 1 && x <= 1024) return static_cast<size_t>(x);
+        if (x >= 1 && x <= 1024) out = static_cast<size_t>(x);
       }
-      return size_t{32};
+      config_dump::RecordResolved("DFKV_FANOUT_THREADS", std::to_string(out));
+      return out;
     }();
     return v;
   }
+
+ private:
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Job>> queue_;
@@ -176,10 +182,17 @@ void RunParallel(size_t n, size_t workers, const std::function<void(size_t)>& fn
 
 size_t EnvSize(const char* name, size_t dflt) {
   const char* v = std::getenv(name);
-  if (!v || !*v) return dflt;
-  char* end = nullptr;
-  unsigned long long x = std::strtoull(v, &end, 10);
-  return (end != v && x > 0) ? static_cast<size_t>(x) : dflt;
+  size_t out = dflt;
+  bool from_env = false;
+  if (v && *v) {
+    char* end = nullptr;
+    unsigned long long x = std::strtoull(v, &end, 10);
+    if (end != v && x > 0) { out = static_cast<size_t>(x); from_env = true; }
+  }
+  config_dump::Record(name, std::to_string(out),
+                      from_env ? config_dump::Source::kEnv
+                               : config_dump::Source::kDefault);
+  return out;
 }
 
 // Split each per-node read group into up to N shards so multiple connections
@@ -248,10 +261,41 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
   }
   // Opt-in active per-peer latency probe. Off unless DFKV_PROBE_INTERVAL_MS>0,
   // so default behavior is unchanged (no background traffic).
-  if (const char* pe = std::getenv("DFKV_PROBE_INTERVAL_MS")) {
-    int ms = std::atoi(pe);
-    if (ms > 0) StartProbe(ms);
+  int probe_ms = 0;
+  if (const char* pe = std::getenv("DFKV_PROBE_INTERVAL_MS")) probe_ms = std::atoi(pe);
+  if (probe_ms > 0) StartProbe(probe_ms);
+  // Record the resolved client env knobs (defaults included). FanoutPool's is a
+  // lazy static, so force it now rather than wait for the first fan-out.
+  {
+    namespace cd = dfkv::config_dump;
+    (void)FanoutPool::MaxThreads();  // records DFKV_FANOUT_THREADS
+    cd::RecordResolved("DFKV_BATCH_CONCURRENCY",
+                       std::to_string(batch_concurrency_.load(std::memory_order_relaxed)));
+    cd::RecordResolved("DFKV_PROBE_INTERVAL_MS", std::to_string(probe_ms));
+    cd::RecordResolved("DFKV_CLIENT_NODE_DEDUP", dedup_ ? "on" : "off");
   }
+  // Startup config dump: once per process (a process usually opens one client;
+  // env knobs are the same for any others, and Emit clears the registry). Shows
+  // the opened geometry — model_hash above all, the isolation identity — plus
+  // the transport and every set DFKV_* env knob (folded in by Emit).
+  static std::once_flag dump_once;
+  std::call_once(dump_once, [this] {
+    namespace cd = dfkv::config_dump;
+    // Geometry is caller-provided (dfkv_open args / the ValueHeader a tool
+    // builds) — externally specified, but not a CLI flag; label it arg. The
+    // client cannot see whether the caller in turn defaulted a field.
+    cd::Record("model_hash", std::to_string(self_hdr_.model_hash), cd::Source::kArg);
+    cd::Record("page_size", std::to_string(self_hdr_.page_size), cd::Source::kArg);
+    cd::Record("dtype_tag", std::to_string(self_hdr_.dtype_tag), cd::Source::kArg);
+    cd::Record("tp_size", std::to_string(self_hdr_.tp_size), cd::Source::kArg);
+    cd::Record("tp_rank", std::to_string(self_hdr_.tp_rank), cd::Source::kArg);
+    cd::Record("layer_num", std::to_string(self_hdr_.layer_num), cd::Source::kArg);
+    cd::Record("head_num", std::to_string(self_hdr_.head_num), cd::Source::kArg);
+    cd::Record("head_dim", std::to_string(self_hdr_.head_dim), cd::Source::kArg);
+    cd::Record("is_mla", self_hdr_.is_mla() ? "1" : "0", cd::Source::kArg);
+    cd::Record("transport", transport_reason_, cd::Source::kArg);
+    cd::Emit("client");
+  });
 }
 
 void KVClient::AdoptRing(ConHash ring, std::map<std::string, std::string> addr) {

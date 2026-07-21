@@ -8,6 +8,7 @@
 
 #include <vector>
 
+#include "common/config_dump.h"
 #include "utils/net_util.h"
 #include "utils/thread_name.h"
 #include "utils/wire_limits.h"
@@ -46,15 +47,22 @@ void KvNodeServer::InitAdmission() {
     unsigned long long n = std::strtoull(v, nullptr, 10);
     put_busy_limit_ = static_cast<size_t>(n);
   }
+  config_dump::RecordResolved("DFKV_PUT_INFLIGHT_LIMIT",
+                              std::to_string(put_busy_limit_));
+  // Read-side convoy collapse master switch, plus its timeout/recur sub-knobs
+  // (forced now so their defaults show even before the first coalesced read).
+  config_dump::RecordResolved("DFKV_READ_COALESCE", coalesce_enabled_ ? "on" : "off");
+  if (coalesce_enabled_) ReadCoalescer::RecordConfig();
 }
 
 void KvNodeServer::InitRamTier() {
   // Off by default. DFKV_RAM_TIER in {1,on,true,yes} enables the RAM hot tier;
   // DFKV_RAM_TIER_BYTES sizes the pre-registered arena (default 4 GiB).
   const char* e = std::getenv("DFKV_RAM_TIER");
-  if (!e || !*e) return;
-  const std::string v(e);
-  if (v != "1" && v != "on" && v != "true" && v != "yes") return;
+  const std::string v = (e && *e) ? std::string(e) : "";
+  const bool enabled = (v == "1" || v == "on" || v == "true" || v == "yes");
+  config_dump::RecordResolved("DFKV_RAM_TIER", enabled ? "on" : "off");
+  if (!enabled) return;
   RamTier::Options o;
   if (const char* b = std::getenv("DFKV_RAM_TIER_BYTES")) {
     unsigned long long n = std::strtoull(b, nullptr, 10);
@@ -74,6 +82,9 @@ void KvNodeServer::InitRamTier() {
   // Background free-slot reclaimer cadence (ms; 0 disables). Default 10.
   if (const char* r = std::getenv("DFKV_RAM_RECLAIM_MS"))
     o.reclaim_interval_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
+  config_dump::RecordResolved("DFKV_RAM_TIER_BYTES", std::to_string(o.bytes));
+  config_dump::RecordResolved("DFKV_RAM_FLUSH_THREADS", std::to_string(o.flush_threads));
+  config_dump::RecordResolved("DFKV_RAM_RECLAIM_MS", std::to_string(o.reclaim_interval_ms));
   // Flusher persists a RAM slot to the disk group. CacheDirect (not Cache): the
   // arena slot is 4 KiB-aligned with cap slack, so a direct-mode slab lands it
   // via O_DIRECT -- a buffered flush would route the RAM tier's entire write

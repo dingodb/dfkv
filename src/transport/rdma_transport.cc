@@ -1,3 +1,4 @@
+#include "common/config_dump.h"
 #include "transport/rdma_transport.h"
 
 #include <unistd.h>
@@ -126,6 +127,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   }
   const char* d = std::getenv("DFKV_RDMA_DEPTH");  // pipeline depth (must be <= server's)
   if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
+  config_dump::RecordResolved("DFKV_RDMA_DEV", list.empty() ? "(auto)" : list);
+  config_dump::RecordResolved("DFKV_RDMA_DEPTH", std::to_string(depth_));
   connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);
   io_ms_ = EnvInt("DFKV_RDMA_IO_MS", 10000);
   // Datapath completion timeout. EnvInt maps non-positive => default; treat an
@@ -140,6 +143,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     const char* v = std::getenv("DFKV_RDMA_BATCH_OP_TIMEOUT_MS");
     if (v && *v) { long x = std::strtol(v, nullptr, 10); if (x > 0) batch_op_timeout_ms_ = static_cast<int>(x); }
   }
+  config_dump::RecordResolved("DFKV_RDMA_OP_TIMEOUT_MS", std::to_string(op_timeout_ms_));
+  config_dump::RecordResolved("DFKV_RDMA_BATCH_OP_TIMEOUT_MS", std::to_string(batch_op_timeout_ms_));
   }
   // Idle-connection pool cap. The pool naturally bounds at peak concurrency
   // (each thread holds <=1 conn); this only guards against a thread-count spike

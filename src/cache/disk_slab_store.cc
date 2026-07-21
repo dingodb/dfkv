@@ -1,5 +1,7 @@
 #include "cache/disk_slab_store.h"
 
+#include "common/config_dump.h"
+
 #ifdef DFKV_WITH_URING
 #include <liburing.h>
 #endif
@@ -145,6 +147,8 @@ DiskSlabStore::DiskSlabStore(Options opt, bool* ok) : opt_(std::move(opt)) {
   {
     const char* v = std::getenv("DFKV_SLAB_URING_WRITE");
     uring_write_enabled_ = !(v && *v == '0');
+    config_dump::RecordResolved("DFKV_SLAB_URING_WRITE",
+                                uring_write_enabled_ ? "on" : "off");
   }
 #endif
   if (ok_ && opt_.reclaim_interval_ms > 0) {

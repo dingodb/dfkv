@@ -171,15 +171,16 @@ class RdmaServer {
   // on pipelined GETs), they don't fail.
   size_t PipelineDepth() const;
   std::string MetricsText() const;  // Prometheus text (dfkv_rdma_*)
+  // Whether the io_uring async-GET serve path should be used for new conns.
+  // Default ON when built with DFKV_WITH_URING and both range prep + complete
+  // handlers are set; DFKV_SERVER_URING=0 forces sync. Decided once per conn.
+  // Public so startup can force-resolve DFKV_SERVER_URING into the config dump.
+  bool UseUringPath() const;
 
  private:
   void AcceptLoop();
   void Serve(int boot_fd);
   void ReapDoneLocked();  // join+erase finished Serve threads; conn_mu_ held
-  // Whether the io_uring async-GET serve path should be used for new conns.
-  // Default ON when built with DFKV_WITH_URING and both range prep + complete
-  // handlers are set; DFKV_SERVER_URING=0 forces sync. Decided once per conn.
-  bool UseUringPath() const;
 
   // A live connection: its Serve thread plus a flag the thread sets (last thing
   // it does) so AcceptLoop can tell it has finished and join it without blocking.

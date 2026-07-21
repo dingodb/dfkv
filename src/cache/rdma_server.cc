@@ -1,3 +1,4 @@
+#include "common/config_dump.h"
 #include "cache/rdma_server.h"
 
 #include <arpa/inet.h>
@@ -62,6 +63,7 @@ RdmaServer::RdmaServer(Handler handler, size_t max_msg, const std::string& dev_n
     const char* e = std::getenv("DFKV_RDMA_DEV");
     if (e && *e) dev_name_ = e;
   }
+  config_dump::RecordResolved("DFKV_RDMA_DEV", dev_name_.empty() ? "(auto)" : dev_name_);
   // --rdma-dev accepts a comma list (multi-rail): every listed device gets a
   // lifetime anchor in Start(); the FIRST entry stays the default for legacy
   // clients whose bootstrap dev frame is empty.
@@ -193,9 +195,11 @@ size_t ServerDepth() {
   // Pipeline depth (requests in flight per connection). Default 1 keeps per-conn
   // pinned memory low; set DFKV_RDMA_DEPTH>1 to enable pipelining (helps the
   // latency-bound PUT path; GET scales via more conns).
+  size_t out = 1;
   const char* e = std::getenv("DFKV_RDMA_DEPTH");
-  if (e && *e) { long v = std::strtol(e, nullptr, 10); if (v >= 1 && v <= 256) return (size_t)v; }
-  return 1;
+  if (e && *e) { long v = std::strtol(e, nullptr, 10); if (v >= 1 && v <= 256) out = (size_t)v; }
+  config_dump::RecordResolved("DFKV_RDMA_DEPTH", std::to_string(out));
+  return out;
 }
 
 int ServerIdleMs() {
@@ -208,14 +212,15 @@ int ServerIdleMs() {
   // the client re-dials a stale pooled connection via RdmaTransport's 2-attempt
   // retry. Default 10 min keeps active/recently-used pooled conns alive; set
   // DFKV_RDMA_IDLE_MS=0 to disable (block forever, the legacy behavior).
+  int out = 600000;  // 10 minutes
   const char* e = std::getenv("DFKV_RDMA_IDLE_MS");
   if (e && *e) {
     long v = std::strtol(e, nullptr, 10);
-    if (v <= 0) return -1;               // disabled => block forever
-    if (v > 86400000) v = 86400000;      // clamp to 24h
-    return static_cast<int>(v);
+    if (v <= 0) out = -1;                     // disabled => block forever
+    else out = static_cast<int>(v > 86400000 ? 86400000 : v);  // clamp to 24h
   }
-  return 600000;  // 10 minutes
+  config_dump::RecordResolved("DFKV_RDMA_IDLE_MS", std::to_string(out));
+  return out;
 }
 
 #ifdef DFKV_WITH_URING
@@ -224,12 +229,14 @@ int ServerIdleMs() {
 // expose more disk queue depth without growing the RDMA pipeline. Clamped to
 // [1, 256] and to >= K by the caller.
 size_t UringDepth(size_t k) {
+  size_t out = k;  // one outstanding read per in-flight request by default
   const char* e = std::getenv("DFKV_SERVER_URING_DEPTH");
   if (e && *e) {
     long v = std::strtol(e, nullptr, 10);
-    if (v >= 1 && v <= 256) return static_cast<size_t>(v);
+    if (v >= 1 && v <= 256) out = static_cast<size_t>(v);
   }
-  return k;  // one outstanding read per in-flight request by default
+  config_dump::RecordResolved("DFKV_SERVER_URING_DEPTH", std::to_string(out));
+  return out;
 }
 #endif  // DFKV_WITH_URING
 
@@ -248,7 +255,9 @@ bool RdmaServer::UseUringPath() const {
   // Non-negative across cases, with a sync fallback on any ring/batch failure.
   // DFKV_SERVER_URING=0 forces the legacy synchronous read loop.
   const char* e = std::getenv("DFKV_SERVER_URING");
-  return !(e && std::strcmp(e, "0") == 0);
+  const bool out = !(e && std::strcmp(e, "0") == 0);
+  config_dump::RecordResolved("DFKV_SERVER_URING", out ? "on" : "off");
+  return out;
 #else
   return false;
 #endif

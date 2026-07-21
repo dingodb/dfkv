@@ -4,6 +4,7 @@
 #include <map>
 
 #include "cache/disk_slab_store.h"
+#include "common/config_dump.h"
 #include "utils/log.h"
 
 namespace dfkv {
@@ -60,6 +61,14 @@ DiskCacheGroup::DiskCacheGroup(Options opt) {
   uint32_t reclaim_ms = 50;
   if (const char* r = std::getenv("DFKV_SLAB_RECLAIM_MS"))
     reclaim_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
+  // Effective values into the startup config dump (defaults included).
+  config_dump::RecordResolved("DFKV_STORE_ENGINE", engine_);
+  config_dump::RecordResolved("DFKV_DISK_HASH_WEIGHT", std::to_string(DiskHashWeight()));
+  config_dump::RecordResolved("DFKV_SLAB_WRITE", slab_direct ? "direct" : "buffered");
+  config_dump::RecordResolved("DFKV_SLAB_GRANULARITY",
+                              slab_gran ? std::to_string(slab_gran) : std::string("1048576"));
+  config_dump::RecordResolved("DFKV_SLAB_TABLE_SYNC_MS", std::to_string(sync_ms));
+  config_dump::RecordResolved("DFKV_SLAB_RECLAIM_MS", std::to_string(reclaim_ms));
   for (const auto& dir : opt.cache_dirs) {
     std::unique_ptr<StoreEngine> store;
     if (use_slab) {

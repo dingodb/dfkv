@@ -21,6 +21,11 @@ namespace {
 // same-poll failure burst (a 64-node ring trips only below 32 survivors) while
 // catching the etcd NOSPACE / lease-mass-expiry signature. 0 disables.
 int ShrinkGuardPct() {
+  // NOTE: this is a CLIENT-side MDS-discovery knob, read when the poller is
+  // built during StartMdsDiscovery — after the client's startup config dump has
+  // already emitted. It is therefore not recorded here (the record would land
+  // in an already-cleared registry). If set via env it still shows in the dump
+  // via Emit()'s environ scan; only its unset default is not surfaced.
   if (const char* v = std::getenv("DFKV_MDS_SHRINK_GUARD_PCT")) {
     const long p = std::atol(v);
     if (p >= 0 && p <= 99) return static_cast<int>(p);

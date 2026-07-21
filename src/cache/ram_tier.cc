@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "utils/log.h"
+#include "common/config_dump.h"
 #include "utils/thread_name.h"
 #include "utils/numa_util.h"
 
@@ -28,6 +29,7 @@ RamTier::RamTier(Options opt, FlushFn flush)
   // DFKV_RDMA_NUMA-pinned single-rail setups).
   const char* nm = std::getenv("DFKV_RAM_TIER_NUMA");
   const bool interleave = !(nm && std::strcmp(nm, "off") == 0);
+  config_dump::RecordResolved("DFKV_RAM_TIER_NUMA", interleave ? "interleave" : "off");
   const int nodes = numa::OnlineNodeCount();
   if (interleave) numa::InterleaveMemory(arena_, opt_.bytes, nodes);
   // Pre-fault the arena now (one bounded, REPORTED cost at startup) instead of
@@ -76,6 +78,7 @@ RamTier::RamTier(Options opt, FlushFn flush)
   }
   if (ext > opt_.bytes) ext = opt_.bytes;
   extent_bytes_ = ext;
+  config_dump::RecordResolved("DFKV_RAM_TIER_EXTENT_BYTES", std::to_string(ext));
   const uint64_t total_extents = std::max<uint64_t>(1, opt_.bytes / ext);
 
   // Shard count: enough shards to take the single lock off the hot path, few
@@ -90,6 +93,13 @@ RamTier::RamTier(Options opt, FlushFn flush)
   nshards = std::min(nshards, kMaxShards);
   while (nshards > 1 && total_extents / nshards < 32) nshards /= 2;
   if (nshards < 1) nshards = 1;
+  // Record the EFFECTIVE shard count (post-clamp), which can differ from the
+  // requested DFKV_RAM_TIER_SHARDS on a small arena; a plain env echo would
+  // mislead. Explicit record wins over Emit's environ scan.
+  config_dump::Record("DFKV_RAM_TIER_SHARDS", std::to_string(nshards),
+                      std::getenv("DFKV_RAM_TIER_SHARDS")
+                          ? config_dump::Source::kEnv
+                          : config_dump::Source::kDefault);
 
   const uint64_t ext_per_shard = total_extents / nshards;  // remainder unused (<1 extent/shard)
   shards_.reserve(nshards);
