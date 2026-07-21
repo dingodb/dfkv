@@ -228,6 +228,38 @@ class DingoFSHiCacheTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
 
+    def test_requires_model_hash(self):
+        # A forgotten model_hash (the per-model isolation identity) must abort
+        # startup, not silently fall back to the shared keyspace. Raises before
+        # any server connection, so a fake member is fine.
+        cfg = self._cfg("n=127.0.0.1:1")
+        cfg.extra_config.pop("model_hash")
+        with self.assertRaises(dfkv_hicache._tcfg.DfkvConfigError):
+            dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+
+    def test_rejects_zero_model_hash(self):
+        cfg = self._cfg("n=127.0.0.1:1")
+        cfg.extra_config["model_hash"] = 0
+        with self.assertRaises(dfkv_hicache._tcfg.DfkvConfigError):
+            dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+
+    def test_requires_ring_endpoint(self):
+        # Neither members nor mds_endpoints => no ring to connect to.
+        cfg = self._cfg("")  # empty members
+        with self.assertRaises(dfkv_hicache._tcfg.DfkvConfigError):
+            dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+
+    def test_shared_keyspace_opt_in_allows_missing_model_hash(self):
+        # Explicit opt-in lets a single-model deployment start with the shared
+        # keyspace (model_hash 0) — this is the escape hatch that keeps the
+        # strict default from breaking legitimate single-model fleets.
+        members, _, _ = self._node("sharedok")
+        cfg = self._cfg(members)
+        cfg.extra_config.pop("model_hash")
+        cfg.extra_config["allow_shared_keyspace"] = 1
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        self.assertTrue(hasattr(st, "get"))
+
     def test_rdma_depth_extra_config_sets_env(self):
         # extra_config rdma_depth must propagate to DFKV_RDMA_DEPTH so the C client
         # builds its transport with write pipelining (#1). Set before dfkv_open.

@@ -53,6 +53,7 @@ from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import create_event_notifier
 
+from ._telemetry import config as _tcfg
 from .config import parse_dfkv_url
 from .native_client import DfkvNativeClient
 
@@ -181,6 +182,9 @@ class DfkvL2AdapterConfig(L2AdapterConfigBase):
         model_name = d.get("model_name", "")
         if not isinstance(model_name, str):
             raise ValueError("dfkv L2 adapter: 'model_name' must be a string")
+        # model_name is the isolation namespace (derives the dfkv model_hash);
+        # refuse to start on an empty one unless the shared keyspace is opted in.
+        _tcfg.require_isolation_name(model_name, cfg=d)
 
         mds_poll_ms = d.get("mds_poll_ms", 3000)
         if not isinstance(mds_poll_ms, int) or mds_poll_ms <= 0:

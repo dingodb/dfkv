@@ -1,7 +1,14 @@
 /* dfkv_bench — throughput / latency benchmark for a dfkv cluster.
  *
- *   dfkv_bench --members "n=ip:port,..." [--size BYTES] [--count N]
- *              [--threads T] [--batch B] [--op put|get|both] [--key-seed S]
+ *   dfkv_bench (--members "n=ip:port,..." | --mds "ip:port,..." [--group g])
+ *              [--size BYTES] [--count N] [--threads T] [--batch B]
+ *              [--op put|get|both] [--key-seed S] [--ready-timeout SECS]
+ *
+ * Ring membership is EITHER a static --members list OR --mds discovery (exactly
+ * one). With --mds the client populates the ring from the MDS group and waits
+ * (up to --ready-timeout, default 30s) for a warmup Put to succeed before the
+ * measured phases start, so you can point bench straight at a production ring
+ * without hand-listing members from `dfkvctl ring`.
  *
  * Transport is chosen by the same env switch as the client: DFKV_RDMA=1 (+ device
  * DFKV_RDMA_DEV) uses RDMA, else TCP. --batch B issues B keys per BatchPut/
@@ -53,6 +60,21 @@ static std::vector<std::pair<std::string, std::string>> ParseMembers(const std::
   return out;
 }
 
+// Comma-split MDS endpoints ("ip:port,ip:port") — no name= prefix, unlike members.
+static std::vector<std::string> SplitComma(const std::string& s) {
+  std::vector<std::string> out;
+  size_t i = 0;
+  while (i <= s.size()) {
+    size_t c = s.find(',', i);
+    if (c == std::string::npos) c = s.size();
+    std::string tok = s.substr(i, c - i);
+    if (!tok.empty()) out.push_back(tok);
+    if (c == s.size()) break;
+    i = c + 1;
+  }
+  return out;
+}
+
 static double Pct(std::vector<double>& v, double p) {
   if (v.empty()) return 0;
   size_t k = static_cast<size_t>(p * (v.size() - 1));
@@ -94,10 +116,14 @@ static void Report(const char* phase, size_t count, size_t size, size_t threads,
 
 int main(int argc, char** argv) {
   if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_bench %s\n", dfkv::Version()); return 0; }
-  std::string members, op = "both", key_seed;
+  std::string members, mds, group = "default", op = "both", key_seed;
   size_t size = 2752512, count = 2000, threads = 8, batch = 1, bc = 0;
+  size_t ready_timeout_s = 30, mds_poll_ms = 1000;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!std::strcmp(argv[i], "--members")) members = argv[i + 1];
+    else if (!std::strcmp(argv[i], "--mds")) mds = argv[i + 1];       // MDS discovery endpoints
+    else if (!std::strcmp(argv[i], "--group")) group = argv[i + 1];   // MDS ring group
+    else if (!std::strcmp(argv[i], "--ready-timeout")) ready_timeout_s = std::stoull(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--size")) size = std::stoull(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--count")) count = std::stoull(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--threads")) threads = std::stoull(argv[i + 1]);
@@ -107,17 +133,46 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--key-seed")) key_seed = argv[i + 1];
   }
   if (batch < 1) batch = 1;
+  // Ring membership: exactly one of a static --members list or --mds discovery.
   auto mem = ParseMembers(members);
-  if (mem.empty()) { std::fprintf(stderr, "need --members name=ip:port,...\n"); return 2; }
+  if (mem.empty() == mds.empty()) {
+    std::fprintf(stderr,
+                 "need exactly one of --members name=ip:port,... "
+                 "or --mds ip:port[,...] [--group g]\n");
+    return 2;
+  }
 
   std::string reason;
   MakeClientTransport(&reason);
-  std::printf("dfkv_bench transport=%s members=%zu\n", reason.c_str(), mem.size());
+  if (mds.empty())
+    std::printf("dfkv_bench transport=%s members=%zu\n", reason.c_str(), mem.size());
+  else
+    std::printf("dfkv_bench transport=%s mds=%s group=%s\n",
+                reason.c_str(), mds.c_str(), group.c_str());
 
   // GLM-5.1 / MLA geometry (matches dfkv_smoke / dfkvctl defaults)
   ValueHeader hdr = ValueHeader::Make(0x51, 64, 0x46384534u, ValueHeader::kFlagIsMla,
                                       8, 0, 78, 1, 576);
-  KVClient c(mem, hdr);
+  KVClient c(mem, hdr);   // empty members when discovering via MDS
+  if (!mds.empty()) {
+    // Populate the ring from MDS, then wait until it's usable (a warmup Put
+    // succeeds) so the measured phases don't race discovery. Mirrors
+    // dfkv_discover_smoke's readiness probe.
+    c.StartMdsDiscovery(SplitComma(mds), group, static_cast<int>(mds_poll_ms));
+    std::vector<char> probe(size, 'w');
+    auto deadline = Clock::now() + std::chrono::seconds(ready_timeout_s);
+    bool ready = false;
+    while (!ready && Clock::now() < deadline) {
+      if (c.Put("dfkv_bench/warmup_k", probe.data(), probe.size())) ready = true;
+      else std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!ready) {
+      std::fprintf(stderr,
+                   "dfkv_bench: ring not ready after %zus (mds=%s group=%s)\n",
+                   ready_timeout_s, mds.c_str(), group.c_str());
+      return 2;
+    }
+  }
   // External --threads already provide concurrency; with multi-node members the
   // client's per-call internal RunParallel(batch_concurrency) would nest under
   // each external thread (threads x nodes x bc) and can exhaust threads/connections.
