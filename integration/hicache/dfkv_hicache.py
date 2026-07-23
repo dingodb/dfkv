@@ -181,6 +181,14 @@ _MARKER_BUF = ctypes.create_string_buffer(1)
 _MARKER_PTR = ctypes.addressof(_MARKER_BUF)
 
 
+def _is_device_transfer(tr) -> bool:
+    """A sidecar PoolTransfer is DEVICE-direct (task 4) when it carries device slot
+    indices and NO host indices — the indexer RDMAs from/into its GPU buffer. A host
+    transfer (host_indices set) keeps the stock host v2 path."""
+    return (getattr(tr, "host_indices", None) is None
+            and getattr(tr, "device_indices", None) is not None)
+
+
 def _arrays(subkeys, ptrs, sizes):
     """Build parallel C arrays (keys, ptrs, sizes) for a batch call."""
     n = len(subkeys)
@@ -596,6 +604,60 @@ class DfkvHiCache(HiCacheStorage):
             r.result = (f"registered {n} device region(s)" if n
                         else "no device buffer found")
 
+    def register_mem_pool_device_sidecar(self, name, device_pool):
+        """Task 4: register the DSA indexer sidecar's per-layer GPU buffers for
+        RDMA (GPUDirect MR), so the indexer RDMAs straight from/into its device
+        buffer instead of a host staging slot. `name` is the sidecar PoolName (e.g.
+        'indexer'); `device_pool` is the DeepSeekV4IndexerPool holding
+        index_k_with_scale_buffer. Deduped against regions already registered."""
+        if not hasattr(self, "_sidecar_device_pools"):
+            self._sidecar_device_pools = {}
+        key = str(name)
+        self._sidecar_device_pools[key] = device_pool
+        from sglang.srt.mem_cache.device_page_meta import sidecar_device_pool_regions
+
+        with access_log("register_mem_pool_device_sidecar",
+                        lambda: f"{self._alog_tag} {key}") as r:
+            n = 0
+            try:
+                for base, size in sidecar_device_pool_regions(device_pool):
+                    region = (base, size)
+                    if not base or not size or region in self._registered_regions:
+                        continue
+                    if self.register_memory(base, size):
+                        self._registered_regions.add(region)
+                        n += 1
+            except Exception as e:  # never fail setup over an optimization
+                r.result = f"skip ({type(e).__name__})"
+                return
+            r.result = (f"registered {n} sidecar device region(s)" if n
+                        else "no sidecar device buffer found")
+
+    def register_mem_pool_device_draft(self, mem_pool_device_draft):
+        """Task 6: register the EAGLE draft model's GPU KV pool for RDMA so draft KV
+        pages RDMA straight from/into their GPU slots (device-direct draft L3),
+        mirroring register_mem_pool_device for the target pool. Deduped against
+        regions already registered."""
+        self.mem_pool_device_draft = mem_pool_device_draft
+        from sglang.srt.mem_cache.device_page_meta import device_pool_regions
+
+        with access_log("register_mem_pool_device_draft",
+                        lambda: f"{self._alog_tag}") as r:
+            n = 0
+            try:
+                for base, size in device_pool_regions(mem_pool_device_draft):
+                    region = (base, size)
+                    if not base or not size or region in self._registered_regions:
+                        continue
+                    if self.register_memory(base, size):
+                        self._registered_regions.add(region)
+                        n += 1
+            except Exception as e:  # never fail setup over an optimization
+                r.result = f"skip ({type(e).__name__})"
+                return
+            r.result = (f"registered {n} draft device region(s)" if n
+                        else "no draft device buffer found")
+
     def set_members(self, members: str):
         """Hot-swap cluster membership, e.g. 'n1=ip:12000,n2=ip:12000'."""
         self._lib.dfkv_set_members(self._h, members.encode())
@@ -755,7 +817,7 @@ class DfkvHiCache(HiCacheStorage):
             self._sg_width_cache = w
         return w
 
-    def _flatten_device(self, keys, seg_ptrs, seg_sizes):
+    def _flatten_device(self, keys, seg_ptrs, seg_sizes, keys_fn=None, sub=None):
         """Expand per-page keys into per-sub-object (k[/v]) sub-keys, pairing each
         with its per-layer device segment list. Parallel to _flatten, but every
         entry is a segment LIST (one per layer), not a single (ptr, size).
@@ -766,14 +828,20 @@ class DfkvHiCache(HiCacheStorage):
         the same scheme (and key suffix) the vLLM connector uses. Write and read
         derive the identical deterministic split from (layer count, width), so
         the layer-major bytes reassemble exactly. Chunk count is uniform across
-        pages, so _fold()'s per-page stride is sub * nchunks."""
-        sub = self._sub()
+        pages, so _fold()'s per-page stride is sub * nchunks.
+
+        keys_fn/sub default to the main-KV key scheme (self._keys / self._sub); the
+        DSA indexer sidecar and the EAGLE draft pool pass their own key builder and
+        object count so they reuse the identical @sg chunking under a distinct
+        namespace (task 4: device-direct sidecar; task 6: device-direct draft)."""
+        keys_fn = keys_fn or self._keys
+        sub = self._sub() if sub is None else sub
         assert len(seg_ptrs) == len(keys) * sub, (len(seg_ptrs), len(keys), sub)
         w = self._sg_width()
         sks, sp, ss = [], [], []
         nchunks = 1
         for i, k in enumerate(keys):
-            for j, sk in enumerate(self._keys(k)):
+            for j, sk in enumerate(keys_fn(k)):
                 p = [int(x) for x in seg_ptrs[i * sub + j]]
                 s = [int(x) for x in seg_sizes[i * sub + j]]
                 nchunks = max(1, (len(p) + w - 1) // w)
@@ -1186,21 +1254,132 @@ class DfkvHiCache(HiCacheStorage):
         flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
         return self._fold(flat_ok, n, sub), sum(lens), dur
 
+    # --- task 4: DSA indexer sidecar device-direct (no host staging) -----------
+    def _sidecar_device_set(self, name, keys, device_indices):
+        """Device-direct SG put of the DSA indexer sidecar `name` (its own key
+        namespace, _pool_keys(name, hash), @sg-chunked like the main KV). The
+        indexer is layer-first & PAGE-indexed; get_device_sidecar_page_buffer_meta
+        yields its per-layer page-row segments from the registered sidecar device
+        pool. Returns (per_page_bools, nbytes, seconds)."""
+        n = len(keys)
+        if self.is_mla and self.tp_rank != 0:
+            return [True] * n, 0, 0.0
+        from sglang.srt.mem_cache.device_page_meta import (
+            get_device_sidecar_page_buffer_meta,
+        )
+        pool = self._sidecar_device_pools[str(name)]
+        seg_ptrs, seg_sizes = get_device_sidecar_page_buffer_meta(pool, device_indices)
+        stride, sks, sp, ss = self._flatten_device(
+            keys, seg_ptrs, seg_sizes,
+            keys_fn=lambda h: self._pool_keys(name, h), sub=self._pool_sub(name))
+        nbytes = sum(sum(s) for s in ss)
+        t0 = time.perf_counter()
+        flat = self._put_sg_flat(sks, sp, ss)
+        dur = time.perf_counter() - t0
+        return self._fold(flat, n, stride), nbytes, dur
+
+    def _sidecar_device_get(self, name, keys, device_indices):
+        """Device-direct SG get of the DSA indexer sidecar `name`: RDMA its stored
+        blob straight INTO its GPU index buffer (no host staging, no H2D). Read twin
+        of _sidecar_device_set. A page is a hit only on a full-length read of every
+        sub-key. Returns (per_page_bools, nbytes, seconds)."""
+        n = len(keys)
+        from sglang.srt.mem_cache.device_page_meta import (
+            get_device_sidecar_page_buffer_meta,
+        )
+        pool = self._sidecar_device_pools[str(name)]
+        seg_ptrs, seg_caps = get_device_sidecar_page_buffer_meta(pool, device_indices)
+        stride, sks, sp, sc = self._flatten_device(
+            keys, seg_ptrs, seg_caps,
+            keys_fn=lambda h: self._pool_keys(name, h), sub=self._pool_sub(name))
+        want = [sum(c) for c in sc]
+        t0 = time.perf_counter()
+        hits, lens = self._batch_get_sg(sks, sp, sc)
+        dur = time.perf_counter() - t0
+        flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
+        return self._fold(flat_ok, n, stride), sum(lens), dur
+
+    # --- task 6: EAGLE draft KV device-direct (best-effort L3) ------------------
+    def _draft_keys(self, page_hash: str, sub: int) -> List[str]:
+        """Draft-model KV sub-keys, a distinct namespace from the target pages
+        (`.draft` infix, PP-aware). The draft model may be MLA or MHA INDEPENDENT of
+        the target, so the key scheme follows the DRAFT pool shape (sub), mirroring
+        _keys: MLA draft (sub=1) is TP-replicated -> no tp_rank suffix; MHA draft
+        (sub=2) is TP-sharded -> tp_size/tp_rank suffix so ranks do not collide."""
+        pps = self._pp_suffix()
+        if sub == 1:
+            return [f"{self.model}/{page_hash}.draft_k{pps}"]
+        base = f"{self.model}/{page_hash}.draft_{self.tp_size}_{self.tp_rank}{pps}"
+        return [base + "_k", base + "_v"]
+
+    def batch_set_v1_device_draft(self, keys, device_indices, extra_info=None) -> List[bool]:
+        """Best-effort device-direct SG put of the EAGLE draft KV pages (task 6):
+        RDMA straight from the draft GPU pool's slots (the same slots the target
+        rode) to L3 under the `.draft` namespace. sub (1 for MLA / 2 for MHA) is
+        derived from the draft pool meta, independent of the target model. An MLA
+        draft's latent is TP-replicated, so only tp_rank 0 writes (backup_skip),
+        exactly like the target MLA path."""
+        n = len(keys)
+        with access_log("batch_set_v1_device_draft",
+                        lambda: f"{self._alog_tag} {n} keys") as r:
+            from sglang.srt.mem_cache.device_page_meta import (
+                get_device_page_buffer_meta,
+            )
+            seg_ptrs, seg_sizes = get_device_page_buffer_meta(
+                self.mem_pool_device_draft, device_indices)
+            sub = len(seg_ptrs) // n if n else 1
+            if sub == 1 and self.tp_rank != 0:
+                r.result = "backup_skip"
+                return [True] * n
+            stride, sks, sp, ss = self._flatten_device(
+                keys, seg_ptrs, seg_sizes,
+                keys_fn=lambda h: self._draft_keys(h, sub), sub=sub)
+            flat = self._put_sg_flat(sks, sp, ss)
+            res = self._fold(flat, n, stride)
+            r.result = f"ok {sum(res)}/{n} (draft device-direct)"
+            return res
+
+    def batch_get_v1_device_draft(self, keys, device_indices, extra_info=None) -> List[bool]:
+        """Best-effort device-direct SG get of the EAGLE draft KV pages (task 6):
+        RDMA straight INTO the draft GPU pool's slots. Read twin of
+        batch_set_v1_device_draft. Every rank reads its own copy (no rank skip on
+        read), even for a TP-replicated MLA draft."""
+        n = len(keys)
+        with access_log("batch_get_v1_device_draft",
+                        lambda: f"{self._alog_tag} {n} keys") as r:
+            from sglang.srt.mem_cache.device_page_meta import (
+                get_device_page_buffer_meta,
+            )
+            seg_ptrs, seg_caps = get_device_page_buffer_meta(
+                self.mem_pool_device_draft, device_indices)
+            sub = len(seg_ptrs) // n if n else 1
+            stride, sks, sp, sc = self._flatten_device(
+                keys, seg_ptrs, seg_caps,
+                keys_fn=lambda h: self._draft_keys(h, sub), sub=sub)
+            want = [sum(c) for c in sc]
+            hits, lens = self._batch_get_sg(sks, sp, sc)
+            flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
+            res = self._fold(flat_ok, n, stride)
+            r.result = f"hits={sum(res)}/{n} (draft device-direct)"
+            return res
+
     def batch_set_v2_device(
         self, kv_keys, kv_device_indices, sidecar_transfers, extra_info=None
     ) -> dict:
         """DSA L2-bypass backup (GLM-5.2): the anchor "kv" pool (the big MLA latent)
-        RDMAs straight from its GPU slots to L3 via the device-direct SG put, while
-        the small DSA indexer sidecar STAYS on the host v2 path (_v2_io from its host
-        buffer). One logical op so the split value is written atomically-per-page.
+        RDMAs straight from its GPU slots to L3 via the device-direct SG put. Task 4:
+        a DEVICE sidecar transfer (device_indices set, host_indices None) RDMAs the
+        DSA indexer straight from its GPU index buffer too (no host staging); a host
+        sidecar transfer still rides the stock host v2 path. One logical op so the
+        split value is written atomically-per-page.
 
         VALUE LAYOUT (explicit): the main KV is stored under the v1-style keys
         (_keys(hash) -> "model/hash_k"), byte-for-byte the same key scheme
         batch_set_v1_device / batch_exists use — so an unchanged batch_exists_v2
         anchors the hit prefix on the SAME "kv" keys with no change. The sidecar
-        rides its own v2 keys (_pool_keys('indexer', hash) -> "model/hash_indexer_k")
-        exactly as stock batch_set_v2. The two components never collide; the composite
-        is split honestly across two key namespaces, isolated by model_hash.
+        rides its own keys (_pool_keys('indexer', hash) -> "model/hash_indexer_k",
+        @sg-chunked when device-direct). The two components never collide; the
+        composite is split honestly across two key namespaces, isolated by model_hash.
 
         METRICS: the anchor device SG put reports on_set (a v1-device physical
         transfer, identical attribution to stock DSA whose anchor rides batch_set_v1),
@@ -1218,23 +1397,37 @@ class DfkvHiCache(HiCacheStorage):
             if n and not (self.is_mla and self.tp_rank != 0):
                 self._metrics.on_set(pages=n, ok_pages=sum(kv_res),
                                      nbytes=kv_bytes, seconds=kv_secs)
-            # Sidecar rides the host v2 path (its own keys, its own host buffer).
-            if sidecar_transfers:
-                side = self._v2_io(sidecar_transfers, putting=True)
+            # Sidecar. Task 4: a DEVICE sidecar transfer (device_indices set,
+            # host_indices None) RDMAs straight from its GPU index buffer; a host
+            # sidecar transfer keeps the stock host v2 path. In bypass every sidecar
+            # is device now, but keep the host branch for generality/safety.
+            dev_side = [tr for tr in sidecar_transfers if _is_device_transfer(tr)]
+            host_side = [tr for tr in sidecar_transfers if not _is_device_transfer(tr)]
+            side_pages = side_ok = side_bytes = 0
+            side_secs = 0.0
+            for tr in dev_side:
+                name = str(tr.name)
+                res, nb, secs = self._sidecar_device_set(name, tr.keys, tr.device_indices)
+                results[name] = res
+                side_pages += len(res); side_ok += sum(res)
+                side_bytes += nb; side_secs += secs
+            if host_side:
+                side = self._v2_io(host_side, putting=True)
                 results.update(side)
-                side_pages = sum(len(rs) for rs in side.values())
-                if side_pages and not (self.is_mla and self.tp_rank != 0):
-                    self._metrics.on_set_v2(
-                        pages=side_pages,
-                        ok_pages=sum(sum(rs) for rs in side.values()),
-                        nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
+                side_pages += sum(len(rs) for rs in side.values())
+                side_ok += sum(sum(rs) for rs in side.values())
+                side_bytes += self._v2_io_bytes; side_secs += self._v2_io_seconds
+            if side_pages and not (self.is_mla and self.tp_rank != 0):
+                self._metrics.on_set_v2(
+                    pages=side_pages, ok_pages=side_ok,
+                    nbytes=side_bytes, seconds=side_secs)
             r.result = f"kv {sum(kv_res)}/{n} (device-direct); " + _fmt_pool_results(
                 {k: v for k, v in results.items() if k != "kv"})
             if self._put_retry_recovered:
                 r.result += f" retry_ok={self._put_retry_recovered}"
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in results.values())
-                _sp.bytes = kv_bytes + self._v2_io_bytes if sidecar_transfers else kv_bytes
+                _sp.bytes = kv_bytes + side_bytes
             return results
 
     def batch_get_v2_device(
@@ -1242,9 +1435,9 @@ class DfkvHiCache(HiCacheStorage):
     ) -> dict:
         """DSA L2-bypass on-demand read (GLM-5.2): the read twin of
         batch_set_v2_device. The anchor "kv" pool RDMAs straight INTO its GPU slots
-        via the device-direct SG get; the DSA indexer sidecar is read into its host
-        buffer via the v2 host path (batch_get_v2 semantics), from which the SGLang
-        controller then H2Ds it into the device index buffer.
+        via the device-direct SG get; a DEVICE sidecar transfer (task 4) RDMAs the
+        indexer straight INTO its GPU index buffer too (no host staging / H2D),
+        while a host sidecar transfer keeps the stock host v2 path.
 
         The kv keys/indices and sidecar keys mirror batch_set_v2_device exactly, so a
         page written there reads back byte-identical for BOTH components. Anchor read
@@ -1260,19 +1453,31 @@ class DfkvHiCache(HiCacheStorage):
             if n:
                 self._metrics.on_get(pages=n, hit_pages=sum(kv_res),
                                      nbytes=kv_bytes, seconds=kv_secs)
-            if sidecar_transfers:
-                side = self._v2_io(sidecar_transfers, putting=False)
+            dev_side = [tr for tr in sidecar_transfers if _is_device_transfer(tr)]
+            host_side = [tr for tr in sidecar_transfers if not _is_device_transfer(tr)]
+            side_pages = side_hit = side_bytes = 0
+            side_secs = 0.0
+            for tr in dev_side:
+                name = str(tr.name)
+                res, nb, secs = self._sidecar_device_get(name, tr.keys, tr.device_indices)
+                results[name] = res
+                side_pages += len(res); side_hit += sum(res)
+                side_bytes += nb; side_secs += secs
+            if host_side:
+                side = self._v2_io(host_side, putting=False)
                 results.update(side)
-                side_pages = sum(len(rs) for rs in side.values())
-                if side_pages:
-                    self._metrics.on_get_v2(
-                        pages=side_pages,
-                        hit_pages=sum(sum(rs) for rs in side.values()),
-                        nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
+                side_pages += sum(len(rs) for rs in side.values())
+                side_hit += sum(sum(rs) for rs in side.values())
+                side_bytes += self._v2_io_bytes; side_secs += self._v2_io_seconds
+            if side_pages:
+                self._metrics.on_get_v2(
+                    pages=side_pages, hit_pages=side_hit,
+                    nbytes=side_bytes, seconds=side_secs)
             r.result = f"kv {sum(kv_res)}/{n} (device-direct); " + _fmt_pool_results(
                 {k: v for k, v in results.items() if k != "kv"})
             if _sp:
                 _sp.hits = sum(sum(rs) for rs in results.values())
+                _sp.bytes = kv_bytes + side_bytes
             return results
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
@@ -1290,7 +1495,12 @@ class DfkvHiCache(HiCacheStorage):
                     break
                 name = str(tr.name)
                 sub = self._pool_sub(name)
-                sks = [sk for k in keys[:kv_pages]
+                # Device-direct sidecars (task 4) store "@sg{n}" chunk sub-keys, so
+                # probe "@sg0" — the same scheme batch_exists uses for the main KV.
+                # A host sidecar stores the bare sub-key.
+                dev_side = name in getattr(self, "_sidecar_device_pools", {})
+                sks = [(sk + "@sg0") if dev_side else sk
+                       for k in keys[:kv_pages]
                        for sk in self._pool_keys(name, k)]
                 present = self._fold(self._batch_exist_flat(sks), kv_pages, sub)
                 if tr.hit_policy == PoolHitPolicy.TRAILING_PAGES:
