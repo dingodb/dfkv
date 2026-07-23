@@ -50,10 +50,12 @@ def _bare(**attrs):
 
 
 class FakeLib:
-    def __init__(self, has_sg=True, has_width=True, max_segs=32):
+    def __init__(self, has_sg=True, has_get_sg=True, has_width=True, max_segs=32):
         self._max_segs = max_segs
         if has_sg:
             self.dfkv_batch_put_sg = lambda *a: 0
+        if has_get_sg:
+            self.dfkv_batch_get_auto_sg = lambda *a: 0
         if has_width:
             self.dfkv_max_sg_segs = lambda h: self._max_segs
 
@@ -137,9 +139,50 @@ class TestSupportsDeviceTransfer(unittest.TestCase):
         obj = _bare(cfg={"layer_num": 4}, _lib=FakeLib(has_sg=False), _h=1)
         self.assertFalse(obj.supports_device_transfer())
 
+    def test_declined_without_get_sg_symbol(self):
+        # Read-side symbol missing: a page could be written but never read back,
+        # so the bypass path is declined (increment 2 requires the SG GET twin).
+        obj = _bare(cfg={"layer_num": 4}, _lib=FakeLib(has_get_sg=False), _h=1)
+        self.assertFalse(obj.supports_device_transfer())
+
     def test_declined_without_layer_num(self):
         obj = _bare(cfg={}, _lib=FakeLib(), _h=1)
         self.assertFalse(obj.supports_device_transfer())
+
+
+class TestBatchGetV1DeviceFold(unittest.TestCase):
+    """Pure-python fold semantics of the device-direct READ (no client/GPU): a
+    page is a hit only if every sub-object hit AND returned its full capacity;
+    a short read (truncated blob) is a per-page failure so the caller recomputes."""
+
+    def _meta_pool(self):
+        # Minimal MLA layer-first pool (1 page @ slot0, 2 layers, dim 4).
+        return FakeLayerFirstMlaDevicePool(
+            layer_num=2, size=8, page_size=4, kv_cache_dim=4)
+
+    def _obj(self, pool):
+        return _bare(is_mla=True, mem_pool_device=pool, _alog_tag="r0",
+                     _metrics=dfkv_hicache._Metrics(0))
+
+    def test_full_hit_is_page_success(self):
+        obj = self._obj(self._meta_pool())
+        # each MLA page sub-object wants page_size*kv_dim per layer * 2 layers.
+        want = 4 * 4 * 2
+        obj._batch_get_sg = lambda sks, sp, sc: ([1], [want])
+        res = obj.batch_get_v1_device(["h0"], list(range(4)))
+        self.assertEqual(res, [True])
+
+    def test_miss_is_page_failure(self):
+        obj = self._obj(self._meta_pool())
+        obj._batch_get_sg = lambda sks, sp, sc: ([0], [0])
+        self.assertEqual(obj.batch_get_v1_device(["h0"], list(range(4))), [False])
+
+    def test_short_read_is_page_failure(self):
+        obj = self._obj(self._meta_pool())
+        want = 4 * 4 * 2
+        # hit==1 but only half the bytes came back -> corrupt page -> failure.
+        obj._batch_get_sg = lambda sks, sp, sc: ([1], [want // 2])
+        self.assertEqual(obj.batch_get_v1_device(["h0"], list(range(4))), [False])
 
 
 class _NpTensor:
@@ -272,6 +315,57 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
                 token_major += pool._np[L][base:base + self.KV_DIM].tobytes()
         self.assertNotEqual(blob, bytes(token_major),
                             "layer-major vs page-first must differ for layer_num>1")
+
+    def test_device_direct_write_then_read_roundtrip(self):
+        """Increment 2: write a page device-direct, then read it back device-direct
+        into a FRESH destination pool via SG GET, and assert every per-layer page
+        segment is byte-identical to the source. This proves the layer-major SG
+        write + layer-major SG-GET scatter reassemble a byte-consistent device page
+        (the pairing the increment-1 transpose note requires)."""
+        st = self._plugin(self._node("rt"))
+        src = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        st.register_mem_pool_device(src)
+        self.assertTrue(st.supports_device_transfer())
+
+        page_hash = "cafef00d"
+        device_indices = list(range(0, self.PAGE_SIZE))  # one page at slot 0
+        self.assertEqual(st.batch_set_v1_device([page_hash], device_indices), [True])
+
+        # Fresh, zeroed destination pool. Re-point the plugin's device pool to it
+        # (register_mem_pool_device sets self.mem_pool_device), so the SG GET
+        # scatters the stored blob back into the destination's per-layer segments.
+        dst = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        for L in range(self.LAYER_NUM):
+            dst._np[L][:] = 0
+        st.register_mem_pool_device(dst)
+
+        res = st.batch_get_v1_device([page_hash], device_indices)
+        self.assertEqual(res, [True], "device-direct page must read back")
+
+        # Every layer's page bytes in the destination must match the source: the
+        # write stored layer0(page)|layer1(page)|... and the SG GET scattered that
+        # same order back into dst's per-layer segments -> byte-consistent.
+        for L in range(self.LAYER_NUM):
+            self.assertEqual(
+                dst.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                src.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                f"layer {L} page mismatch after device-direct roundtrip")
+
+    def test_device_direct_read_miss_returns_false(self):
+        """A key never written must read back as a miss (not a phantom hit) so the
+        scheduler recomputes instead of serving garbage device slots."""
+        st = self._plugin(self._node("miss"))
+        dst = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        st.register_mem_pool_device(dst)
+        self.assertEqual(
+            st.batch_get_v1_device(["never_written"], list(range(self.PAGE_SIZE))),
+            [False])
 
 
 if __name__ == "__main__":

@@ -108,6 +108,21 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
             ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
             ctypes.POINTER(ctypes.POINTER(ctypes.c_uint64)),
             ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    # Scatter-gather GET, the read-side mirror of dfkv_batch_put_sg for the
+    # HiCache L2-bypass (device-direct read) path. Key i's stored blob is
+    # scattered in order across num_dsts[i] destination buffers (a page's
+    # per-layer GPU segments); out_hit[i]==1 on hit, out_len[i]=total stored
+    # bytes. Same symbol the vLLM connector's load path uses (see
+    # integration/vllm/src/dfkv_vllm/_cabi.py). Guarded: older libdfkv.so lacks
+    # it and supports_device_transfer() declines the bypass path.
+    if hasattr(lib, "dfkv_batch_get_auto_sg"):
+        lib.dfkv_batch_get_auto_sg.restype = ctypes.c_int
+        lib.dfkv_batch_get_auto_sg.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_uint64)),
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint64)]
     if hasattr(lib, "dfkv_max_sg_segs"):
         lib.dfkv_max_sg_segs.restype = ctypes.c_uint32
         lib.dfkv_max_sg_segs.argtypes = [ctypes.c_void_p]
@@ -525,14 +540,17 @@ class DfkvHiCache(HiCacheStorage):
     def supports_device_transfer(self) -> bool:
         """True iff this backend can RDMA a page straight from GPU KV slots to L3.
 
-        Requires the scatter-gather put ABI (dfkv_batch_put_sg) plus a negotiated
-        SG width big enough to hold a page's per-layer device segments in ONE key
-        (layer_num segments/key — the GPU pool is layer-first, so a page's KV is
-        scattered across layer_num non-contiguous buffers). Older libdfkv.so
-        without the symbols, or an HCA whose max_sge is too small, keep the stock
-        host (D2H) write path. Checked by the SGLang controller's capability gate;
-        never raises."""
+        Requires the scatter-gather put AND get ABIs (dfkv_batch_put_sg /
+        dfkv_batch_get_auto_sg) plus a negotiated SG width big enough to hold a
+        page's per-layer device segments in ONE key (layer_num segments/key — the
+        GPU pool is layer-first, so a page's KV is scattered across layer_num
+        non-contiguous buffers). The get symbol is required too: increment 2 reads
+        device-direct-written pages back via SG GET, and a page written with no
+        matching reader is dead. Older libdfkv.so without the symbols, or an HCA
+        whose max_sge is too small, keep the stock host (D2H) path. Checked by the
+        SGLang controller's capability gate; never raises."""
         if not (hasattr(self._lib, "dfkv_batch_put_sg")
+                and hasattr(self._lib, "dfkv_batch_get_auto_sg")
                 and hasattr(self._lib, "dfkv_max_sg_segs")):
             return False
         layer_num = int(self.cfg.get("layer_num", 0))
@@ -830,6 +848,82 @@ class DfkvHiCache(HiCacheStorage):
             if _sp:
                 _sp.hits = sum(res); _sp.bytes = nbytes
             self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=nbytes,
+                                 seconds=dur)
+            return res
+
+    def _batch_get_sg(self, sks, seg_ptrs, seg_caps):
+        """Scatter-gather batch get: sub-key sks[i]'s stored blob is scattered in
+        order across the destination buffers seg_ptrs[i][..] of capacity
+        seg_caps[i][..] (one RDMA multi-SGE op). Returns (hits, lens): hits[i]==1
+        on hit, lens[i]=total stored bytes. Mirrors the vLLM connector's
+        batch_get_auto_sg (dfkv_client.py) and is the read twin of _batch_put_sg."""
+        n = len(sks)
+        if n == 0:
+            return [], []
+        karr = (ctypes.c_char_p * n)(*[k.encode() for k in sks])
+        # Keep the per-key inner arrays alive for the whole call (the outer arrays
+        # hold casts of these) — same lifetime discipline as _batch_put_sg.
+        inner_p = [(ctypes.c_void_p * len(p))(*[ctypes.c_void_p(int(x)) for x in p])
+                   for p in seg_ptrs]
+        inner_c = [(ctypes.c_uint64 * len(c))(*[int(x) for x in c])
+                   for c in seg_caps]
+        parr = (ctypes.POINTER(ctypes.c_void_p) * n)(
+            *[ctypes.cast(a, ctypes.POINTER(ctypes.c_void_p)) for a in inner_p])
+        carr = (ctypes.POINTER(ctypes.c_uint64) * n)(
+            *[ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64)) for a in inner_c])
+        narr = (ctypes.c_int * n)(*[len(p) for p in seg_ptrs])
+        out_hit = (ctypes.c_int * n)()
+        out_len = (ctypes.c_uint64 * n)()
+        rc = self._lib.dfkv_batch_get_auto_sg(
+            self._h, karr, parr, carr, narr, n, out_hit, out_len)
+        if rc != 0:
+            return [0] * n, [0] * n
+        return [out_hit[i] for i in range(n)], [int(out_len[i]) for i in range(n)]
+
+    def batch_get_v1_device(self, keys, device_indices, extra_info=None) -> List[bool]:
+        """L2-bypass on-demand read: RDMA a page's stored blob straight INTO its
+        GPU KV slots (no host staging). The read twin of batch_set_v1_device.
+
+        The device pool is layer-first, so a page's KV scatters across layer_num
+        non-contiguous per-layer buffers; get_device_page_buffer_meta yields the
+        same per-layer (ptr, size) segment lists the write used, here as the SG GET
+        DESTINATIONS (ptr) and capacities (size). Because the stored blob was
+        written LAYER-major (batch_set_v1_device), scattering it back across the
+        per-layer destination segments reassembles it layer-major into the device
+        slots — byte-consistent with the writer. A page succeeds iff every one of
+        its sub-objects (k[/v]) hit AND returned its full capacity (a short read is
+        a corrupt page -> failure, so the caller recomputes rather than serving it).
+
+        MLA note: the latent is replicated across TP, and only tp_rank 0 wrote it
+        (backup_skip). But EVERY rank must READ its own copy into its own device
+        slots, so there is NO read-side rank skip (unlike the write)."""
+        n = len(keys)
+        with _tracing.span("batch_get_v1_device", n) as _sp, \
+                access_log("batch_get_v1_device",
+                           lambda: f"{self._alog_tag} {n} keys") as r:
+            from sglang.srt.mem_cache.device_page_meta import (
+                get_device_page_buffer_meta,
+            )
+            seg_ptrs, seg_caps = get_device_page_buffer_meta(
+                self.mem_pool_device, device_indices)
+            sub, sks, sp, sc = self._flatten_device(keys, seg_ptrs, seg_caps)
+            # Per sub-key expected byte length = sum of its per-layer segment caps.
+            want = [sum(c) for c in sc]
+            t0 = time.perf_counter()
+            hits, lens = self._batch_get_sg(sks, sp, sc)
+            dur = time.perf_counter() - t0
+            # A sub-object is good only on a full-length hit; fold to per-page.
+            flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
+            res = self._fold(flat_ok, n, sub)
+            nbytes = sum(lens)
+            r.result = f"hits={sum(res)}/{n} (device-direct)"
+            short = sum(1 for i in range(len(sks))
+                        if hits[i] == 1 and lens[i] < want[i])
+            if short:
+                r.result += f" short_read={short}"
+            if _sp:
+                _sp.hits = sum(res); _sp.bytes = nbytes
+            self._metrics.on_get(pages=n, hit_pages=sum(res), nbytes=nbytes,
                                  seconds=dur)
             return res
 
