@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "client/group_shard.h"
 #include "client/key_map.h"
 #include "utils/log.h"
 #include "utils/thread_name.h"
@@ -195,38 +196,18 @@ size_t EnvSize(const char* name, size_t dflt) {
   return out;
 }
 
-// Split each per-node read group into up to N shards so multiple connections
-// read one node concurrently. A single- or few-node ring otherwise routes a
-// whole batch to ONE (node,size) group -> one worker -> one QP, where the
-// server drains it key-by-key (~7 ms/key, ~166 MB/s/conn measured on the
-// phase-8 hit-rate probe — the L3 read-back ceiling). Sharding turns that
-// into DFKV_READ_MAX_CONNS parallel streams per node. Shard target size and
-// the per-node cap are env-tunable; each shard keeps its group's (node,size)
-// key so downstream code is unchanged. Groups already at/under one shard pass
-// through untouched (wide rings keep their existing per-node parallelism).
+// Env-reading wrapper over ShardGroups (client/group_shard.h): resolve the
+// DFKV_READ_SHARD_KEYS / DFKV_READ_MAX_CONNS knobs once (recorded into the config
+// dump via EnvSize) and split each per-node group into up to DFKV_READ_MAX_CONNS
+// shards so multiple connections drive one node concurrently — the mechanism that
+// breaks the single-connection ~166 MB/s/conn key-by-key drain on a single- or
+// few-node ring. Used by both the read (BatchGet / SG GET) and write (BatchPutSg)
+// batch paths; the same two knobs govern read and write sharding.
 template <class GroupVec>
 GroupVec ShardReadGroups(GroupVec groups) {
   static const size_t target = EnvSize("DFKV_READ_SHARD_KEYS", 16);
   static const size_t maxc = EnvSize("DFKV_READ_MAX_CONNS", 8);
-  if (maxc <= 1) return groups;
-  GroupVec out;
-  out.reserve(groups.size());
-  for (auto& g : groups) {
-    const auto& idx = g.second;
-    size_t nsh = (idx.size() + target - 1) / target;
-    if (nsh < 1) nsh = 1;
-    if (nsh > maxc) nsh = maxc;
-    if (nsh <= 1) { out.push_back(std::move(g)); continue; }
-    const size_t per = (idx.size() + nsh - 1) / nsh;
-    for (size_t s = 0; s < idx.size(); s += per) {
-      typename GroupVec::value_type sh;
-      sh.first = g.first;
-      sh.second.assign(idx.begin() + s,
-                       idx.begin() + std::min(idx.size(), s + per));
-      out.push_back(std::move(sh));
-    }
-  }
-  return out;
+  return ShardGroups(std::move(groups), target, maxc);
 }
 }  // namespace
 
@@ -1223,7 +1204,16 @@ std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {
     h.Serialize(hdrs[i].data());
     by_node[node].push_back(i);
   }
-  std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
+  // Shard each per-node put group the same way the read path does (shared knobs
+  // DFKV_READ_SHARD_KEYS / DFKV_READ_MAX_CONNS): a single-node ring otherwise
+  // gathers the whole SG batch into one group -> one worker -> one QP that the
+  // server drains key-by-key. Sharding fans it across up to DFKV_READ_MAX_CONNS
+  // connections. Each shard keeps its node and a contiguous slice of the original
+  // indices, so hdrs[k]/ok[k] stay addressed by original index and per-key results
+  // are unchanged.
+  std::vector<std::pair<std::string, std::vector<size_t>>> groups =
+      ShardReadGroups(std::vector<std::pair<std::string, std::vector<size_t>>>(
+          by_node.begin(), by_node.end()));
   RunParallel(groups.size(), BatchWorkers(groups.size()), [&](size_t g) {
     const std::string& node = groups[g].first;
     uint64_t now = NowMs();
