@@ -464,10 +464,16 @@ TEST_F(DiskSlabTest, BackgroundReclaimerFreesSlotsOnFullStore) {
 // with one extent's worth of survivors); the reclaim tick must instead grow B
 // from the idle A donor so the whole burst stays readable.
 TEST_F(DiskSlabTest, ReclaimTickGrowsHotClassFromColdDonor) {
+  // Watermark eviction OFF: on a >92%-full store it returns cold extents to
+  // the pool each tick, and a non-empty pool disables the donor-steal grow
+  // (B then grows via pool grabs, rebalanced_extents stays 0). This test
+  // targets the donor-steal path specifically, so isolate it.
+  ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", "0", 1);
   bool ok = false;
   auto o = Opts(16 << 20, 1 << 20, 4096);  // 16 extents x 1 MiB
   o.reclaim_interval_ms = 1;
   DiskSlabStore s(o, &ok);
+  ::unsetenv("DFKV_SLAB_EVICT_HIGH_PCT");
   ASSERT_TRUE(ok);
   std::string a(4000, 'a');
   for (uint64_t i = 0; i < 4096; ++i)  // 16 extents x 256 slots: fill class A
