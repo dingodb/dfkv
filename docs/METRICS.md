@@ -154,6 +154,17 @@ C 客户端快照里还含传输级（RDMA 构建）：`dfkv_rdma_client_conns_o
 
 > 逐 peer 延迟由 C++ 客户端主动探测（`DFKV_PROBE_INTERVAL_MS`）：SGLang HiCache 开 metrics 即自动开；vLLM/LMCache 需手动 `export DFKV_PROBE_INTERVAL_MS=5000`。
 
+### 3.5 vLLM 连接器客户端健康（`dfkv-vllm` /metrics，经 prometheus_client，pull）
+§3.4 是 OTLP **push**（opt-in）；此外 vLLM 连接器后台轮询线程读同一 C 客户端快照（`DFKV_CLIENT_STATS_POLL_S`，默认 15s，0=关），把**环/MDS 健康**镜像为带 `{tp_rank}` 的 Gauge，直接落在 vLLM 自带 `/metrics` 上（**无需开 telemetry**）。这样"空环（写无处可去、ok=0）/ MDS 不可达"在 scrape 上可见，而非只在客户端日志里——正是一次生产事故（静默空环）的教训。
+| 指标 | 类型 | 标签 | 含义 |
+|---|---|---|---|
+| `vllm:dfkv_client_ring_members` | gauge | `tp_rank` | 客户端看到的环成员数（`0` = 空环） |
+| `vllm:dfkv_client_mds_reachable` | gauge | `tp_rank` | 上次发现轮询 MDS 是否可达（`1`/`0`） |
+| `vllm:dfkv_client_mds_unreachable_polls_total` | gauge | `tp_rank` | 无法连上 MDS 的发现轮询次数（镜像 C 端计数器） |
+| `vllm:dfkv_client_transport_info` | gauge | `tp_rank`,`transport` | 恒为 `1`，`transport` 标 live 传输（`rdma`/`tcp`） |
+
+> 源快照名（C 端无 `vllm:` 前缀）为 `dfkv_client_ring_members` / `dfkv_client_mds_reachable` / `dfkv_client_mds_unreachable_polls_total`（PR#207），与 SGLang HiCache §3.3 同源；vLLM 侧加 `vllm:` 前缀入连接器命名空间。
+
 ## 4. 性能保证
 
 - 热路径计数：`std::atomic` relaxed `fetch_add`，零锁零分配（与既有模式一致）。

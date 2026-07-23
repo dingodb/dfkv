@@ -342,7 +342,9 @@ vllm serve <model> \
 3. server 侧 `dfkvctl stat --all` 或 `/metrics` 看 get 命中、写入量。
 
 不命中排查顺序：`PYTHONHASHSEED` → MDS 可达（或静态 `members` 端口是否 rdma-port）→
-`nvidia-peermem` → `model_hash`/几何是否一致（§5）。
+`nvidia-peermem` → `model_hash`/几何是否一致（§5）。**空环 / MDS 不可达**可直接在 vLLM `/metrics`
+上看：`vllm:dfkv_client_ring_members==0`（写无处可去）或 `vllm:dfkv_client_mds_reachable==0`
+（[METRICS.md](METRICS.md) §3.5），不必翻客户端日志。
 
 ### 3.3 环境变量（每个 vLLM 引擎进程）
 
@@ -356,6 +358,7 @@ vllm serve <model> \
 | `DFKV_RDMA_NUMA` | `0` | 多 NUMA 大机 `1` | §1.2 |
 | `DFKV_LIB` / `DFKV_BUILD` | — | so 路径 | 被 extra_config `lib` 覆盖 |
 | `DFKV_ACCESS_LOG_*` | 关 | 排查时开 | §1.6；vLLM 侧记 `batch_get_auto_sg`/`batch_put_sg`/`batch_exist`/`register_memory` |
+| `DFKV_CLIENT_STATS_POLL_S` | `15` | 默认即可 | 后台轮询把环/MDS 健康镜像到 vLLM `/metrics`（`vllm:dfkv_client_ring_members`/`mds_reachable`/`mds_unreachable_polls_total`/`transport_info`）；`0`=关。见 [METRICS.md](METRICS.md) §3.5 |
 | `DFKV_METRICS_ENABLED` / `DFKV_TRACING_ENABLED` | 关 | 按需 | §1.6；vLLM 连接器 telemetry **只认 env**（不读 extra_config） |
 
 ### 3.4 `kv_connector_extra_config`
