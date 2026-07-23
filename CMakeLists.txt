@@ -57,7 +57,10 @@ target_include_directories(dfkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(dfkv_core PRIVATE _GNU_SOURCE  # O_DIRECT/fallocate in src/cache/kv_store.cc
   DFKV_VERSION="${PROJECT_VERSION}")
 find_package(Threads REQUIRED)
-target_link_libraries(dfkv_core PUBLIC Threads::Threads)
+# src/client/cuda_ipc.cc dlopen()s libcuda.so.1 (needs libdl); node_dedup*.cc use
+# POSIX shm_open/shm_unlink (needs librt on glibc < 2.34). PUBLIC so both propagate
+# to every executable linking the dfkv_core static archive.
+target_link_libraries(dfkv_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS} rt)
 if(DFKV_WITH_RDMA)
   target_compile_definitions(dfkv_core PUBLIC DFKV_WITH_RDMA)
   target_link_libraries(dfkv_core PUBLIC ibverbs)
@@ -72,7 +75,7 @@ add_library(dfkv SHARED ${DFKV_SRCS})
 target_include_directories(dfkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(dfkv PRIVATE _GNU_SOURCE  # O_DIRECT/fallocate in src/cache/kv_store.cc
   DFKV_VERSION="${PROJECT_VERSION}")
-target_link_libraries(dfkv PUBLIC Threads::Threads)
+target_link_libraries(dfkv PUBLIC Threads::Threads ${CMAKE_DL_LIBS} rt)  # cuda_ipc dlopen->libdl, node_dedup shm_*->librt
 if(DFKV_WITH_RDMA)
   target_compile_definitions(dfkv PUBLIC DFKV_WITH_RDMA)
   target_link_libraries(dfkv PUBLIC ibverbs)
