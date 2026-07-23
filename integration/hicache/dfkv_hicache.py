@@ -560,12 +560,16 @@ class DfkvHiCache(HiCacheStorage):
             max_segs = int(self._lib.dfkv_max_sg_segs(self._h))
         except Exception:
             return False
-        if max_segs < layer_num:
-            print(f"[dfkv] L2-bypass unavailable: max_sg_segs={max_segs} < "
-                  f"layer_num={layer_num}; a page's per-layer device segments "
-                  "exceed the RDMA SGE budget for a single key. Staying on the "
-                  "host write path.", file=sys.stderr, flush=True)
+        if max_segs < 1:
             return False
+        if max_segs < layer_num:
+            # Pages split into ceil(layer_num/max_segs) "@sg{n}" sub-keys
+            # (_flatten_device) — same chunking the vLLM connector uses, so a
+            # narrow HCA costs extra keys per page, not the bypass itself.
+            print(f"[dfkv] L2-bypass: max_sg_segs={max_segs} < layer_num="
+                  f"{layer_num}; chunking each page into "
+                  f"{(layer_num + max_segs - 1) // max_segs} @sg sub-keys.",
+                  file=sys.stderr, flush=True)
         return True
 
     def register_mem_pool_device(self, mem_pool_device):
@@ -739,19 +743,45 @@ class DfkvHiCache(HiCacheStorage):
             # OTLP by the snapshot poller — see dfkv_telemetry.parse_client_ops.
             return res
 
+    def _sg_width(self) -> int:
+        """Negotiated SG segments per key (HCA max_sge budget), cached."""
+        w = getattr(self, "_sg_width_cache", 0)
+        if not w:
+            try:
+                w = int(self._lib.dfkv_max_sg_segs(self._h))
+            except Exception:
+                w = 0
+            w = w or 29  # ConnectX-era fallback: max_sge=30, one SGE reserved
+            self._sg_width_cache = w
+        return w
+
     def _flatten_device(self, keys, seg_ptrs, seg_sizes):
         """Expand per-page keys into per-sub-object (k[/v]) sub-keys, pairing each
         with its per-layer device segment list. Parallel to _flatten, but every
-        entry is a segment LIST (one per layer), not a single (ptr, size)."""
+        entry is a segment LIST (one per layer), not a single (ptr, size).
+
+        A page's layer_num segments can exceed the HCA's per-key SG budget
+        (max_sge-1, e.g. 29 on ConnectX < 36/61 layers), so each sub-object is
+        chunked into "@sg{n}" sub-keys of <= _sg_width() consecutive layers —
+        the same scheme (and key suffix) the vLLM connector uses. Write and read
+        derive the identical deterministic split from (layer count, width), so
+        the layer-major bytes reassemble exactly. Chunk count is uniform across
+        pages, so _fold()'s per-page stride is sub * nchunks."""
         sub = self._sub()
         assert len(seg_ptrs) == len(keys) * sub, (len(seg_ptrs), len(keys), sub)
+        w = self._sg_width()
         sks, sp, ss = [], [], []
+        nchunks = 1
         for i, k in enumerate(keys):
             for j, sk in enumerate(self._keys(k)):
-                sks.append(sk)
-                sp.append([int(p) for p in seg_ptrs[i * sub + j]])
-                ss.append([int(s) for s in seg_sizes[i * sub + j]])
-        return sub, sks, sp, ss
+                p = [int(x) for x in seg_ptrs[i * sub + j]]
+                s = [int(x) for x in seg_sizes[i * sub + j]]
+                nchunks = max(1, (len(p) + w - 1) // w)
+                for ci in range(nchunks):
+                    sks.append(f"{sk}@sg{ci}")
+                    sp.append(p[ci * w:(ci + 1) * w])
+                    ss.append(s[ci * w:(ci + 1) * w])
+        return sub * nchunks, sks, sp, ss
 
     def _batch_put_sg(self, sks, seg_ptrs, seg_sizes) -> List[bool]:
         """Scatter-gather batch put: sub-key sks[i] stores the in-order
@@ -1107,6 +1137,135 @@ class DfkvHiCache(HiCacheStorage):
                     hit_pages=sum(sum(rs) for rs in res.values()),
                     nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
             return res
+
+    # --- DSA L2-bypass: main KV device-direct + sidecar host, one logical op ----
+    def _kv_device_set(self, keys, device_indices):
+        """Core of batch_set_v1_device (device-direct SG put) without the tracing /
+        access-log wrapper, so batch_set_v2_device can reuse it for the anchor KV.
+        Returns (per_page_bools, nbytes, seconds). MLA backup_skip on non-zero TP
+        rank (replicated latent) short-circuits to all-True, no I/O."""
+        n = len(keys)
+        if self.is_mla and self.tp_rank != 0:
+            return [True] * n, 0, 0.0
+        from sglang.srt.mem_cache.device_page_meta import (
+            get_device_page_buffer_meta,
+        )
+        seg_ptrs, seg_sizes = get_device_page_buffer_meta(
+            self.mem_pool_device, device_indices)
+        sub, sks, sp, ss = self._flatten_device(keys, seg_ptrs, seg_sizes)
+        nbytes = sum(sum(s) for s in ss)
+        t0 = time.perf_counter()
+        flat = self._put_sg_flat(sks, sp, ss)
+        dur = time.perf_counter() - t0
+        return self._fold(flat, n, sub), nbytes, dur
+
+    def _kv_device_get(self, keys, device_indices):
+        """Core of batch_get_v1_device (device-direct SG get) without the tracing /
+        access-log wrapper, so batch_get_v2_device can reuse it for the anchor KV.
+        Returns (per_page_bools, nbytes, seconds). A page is a hit only on a
+        full-length read of every sub-object (a short read is a corrupt page)."""
+        n = len(keys)
+        from sglang.srt.mem_cache.device_page_meta import (
+            get_device_page_buffer_meta,
+        )
+        seg_ptrs, seg_caps = get_device_page_buffer_meta(
+            self.mem_pool_device, device_indices)
+        sub, sks, sp, sc = self._flatten_device(keys, seg_ptrs, seg_caps)
+        want = [sum(c) for c in sc]
+        t0 = time.perf_counter()
+        hits, lens = self._batch_get_sg(sks, sp, sc)
+        dur = time.perf_counter() - t0
+        flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
+        return self._fold(flat_ok, n, sub), sum(lens), dur
+
+    def batch_set_v2_device(
+        self, kv_keys, kv_device_indices, sidecar_transfers, extra_info=None
+    ) -> dict:
+        """DSA L2-bypass backup (GLM-5.2): the anchor "kv" pool (the big MLA latent)
+        RDMAs straight from its GPU slots to L3 via the device-direct SG put, while
+        the small DSA indexer sidecar STAYS on the host v2 path (_v2_io from its host
+        buffer). One logical op so the split value is written atomically-per-page.
+
+        VALUE LAYOUT (explicit): the main KV is stored under the v1-style keys
+        (_keys(hash) -> "model/hash_k"), byte-for-byte the same key scheme
+        batch_set_v1_device / batch_exists use — so an unchanged batch_exists_v2
+        anchors the hit prefix on the SAME "kv" keys with no change. The sidecar
+        rides its own v2 keys (_pool_keys('indexer', hash) -> "model/hash_indexer_k")
+        exactly as stock batch_set_v2. The two components never collide; the composite
+        is split honestly across two key namespaces, isolated by model_hash.
+
+        METRICS: the anchor device SG put reports on_set (a v1-device physical
+        transfer, identical attribution to stock DSA whose anchor rides batch_set_v1),
+        and the sidecar reports on_set_v2 — preserving the stock DSA metric split."""
+        n = len(kv_keys)
+        sidecar_transfers = sidecar_transfers or []
+        with _tracing.span("batch_set_v2_device", n) as _sp, \
+                access_log("batch_set_v2_device",
+                           lambda: f"{self._alog_tag} kv={n} "
+                                   f"{_fmt_pools(sidecar_transfers)}") as r:
+            kv_res, kv_bytes, kv_secs = self._kv_device_set(kv_keys, kv_device_indices)
+            results = {"kv": kv_res}
+            # Main-KV device write reports on_set (v1-device), matching stock DSA's
+            # anchor attribution; skip the metric on the MLA rank!=0 no-op.
+            if n and not (self.is_mla and self.tp_rank != 0):
+                self._metrics.on_set(pages=n, ok_pages=sum(kv_res),
+                                     nbytes=kv_bytes, seconds=kv_secs)
+            # Sidecar rides the host v2 path (its own keys, its own host buffer).
+            if sidecar_transfers:
+                side = self._v2_io(sidecar_transfers, putting=True)
+                results.update(side)
+                side_pages = sum(len(rs) for rs in side.values())
+                if side_pages and not (self.is_mla and self.tp_rank != 0):
+                    self._metrics.on_set_v2(
+                        pages=side_pages,
+                        ok_pages=sum(sum(rs) for rs in side.values()),
+                        nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
+            r.result = f"kv {sum(kv_res)}/{n} (device-direct); " + _fmt_pool_results(
+                {k: v for k, v in results.items() if k != "kv"})
+            if self._put_retry_recovered:
+                r.result += f" retry_ok={self._put_retry_recovered}"
+            if _sp:
+                _sp.hits = sum(sum(rs) for rs in results.values())
+                _sp.bytes = kv_bytes + self._v2_io_bytes if sidecar_transfers else kv_bytes
+            return results
+
+    def batch_get_v2_device(
+        self, kv_keys, kv_device_indices, sidecar_transfers, extra_info=None
+    ) -> dict:
+        """DSA L2-bypass on-demand read (GLM-5.2): the read twin of
+        batch_set_v2_device. The anchor "kv" pool RDMAs straight INTO its GPU slots
+        via the device-direct SG get; the DSA indexer sidecar is read into its host
+        buffer via the v2 host path (batch_get_v2 semantics), from which the SGLang
+        controller then H2Ds it into the device index buffer.
+
+        The kv keys/indices and sidecar keys mirror batch_set_v2_device exactly, so a
+        page written there reads back byte-identical for BOTH components. Anchor read
+        reports on_get (v1-device), sidecar on_get_v2 — the stock DSA read split."""
+        n = len(kv_keys)
+        sidecar_transfers = sidecar_transfers or []
+        with _tracing.span("batch_get_v2_device", n) as _sp, \
+                access_log("batch_get_v2_device",
+                           lambda: f"{self._alog_tag} kv={n} "
+                                   f"{_fmt_pools(sidecar_transfers)}") as r:
+            kv_res, kv_bytes, kv_secs = self._kv_device_get(kv_keys, kv_device_indices)
+            results = {"kv": kv_res}
+            if n:
+                self._metrics.on_get(pages=n, hit_pages=sum(kv_res),
+                                     nbytes=kv_bytes, seconds=kv_secs)
+            if sidecar_transfers:
+                side = self._v2_io(sidecar_transfers, putting=False)
+                results.update(side)
+                side_pages = sum(len(rs) for rs in side.values())
+                if side_pages:
+                    self._metrics.on_get_v2(
+                        pages=side_pages,
+                        hit_pages=sum(sum(rs) for rs in side.values()),
+                        nbytes=self._v2_io_bytes, seconds=self._v2_io_seconds)
+            r.result = f"kv {sum(kv_res)}/{n} (device-direct); " + _fmt_pool_results(
+                {k: v for k, v in results.items() if k != "kv"})
+            if _sp:
+                _sp.hits = sum(sum(rs) for rs in results.values())
+            return results
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
         total = len(keys)

@@ -69,7 +69,7 @@ class TestFlattenDevice(unittest.TestCase):
         seg_sizes = [[100, 100, 100], [100, 100, 100]]
         sub, sks, sp, ss = obj._flatten_device(keys, seg_ptrs, seg_sizes)
         self.assertEqual(sub, 1)
-        self.assertEqual(sks, ["m/h0_k", "m/h1_k"])
+        self.assertEqual(sks, ["m/h0_k@sg0", "m/h1_k@sg0"])
         self.assertEqual(sp, [[10, 11, 12], [20, 21, 22]])
         self.assertEqual(ss, [[100, 100, 100], [100, 100, 100]])
 
@@ -80,8 +80,20 @@ class TestFlattenDevice(unittest.TestCase):
         seg_sizes = [[8, 8], [8, 8]]
         sub, sks, sp, ss = obj._flatten_device(keys, seg_ptrs, seg_sizes)
         self.assertEqual(sub, 2)
-        self.assertEqual(sks, ["m/h0_2_1_k", "m/h0_2_1_v"])
+        self.assertEqual(sks, ["m/h0_2_1_k@sg0", "m/h0_2_1_v@sg0"])
         self.assertEqual(sp, [[1, 2], [3, 4]])
+
+    def test_chunk_split_when_width_below_layers(self):
+        # 5 layers on a width-2 lib -> 3 chunks per sub-object, consecutive
+        # slices, deterministic order (the read side derives the same split).
+        obj = _bare(is_mla=True, _lib=FakeLib(max_segs=2), _h=1)
+        seg_ptrs = [[10, 11, 12, 13, 14]]
+        seg_sizes = [[1, 2, 3, 4, 5]]
+        sub, sks, sp, ss = obj._flatten_device(["h0"], seg_ptrs, seg_sizes)
+        self.assertEqual(sub, 3)
+        self.assertEqual(sks, ["m/h0_k@sg0", "m/h0_k@sg1", "m/h0_k@sg2"])
+        self.assertEqual(sp, [[10, 11], [12, 13], [14]])
+        self.assertEqual(ss, [[1, 2], [3, 4], [5]])
 
     def test_shape_mismatch_asserts(self):
         obj = _bare(is_mla=False)  # sub=2
@@ -131,8 +143,13 @@ class TestSupportsDeviceTransfer(unittest.TestCase):
         obj = _bare(cfg={"layer_num": 32}, _lib=FakeLib(max_segs=32), _h=1)
         self.assertTrue(obj.supports_device_transfer())
 
-    def test_declined_when_width_too_small(self):
+    def test_chunked_when_width_too_small(self):
+        # Narrow HCA no longer declines: pages chunk into @sg{n} sub-keys.
         obj = _bare(cfg={"layer_num": 61}, _lib=FakeLib(max_segs=29), _h=1)
+        self.assertTrue(obj.supports_device_transfer())
+
+    def test_declined_when_width_zero(self):
+        obj = _bare(cfg={"layer_num": 61}, _lib=FakeLib(max_segs=0), _h=1)
         self.assertFalse(obj.supports_device_transfer())
 
     def test_declined_without_sg_symbol(self):
@@ -289,7 +306,9 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         self.assertEqual(res, [True])
 
         # Read the stored blob back contiguously (what the stock host get does).
-        sk = st._keys(page_hash)[0]
+        # Device-direct sub-keys carry the "@sg{n}" chunk suffix; LAYER_NUM=3
+        # fits one chunk on this fake lib, so the whole page is under @sg0.
+        sk = st._keys(page_hash)[0] + "@sg0"
         cap = self.LAYER_NUM * self.PAGE_SIZE * self.KV_DIM
         buf = ctypes.create_string_buffer(cap)
         rc = st._lib.dfkv_get(st._h, sk.encode(), ctypes.cast(buf, ctypes.c_void_p),
