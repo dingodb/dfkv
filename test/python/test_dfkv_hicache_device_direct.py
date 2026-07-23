@@ -218,6 +218,49 @@ class _NpTensor:
         return int(self._arr.itemsize)
 
 
+class _Transfer:
+    """Minimal PoolTransfer stand-in for the v2 sidecar path (name/keys/host_indices)."""
+
+    def __init__(self, name, keys, host_indices):
+        self.name = name
+        self.keys = keys
+        self.host_indices = host_indices
+
+
+class FakePageFirstHostSidecarPool:
+    """Page-first host pool for the DSA indexer sidecar, emulated with a single
+    numpy buffer of shape (num_pages, page_bytes). Mirrors the real host pool
+    surface the v2 path uses: get_page_buffer_meta(host_indices) -> (ptrs, sizes),
+    one contiguous (ptr, size) per page. Unlike the layer-first device pool, the
+    sidecar rides the *host* v2 path (D2H already done), so its page is one
+    contiguous blob — exactly what the stock host read reconstructs."""
+
+    def __init__(self, num_pages, page_size, page_bytes, fill_base=0):
+        self.page_size = page_size
+        self.page_bytes = page_bytes
+        self._arr = np.zeros(num_pages * page_bytes, dtype=np.uint8)
+        for pg in range(num_pages):
+            for b in range(page_bytes):
+                self._arr[pg * page_bytes + b] = (fill_base + pg * 7 + b) % 256
+
+    def get_page_buffer_meta(self, indices):
+        # indices are page-aligned token slots; one (ptr, size) per page (sub=1).
+        idx = list(indices)
+        assert len(idx) % self.page_size == 0
+        npages = len(idx) // self.page_size
+        base = self._arr.ctypes.data
+        ptrs, sizes = [], []
+        for p in range(npages):
+            page_idx = idx[p * self.page_size] // self.page_size
+            ptrs.append(base + page_idx * self.page_bytes)
+            sizes.append(self.page_bytes)
+        return ptrs, sizes
+
+    def page_bytes_at(self, page_idx):
+        off = page_idx * self.page_bytes
+        return bytes(self._arr[off:off + self.page_bytes])
+
+
 class FakeLayerFirstMlaDevicePool:
     """Layer-first MLA GPU pool emulated with host numpy per-layer buffers, so the
     device-direct SG write path can be exercised end-to-end without a GPU."""
@@ -385,6 +428,81 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         self.assertEqual(
             st.batch_get_v1_device(["never_written"], list(range(self.PAGE_SIZE))),
             [False])
+
+    # Increment 2.5: DSA split-value (main KV device-direct + indexer sidecar host).
+    SIDE_BYTES = 4 * 3  # indexer page bytes (page_size * indexer_size_per_token-ish)
+
+    def test_dsa_split_value_write_then_read_roundtrip(self):
+        """DSA (GLM-5.2) L2-bypass: the main MLA latent rides the device-direct SG
+        path (layer-major, straight from GPU slots) while the small DSA indexer
+        sidecar rides the host v2 path. batch_set_v2_device writes the split value
+        under two key namespaces (kv @sg keys + indexer host keys); batch_get_v2_device
+        reads BOTH back byte-identical into fresh destination pools. Proves the
+        composite is split honestly without any C-server change: main KV and sidecar
+        never collide, and each component round-trips byte-exact."""
+        st = self._plugin(self._node("dsa"))
+        # Source pools: main latent (layer-first device) + indexer sidecar (page-first host).
+        src_kv = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        src_side = FakePageFirstHostSidecarPool(
+            num_pages=4, page_size=self.PAGE_SIZE, page_bytes=self.SIDE_BYTES,
+            fill_base=17)
+        st.register_mem_pool_device(src_kv)
+        st.register_mem_host_pool_v2(src_side, "indexer")
+        self.assertTrue(st.supports_device_transfer())
+
+        page_hash = "d5a10001"
+        kv_device_indices = list(range(0, self.PAGE_SIZE))  # one page at slot 0
+        side_host_indices = list(range(0, self.PAGE_SIZE))  # indexer shares slot 0
+        set_res = st.batch_set_v2_device(
+            [page_hash], kv_device_indices,
+            [_Transfer("indexer", [page_hash], side_host_indices)])
+        self.assertEqual(set_res["kv"], [True], "main KV device-direct write failed")
+        self.assertEqual(set_res["indexer"], [True], "indexer host write failed")
+
+        # Fresh, zeroed destination pools; re-point the plugin at them for the read.
+        dst_kv = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        for L in range(self.LAYER_NUM):
+            dst_kv._np[L][:] = 0
+        dst_side = FakePageFirstHostSidecarPool(
+            num_pages=4, page_size=self.PAGE_SIZE, page_bytes=self.SIDE_BYTES,
+            fill_base=0)
+        dst_side._arr[:] = 0
+        st.register_mem_pool_device(dst_kv)
+        st.register_mem_host_pool_v2(dst_side, "indexer")
+
+        get_res = st.batch_get_v2_device(
+            [page_hash], kv_device_indices,
+            [_Transfer("indexer", [page_hash], side_host_indices)])
+        self.assertEqual(get_res["kv"], [True], "main KV device-direct read failed")
+        self.assertEqual(get_res["indexer"], [True], "indexer host read failed")
+
+        # Main KV: every layer's page must match source (layer-major roundtrip).
+        for L in range(self.LAYER_NUM):
+            self.assertEqual(
+                dst_kv.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                src_kv.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                f"main KV layer {L} mismatch after DSA split roundtrip")
+        # Sidecar: the indexer page must match source (host v2 roundtrip).
+        self.assertEqual(
+            dst_side.page_bytes_at(0), src_side.page_bytes_at(0),
+            "indexer sidecar page mismatch after DSA split roundtrip")
+
+    def test_dsa_split_value_kv_and_sidecar_use_distinct_keys(self):
+        """The split value's two components must live under DISTINCT key namespaces
+        so they never overwrite each other: main KV under the @sg-chunked v1-style
+        'kv' keys, the indexer under its own '_indexer_k' key. A cross-namespace
+        collision would corrupt one component."""
+        st = self._plugin(self._node("dsakeys"))
+        h = "feedface"
+        kv_sub = st._keys(h)[0] + "@sg0"          # device-direct main KV sub-key
+        side_sub = st._pool_keys("indexer", h)[0]  # host v2 indexer sub-key
+        self.assertNotEqual(kv_sub, side_sub)
+        self.assertNotIn("indexer", kv_sub)
+        self.assertIn("indexer", side_sub)
 
 
 if __name__ == "__main__":
