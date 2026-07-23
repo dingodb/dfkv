@@ -219,12 +219,73 @@ class _NpTensor:
 
 
 class _Transfer:
-    """Minimal PoolTransfer stand-in for the v2 sidecar path (name/keys/host_indices)."""
+    """Minimal PoolTransfer stand-in for the HOST v2 sidecar path
+    (name/keys/host_indices; device_indices None)."""
 
     def __init__(self, name, keys, host_indices):
         self.name = name
         self.keys = keys
         self.host_indices = host_indices
+        self.device_indices = None
+
+
+class _DeviceTransfer:
+    """Minimal PoolTransfer stand-in for the DEVICE-direct sidecar path (task 4):
+    device_indices set (the main-KV slots the indexer rides), host_indices None."""
+
+    def __init__(self, name, keys, device_indices):
+        self.name = name
+        self.keys = keys
+        self.device_indices = device_indices
+        self.host_indices = None
+
+
+class _NpTensor2D:
+    """numpy-backed 2D stand-in for a torch device tensor, exposing the shape/stride
+    surface get_device_sidecar_page_buffer_meta needs (plus data_ptr/numel/elt)."""
+
+    def __init__(self, arr):
+        self._arr = arr
+
+    def data_ptr(self):
+        return self._arr.ctypes.data
+
+    def numel(self):
+        return int(self._arr.size)
+
+    def element_size(self):
+        return int(self._arr.itemsize)
+
+    @property
+    def shape(self):
+        return self._arr.shape
+
+    def stride(self, dim=None):
+        strides = tuple(s // self._arr.itemsize for s in self._arr.strides)
+        return strides if dim is None else strides[dim]
+
+
+class FakeLayerFirstIndexerDevicePool:
+    """Layer-first, PAGE-indexed DSA indexer GPU pool emulated with host numpy: a
+    list of per-layer 2D buffers (num_pages, page_bytes), so the device-direct sidecar
+    SG path (task 4) can be exercised end-to-end without a GPU. Row (slot // page_size)
+    of layer L holds the whole page's index+scale for that layer."""
+
+    def __init__(self, layer_num, num_pages, page_size, page_bytes):
+        self.page_size = page_size
+        self.page_bytes = page_bytes
+        self._np = []
+        self.index_k_with_scale_buffer = []
+        for L in range(layer_num):
+            arr = np.zeros((num_pages, page_bytes), dtype=np.uint8)
+            for pg in range(num_pages):
+                for b in range(page_bytes):
+                    arr[pg, b] = (L * 90 + pg * 13 + b) % 256
+            self._np.append(arr)
+            self.index_k_with_scale_buffer.append(_NpTensor2D(arr))
+
+    def layer_page_bytes(self, layer, page_idx):
+        return bytes(self._np[layer][page_idx].tobytes())
 
 
 class FakePageFirstHostSidecarPool:
@@ -503,6 +564,132 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         self.assertNotEqual(kv_sub, side_sub)
         self.assertNotIn("indexer", kv_sub)
         self.assertIn("indexer", side_sub)
+        # Task 4: the device-direct sidecar stores an "@sg0"-chunked indexer key —
+        # still its own namespace, distinct from the main KV.
+        side_sub_dev = st._pool_keys("indexer", h)[0] + "@sg0"
+        self.assertNotEqual(kv_sub, side_sub_dev)
+        self.assertIn("indexer", side_sub_dev)
+
+    # Task 4: DSA split-value with the indexer sidecar ALSO device-direct.
+    SIDE_DEV_BYTES = 6  # indexer page-row bytes (page_size * indexer bytes/token-ish)
+
+    def test_dsa_split_value_device_sidecar_roundtrip(self):
+        """DSA (GLM-5.2) L2-bypass, task 4: BOTH the main MLA latent AND the DSA
+        indexer sidecar ride the device-direct SG path — no host staging. The indexer
+        is layer-first & PAGE-indexed, so it @sg-chunks exactly like the main latent.
+        batch_set_v2_device writes both from GPU slots; batch_get_v2_device reads both
+        back into FRESH device pools, byte-identical per layer. Proves the sidecar's
+        layer-major device write/read reassemble byte-exact under distinct keys."""
+        st = self._plugin(self._node("dsadev"))
+        src_kv = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        src_side = FakeLayerFirstIndexerDevicePool(
+            self.LAYER_NUM, num_pages=4, page_size=self.PAGE_SIZE,
+            page_bytes=self.SIDE_DEV_BYTES)
+        st.register_mem_pool_device(src_kv)
+        st.register_mem_pool_device_sidecar("indexer", src_side)
+        self.assertTrue(st.supports_device_transfer())
+
+        page_hash = "d5adev01"
+        kv_dev = list(range(0, self.PAGE_SIZE))  # one page at slot 0
+        set_res = st.batch_set_v2_device(
+            [page_hash], kv_dev,
+            [_DeviceTransfer("indexer", [page_hash], kv_dev)])
+        self.assertEqual(set_res["kv"], [True], "main KV device-direct write failed")
+        self.assertEqual(set_res["indexer"], [True],
+                         "indexer device-direct write failed")
+
+        # Fresh, zeroed destination pools; re-point the plugin at them for the read.
+        dst_kv = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        for L in range(self.LAYER_NUM):
+            dst_kv._np[L][:] = 0
+        dst_side = FakeLayerFirstIndexerDevicePool(
+            self.LAYER_NUM, num_pages=4, page_size=self.PAGE_SIZE,
+            page_bytes=self.SIDE_DEV_BYTES)
+        for L in range(self.LAYER_NUM):
+            dst_side._np[L][:] = 0
+        st.register_mem_pool_device(dst_kv)
+        st.register_mem_pool_device_sidecar("indexer", dst_side)
+
+        get_res = st.batch_get_v2_device(
+            [page_hash], kv_dev,
+            [_DeviceTransfer("indexer", [page_hash], kv_dev)])
+        self.assertEqual(get_res["kv"], [True], "main KV device-direct read failed")
+        self.assertEqual(get_res["indexer"], [True],
+                         "indexer device-direct read failed")
+
+        for L in range(self.LAYER_NUM):
+            self.assertEqual(
+                dst_kv.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                src_kv.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                f"main KV layer {L} mismatch after device-sidecar roundtrip")
+        # Indexer page-row 0 (slot 0 // page_size) must match source per layer.
+        for L in range(self.LAYER_NUM):
+            self.assertEqual(
+                dst_side.layer_page_bytes(L, 0),
+                src_side.layer_page_bytes(L, 0),
+                f"indexer layer {L} mismatch after device-sidecar roundtrip")
+
+    def test_device_sidecar_read_miss_returns_false(self):
+        """A device-direct sidecar page never written must read back as a miss so the
+        controller recomputes rather than serving garbage GPU index slots."""
+        st = self._plugin(self._node("dsadevmiss"))
+        dst_kv = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        dst_side = FakeLayerFirstIndexerDevicePool(
+            self.LAYER_NUM, num_pages=4, page_size=self.PAGE_SIZE,
+            page_bytes=self.SIDE_DEV_BYTES)
+        st.register_mem_pool_device(dst_kv)
+        st.register_mem_pool_device_sidecar("indexer", dst_side)
+        kv_dev = list(range(0, self.PAGE_SIZE))
+        res = st.batch_get_v2_device(
+            ["never_dev"], kv_dev, [_DeviceTransfer("indexer", ["never_dev"], kv_dev)])
+        self.assertEqual(res["kv"], [False])
+        self.assertEqual(res["indexer"], [False])
+
+    # Task 6: EAGLE draft KV device-direct L3.
+    def test_draft_device_direct_roundtrip(self):
+        """Task 6: the EAGLE draft KV rides the device-direct SG path under its own
+        `.draft` namespace (distinct from the target). Write the draft from GPU slots,
+        read it back into a FRESH draft pool, byte-identical per layer."""
+        st = self._plugin(self._node("draft"))
+        src = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        st.register_mem_pool_device_draft(src)
+        page_hash = "draf7001"
+        dev = list(range(0, self.PAGE_SIZE))
+        self.assertEqual(st.batch_set_v1_device_draft([page_hash], dev), [True])
+
+        dst = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        for L in range(self.LAYER_NUM):
+            dst._np[L][:] = 0
+        st.register_mem_pool_device_draft(dst)
+        self.assertEqual(st.batch_get_v1_device_draft([page_hash], dev), [True])
+        for L in range(self.LAYER_NUM):
+            self.assertEqual(
+                dst.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                src.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                f"draft layer {L} mismatch after device-direct roundtrip")
+
+    def test_draft_keys_distinct_and_tp_aware(self):
+        """Draft keys are a distinct namespace from the target and follow the DRAFT
+        pool shape: MLA draft (sub=1) has no tp suffix (replicated); MHA draft (sub=2)
+        carries tp_size/tp_rank so TP ranks do not collide."""
+        st = _bare(is_mla=True, tp_size=2, tp_rank=1, pp_rank=0, pp_size=1,
+                   enable_pp=False, model="m")
+        h = "abc123"
+        self.assertNotIn(".draft", st._keys(h)[0])
+        mla_draft = st._draft_keys(h, 1)
+        self.assertEqual(mla_draft, ["m/abc123.draft_k"])
+        mha_draft = st._draft_keys(h, 2)
+        self.assertEqual(mha_draft, ["m/abc123.draft_2_1_k", "m/abc123.draft_2_1_v"])
 
 
 if __name__ == "__main__":

@@ -131,3 +131,58 @@ def device_pool_regions(pool) -> List[Tuple[int, int]]:
     for t in tensors:
         regions.append((int(t.data_ptr()), int(t.numel()) * int(t.element_size())))
     return regions
+
+
+# --- DSA indexer sidecar (device-direct), task 4 ------------------------------
+# Torch-free copy of the sidecar meta in the patched SGLang device_page_meta.py,
+# so the dfkv sidecar-device roundtrip test can exercise _sidecar_device_set/get
+# without a GPU. Kept in sync with the patched module (layer-first, page-indexed
+# index_k_with_scale_buffer -> layer_num segments/page, same @sg chunking as the
+# main latent).
+
+
+def _is_indexer(pool) -> bool:
+    layers = getattr(pool, "index_k_with_scale_buffer", None)
+    return (
+        isinstance(layers, (list, tuple))
+        and len(layers) > 0
+        and hasattr(pool, "page_size")
+    )
+
+
+def sidecar_supported(pool) -> bool:
+    return _is_indexer(pool)
+
+
+def sidecar_device_pool_regions(pool) -> List[Tuple[int, int]]:
+    regions: List[Tuple[int, int]] = []
+    for t in getattr(pool, "index_k_with_scale_buffer", None) or []:
+        regions.append((int(t.data_ptr()), int(t.numel()) * int(t.element_size())))
+    return regions
+
+
+def get_device_sidecar_page_buffer_meta(
+    pool, indices
+) -> Tuple[List[List[int]], List[List[int]]]:
+    page_size = pool.page_size
+    idx = indices.tolist() if hasattr(indices, "tolist") else list(indices)
+    assert len(idx) % page_size == 0, (
+        f"sidecar device page meta needs page-aligned indices, got {len(idx)} "
+        f"(page_size={page_size})"
+    )
+    n_pages = len(idx) // page_size
+
+    layers = pool.index_k_with_scale_buffer
+    itemsize = layers[0].element_size()
+    row_bytes = int(layers[0].shape[1]) * itemsize
+    row_stride = int(layers[0].stride(0)) * itemsize
+    bases = [int(t.data_ptr()) for t in layers]
+
+    seg_ptrs: List[List[int]] = []
+    seg_sizes: List[List[int]] = []
+    for p in range(n_pages):
+        slot = idx[p * page_size]
+        off = (slot // page_size) * row_stride
+        seg_ptrs.append([b + off for b in bases])
+        seg_sizes.append([row_bytes] * len(bases))
+    return seg_ptrs, seg_sizes
