@@ -228,3 +228,52 @@ TEST(Sg, MultiKeyTwoNodes) {
   }
   a->srv->Stop(); b->srv->Stop();
 }
+
+// Large single-node SG batch: with one node in the ring the whole batch routes to
+// one (node[,cap]) group, which BOTH the SG write (BatchPutSg) and the SG read
+// (BatchGetAutoSg) now split into up to DFKV_READ_MAX_CONNS parallel connections
+// (ShardReadGroups). This asserts the shard fan-out preserves every per-key result
+// and every scattered byte -- correctness of the concurrent-connection path the
+// benchmark leans on for bandwidth. Uniform segment count + size so all keys share
+// one (node,cap) group (the worst case for serial drain, best case to shard).
+TEST(Sg, LargeSingleNodeShardedRoundTrip) {
+  auto a = Start("shard1");
+  KVClient c({{"a", a->addr}}, Hdr());
+  const int N = 200;             // >> DFKV_READ_SHARD_KEYS(16) => shards to the cap
+  const size_t nsegs = 3, seg = 1024;
+  std::vector<std::vector<std::string>> srcs(N);
+  std::vector<KvPutItemSg> puts(N);
+  for (int i = 0; i < N; ++i) {
+    std::vector<size_t> sizes(nsegs, seg);
+    srcs[i] = MakeChunks("sh" + std::to_string(i), sizes);
+    std::vector<const void*> ptrs;
+    for (auto& s : srcs[i]) ptrs.push_back(s.data());
+    puts[i] = {"sh" + std::to_string(i), ptrs, sizes};
+  }
+  auto pr = c.BatchPutSg(puts);
+  ASSERT_EQ(pr.size(), size_t(N));
+  for (int i = 0; i < N; ++i) ASSERT_TRUE(pr[i]) << "sharded put key " << i;
+
+  std::vector<std::vector<std::string>> dsts(N);
+  std::vector<KvGetItemSg> gets(N);
+  for (int i = 0; i < N; ++i) {
+    dsts[i].resize(nsegs);
+    std::vector<void*> dptrs;
+    std::vector<size_t> caps(nsegs, seg);
+    for (size_t j = 0; j < nsegs; ++j) {
+      dsts[i][j].assign(seg, '\0');
+      dptrs.push_back(&dsts[i][j][0]);
+    }
+    gets[i] = {"sh" + std::to_string(i), dptrs, caps};
+  }
+  std::vector<size_t> lens;
+  auto gr = c.BatchGetAutoSg(gets, &lens);
+  ASSERT_EQ(gr.size(), size_t(N));
+  for (int i = 0; i < N; ++i) {
+    ASSERT_TRUE(gr[i]) << "sharded get key " << i;
+    EXPECT_EQ(lens[i], nsegs * seg) << i;
+    for (size_t j = 0; j < nsegs; ++j)
+      EXPECT_EQ(dsts[i][j], srcs[i][j]) << "key " << i << " seg " << j;
+  }
+  a->srv->Stop();
+}
