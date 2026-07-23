@@ -995,9 +995,17 @@ class DfkvHiCache(HiCacheStorage):
         total = len(keys)
         with _tracing.span("batch_exists", total) as _sp, \
                 access_log("batch_exists", lambda: f"{self._alog_tag} {total} keys") as r:
-            # longest contiguous prefix of pages whose every sub-object exists
+            # longest contiguous prefix of pages whose every sub-object exists.
+            # Device-direct (L2-bypass) writes store "@sg{n}" chunk sub-keys, so
+            # existence is probed on "@sg0" — the vLLM connector's probe scheme;
+            # the bare sub-key never matches a chunked store. A bypass instance
+            # only ever writes chunked keys (model_hash-isolated), so one probe
+            # form suffices per mode.
             sub = self._sub()
-            sks = [sk for k in keys for sk in self._keys(k)]
+            if getattr(self, "mem_pool_device", None) is not None:
+                sks = [f"{sk}@sg0" for k in keys for sk in self._keys(k)]
+            else:
+                sks = [sk for k in keys for sk in self._keys(k)]
             page_ok = self._fold(self._batch_exist_flat(sks), total, sub)
             n = 0
             for ok in page_ok:
