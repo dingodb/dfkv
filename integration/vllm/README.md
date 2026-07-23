@@ -44,6 +44,9 @@ vLLM engine process — each DP rank is its own process.
 | **`PYTHONHASHSEED`** | unset | **Set to `0` (any fixed value, identical on every rank and instance).** vLLM's block hashes feed the dfkv key and use Python `hash()`, which is per-process randomized by default. Without a fixed seed, DP ranks and restarts compute **different keys for the same tokens** ⇒ cross-process / cross-restart prefix reuse silently drops to ~0. The single most common "no hit" misconfig. |
 | `DFKV_RDMA_DEPTH` | `1` | Requests in flight per connection. A latency hider, **not** a throughput knob (GET/PUT are depth-flat — the per-connection serve loop is in-order). Leave at default. |
 | `DFKV_RDMA_NUMA` | `0` | `1` pins buffers/threads to the rail's NUMA node and picks a NUMA-local rail per connection. Optional. |
+| `DFKV_READ_SHARD_KEYS` | `16` | Target keys per read shard: splits one node's batched GET into parallel shards. The real read-throughput lever on few-node rings / large batches landing on one node (single connection drains ~166 MB/s serially); no-op on wide rings. |
+| `DFKV_READ_MAX_CONNS` | `8` | Per-node cap on concurrent read-shard connections (pairs with the above; `1` disables sharding). |
+| `DFKV_FANOUT_THREADS` | `32` | Client batch-op fan-out pool cap (clamped [1,1024]). Raise when callers × node-groups ≫ 32, or batch calls degrade to caller-serial and per-call latency grows from max(group) to sum(group). |
 | `DFKV_LIB` / `DFKV_BUILD` | — | `libdfkv.so` path (overridden by the `lib` extra-config key). |
 | `DFKV_ACCESS_LOG_ENABLED` | `0` | `1` turns on the per-op access log (one line per dfkv client op: `batch_get_auto_sg`/`batch_put_sg`/`batch_exist`/…). Off ⇒ ~100 ns/call no-op; on ⇒ async (background thread), ~µs on the hot path. |
 | `DFKV_ACCESS_LOG_PATH` | (stderr) | access-log file path; empty ⇒ stderr. |
