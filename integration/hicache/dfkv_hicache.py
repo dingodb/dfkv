@@ -97,6 +97,20 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_batch_exist.restype = ctypes.c_int
     lib.dfkv_batch_exist.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
                                      ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    # Scatter-gather put + live SG width, for the HiCache L2-bypass (device-direct
+    # write) path. Each key gathers num_bufs[i] non-contiguous source buffers
+    # (a page's per-layer GPU segments) into one stored blob. Guarded like the
+    # vLLM connector: older libdfkv.so lacks the symbols and callers fall back.
+    if hasattr(lib, "dfkv_batch_put_sg"):
+        lib.dfkv_batch_put_sg.restype = ctypes.c_int
+        lib.dfkv_batch_put_sg.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_uint64)),
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    if hasattr(lib, "dfkv_max_sg_segs"):
+        lib.dfkv_max_sg_segs.restype = ctypes.c_uint32
+        lib.dfkv_max_sg_segs.argtypes = [ctypes.c_void_p]
     lib.dfkv_set_members.restype = ctypes.c_int
     lib.dfkv_set_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.dfkv_refresh_members.restype = ctypes.c_int
@@ -507,6 +521,59 @@ class DfkvHiCache(HiCacheStorage):
                 return
             r.result = f"registered {n} region(s)" if n else "no backing buffer found"
 
+    # --- L2-bypass (device-direct write) -------------------------------------
+    def supports_device_transfer(self) -> bool:
+        """True iff this backend can RDMA a page straight from GPU KV slots to L3.
+
+        Requires the scatter-gather put ABI (dfkv_batch_put_sg) plus a negotiated
+        SG width big enough to hold a page's per-layer device segments in ONE key
+        (layer_num segments/key — the GPU pool is layer-first, so a page's KV is
+        scattered across layer_num non-contiguous buffers). Older libdfkv.so
+        without the symbols, or an HCA whose max_sge is too small, keep the stock
+        host (D2H) write path. Checked by the SGLang controller's capability gate;
+        never raises."""
+        if not (hasattr(self._lib, "dfkv_batch_put_sg")
+                and hasattr(self._lib, "dfkv_max_sg_segs")):
+            return False
+        layer_num = int(self.cfg.get("layer_num", 0))
+        if layer_num <= 0:
+            return False
+        try:
+            max_segs = int(self._lib.dfkv_max_sg_segs(self._h))
+        except Exception:
+            return False
+        if max_segs < layer_num:
+            print(f"[dfkv] L2-bypass unavailable: max_sg_segs={max_segs} < "
+                  f"layer_num={layer_num}; a page's per-layer device segments "
+                  "exceed the RDMA SGE budget for a single key. Staying on the "
+                  "host write path.", file=sys.stderr, flush=True)
+            return False
+        return True
+
+    def register_mem_pool_device(self, mem_pool_device):
+        """Register the GPU KV pool's per-layer buffers for RDMA (GPUDirect MR;
+        dfkv_register_memory accepts device pointers — same call the vLLM connector
+        uses). Deduped against host regions already registered."""
+        self.mem_pool_device = mem_pool_device
+        from sglang.srt.mem_cache.device_page_meta import device_pool_regions
+
+        with access_log("register_mem_pool_device",
+                        lambda: f"{self._alog_tag}") as r:
+            n = 0
+            try:
+                for base, size in device_pool_regions(mem_pool_device):
+                    region = (base, size)
+                    if not base or not size or region in self._registered_regions:
+                        continue
+                    if self.register_memory(base, size):
+                        self._registered_regions.add(region)
+                        n += 1
+            except Exception as e:  # never fail setup over an optimization
+                r.result = f"skip ({type(e).__name__})"
+                return
+            r.result = (f"registered {n} device region(s)" if n
+                        else "no device buffer found")
+
     def set_members(self, members: str):
         """Hot-swap cluster membership, e.g. 'n1=ip:12000,n2=ip:12000'."""
         self._lib.dfkv_set_members(self._h, members.encode())
@@ -652,6 +719,118 @@ class DfkvHiCache(HiCacheStorage):
             # Fleet op metrics (put/get/exist/...) are accumulated in the C++
             # KVClient (the chokepoint all connectors share) and forwarded over
             # OTLP by the snapshot poller — see dfkv_telemetry.parse_client_ops.
+            return res
+
+    def _flatten_device(self, keys, seg_ptrs, seg_sizes):
+        """Expand per-page keys into per-sub-object (k[/v]) sub-keys, pairing each
+        with its per-layer device segment list. Parallel to _flatten, but every
+        entry is a segment LIST (one per layer), not a single (ptr, size)."""
+        sub = self._sub()
+        assert len(seg_ptrs) == len(keys) * sub, (len(seg_ptrs), len(keys), sub)
+        sks, sp, ss = [], [], []
+        for i, k in enumerate(keys):
+            for j, sk in enumerate(self._keys(k)):
+                sks.append(sk)
+                sp.append([int(p) for p in seg_ptrs[i * sub + j]])
+                ss.append([int(s) for s in seg_sizes[i * sub + j]])
+        return sub, sks, sp, ss
+
+    def _batch_put_sg(self, sks, seg_ptrs, seg_sizes) -> List[bool]:
+        """Scatter-gather batch put: sub-key sks[i] stores the in-order
+        concatenation of its per-layer segments seg_ptrs[i][..]/seg_sizes[i][..] as
+        one dfkv key (one RDMA multi-SGE op). Returns per-key success bools."""
+        n = len(sks)
+        if n == 0:
+            return []
+        karr = (ctypes.c_char_p * n)(*[k.encode() for k in sks])
+        # Keep the per-key inner arrays alive for the whole call (mirrors the vLLM
+        # connector's batch_put_sg): the outer arrays hold casts of these.
+        inner_p = [(ctypes.c_void_p * len(p))(*[ctypes.c_void_p(int(x)) for x in p])
+                   for p in seg_ptrs]
+        inner_s = [(ctypes.c_uint64 * len(s))(*[int(x) for x in s])
+                   for s in seg_sizes]
+        parr = (ctypes.POINTER(ctypes.c_void_p) * n)(
+            *[ctypes.cast(a, ctypes.POINTER(ctypes.c_void_p)) for a in inner_p])
+        sarr = (ctypes.POINTER(ctypes.c_uint64) * n)(
+            *[ctypes.cast(a, ctypes.POINTER(ctypes.c_uint64)) for a in inner_s])
+        narr = (ctypes.c_int * n)(*[len(p) for p in seg_ptrs])
+        out = (ctypes.c_int * n)()
+        rc = self._lib.dfkv_batch_put_sg(self._h, karr, parr, sarr, narr, n, out)
+        if rc != 0:
+            return [False] * n
+        return [out[i] == 1 for i in range(n)]
+
+    def _put_sg_flat(self, sks, seg_ptrs, seg_sizes) -> List[bool]:
+        """SG put with the same phase-9 exist gate + single transient retry as
+        _put_flat (the contiguous host put), so the L2-bypass path inherits the
+        identical backup-dedup and burst-failure recovery semantics."""
+        self._put_retry_recovered = 0
+        if not sks:
+            return []
+        if self._backup_exist_gate:
+            present = list(self._batch_exist_flat(sks))
+            todo = [i for i, p in enumerate(present) if not p]
+            if not todo:
+                return [True] * len(sks)
+        else:
+            present = [False] * len(sks)
+            todo = list(range(len(sks)))
+        for attempt in (0, 1):
+            if not todo:
+                break
+            if attempt:
+                time.sleep(0.01)  # let the write burst drain first
+            out = self._batch_put_sg(
+                [sks[i] for i in todo], [seg_ptrs[i] for i in todo],
+                [seg_sizes[i] for i in todo])
+            failed = []
+            for m, i in enumerate(todo):
+                present[i] = out[m]
+                if not present[i]:
+                    failed.append(i)
+                elif attempt:
+                    self._put_retry_recovered += 1
+            todo = failed
+        return present
+
+    def batch_set_v1_device(self, keys, device_indices, extra_info=None) -> List[bool]:
+        """L2-bypass write-through: RDMA a page straight from its GPU KV slots to L3
+        (no D2H staging). Mirrors batch_set_v1 but the page payload is gathered from
+        the layer-first device pool as per-layer scatter-gather segments.
+
+        NOTE (ordering): the device segments concatenate LAYER-major, whereas the
+        stock host read (batch_get_v1) reconstructs a page-first (TOKEN-major)
+        buffer. The two are transposes; a page written here is byte-coherent only
+        with a matching device-direct (layer-major) reader — increment 2 — not with
+        the unchanged host read path. See the SGLang-side device_page_meta.py."""
+        n = len(keys)
+        with _tracing.span("batch_set_v1_device", n) as _sp, \
+                access_log("batch_set_v1_device",
+                           lambda: f"{self._alog_tag} {n} keys") as r:
+            # MLA backup_skip: latent is replicated across TP, only rank 0 writes.
+            if self.is_mla and self.tp_rank != 0:
+                r.result = "backup_skip"
+                if _sp:
+                    _sp.attrs = {"dfkv.backup_skip": True}
+                return [True] * n
+            from sglang.srt.mem_cache.device_page_meta import (
+                get_device_page_buffer_meta,
+            )
+            seg_ptrs, seg_sizes = get_device_page_buffer_meta(
+                self.mem_pool_device, device_indices)
+            sub, sks, sp, ss = self._flatten_device(keys, seg_ptrs, seg_sizes)
+            nbytes = sum(sum(s) for s in ss)
+            t0 = time.perf_counter()
+            flat = self._put_sg_flat(sks, sp, ss)
+            dur = time.perf_counter() - t0
+            res = self._fold(flat, n, sub)
+            r.result = f"ok {sum(res)}/{n} (device-direct)"
+            if self._put_retry_recovered:
+                r.result += f" retry_ok={self._put_retry_recovered}"
+            if _sp:
+                _sp.hits = sum(res); _sp.bytes = nbytes
+            self._metrics.on_set(pages=n, ok_pages=sum(res), nbytes=nbytes,
+                                 seconds=dur)
             return res
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
