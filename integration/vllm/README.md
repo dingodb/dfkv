@@ -51,6 +51,7 @@ vLLM engine process — each DP rank is its own process.
 | `DFKV_ACCESS_LOG_ENABLED` | `0` | `1` turns on the per-op access log (one line per dfkv client op: `batch_get_auto_sg`/`batch_put_sg`/`batch_exist`/…). Off ⇒ ~100 ns/call no-op; on ⇒ async (background thread), ~µs on the hot path. |
 | `DFKV_ACCESS_LOG_PATH` | (stderr) | access-log file path; empty ⇒ stderr. |
 | `DFKV_ACCESS_LOG_THRESHOLD_US` | `0` | only log ops slower than this many µs (`0` = log every call). Set e.g. `1000` to surface only ≥1 ms ops. |
+| `DFKV_CLIENT_STATS_POLL_S` | `15` | cadence (seconds) of the background poller that mirrors the C client's ring/MDS health onto Prometheus (`vllm:dfkv_client_ring_members`, `vllm:dfkv_client_mds_reachable`, `vllm:dfkv_client_mds_unreachable_polls_total`, `vllm:dfkv_client_transport_info`). Sleeping daemon thread, off the request path. `0` disables. |
 
 The access log shares the same env vars and line format as the dfkv HiCache /
 LMCache connector access logs, so one setting covers every integration. Format:

@@ -19,6 +19,7 @@ import os
 from typing import Optional, Sequence
 
 from ._cabi import load_lib, native_version
+from .client_stats import ClientStatsPoller, read_snapshot
 from . import access_log as _alog
 from .access_log import access_log
 from . import _hot_config
@@ -140,6 +141,20 @@ class DfkvDeviceClient:
         _alog.configure({}, tp_rank=_env_rank())
         _hot_config.register("access_log", _alog.apply_hot)
         _hot_config.start({}, tp_rank=_env_rank())
+        # Surface the C client's ring/MDS health on Prometheus so an empty ring
+        # (writes routed nowhere) or an unreachable MDS is visible on the scrape,
+        # not just in the client log. Sleeping daemon thread off the request path;
+        # DFKV_CLIENT_STATS_POLL_S=0 disables. Mirrors the HiCache stats poller.
+        self._stats_poller = None
+        try:
+            poll_s = float(os.environ.get("DFKV_CLIENT_STATS_POLL_S", 15))
+        except (TypeError, ValueError):
+            poll_s = 15.0
+        if poll_s > 0:
+            self._stats_poller = ClientStatsPoller(
+                lambda: read_snapshot(self._lib, self._h), _env_rank(),
+                transport=self.transport_mode, interval_s=poll_s)
+            self._stats_poller.start()
 
     @property
     def transport_mode(self) -> str:
@@ -326,6 +341,12 @@ class DfkvDeviceClient:
             return res
 
     def close(self) -> None:
+        try:
+            if getattr(self, "_stats_poller", None):
+                self._stats_poller.stop()
+                self._stats_poller = None
+        except Exception:
+            pass
         try:
             _hot_config.stop()
         except Exception:

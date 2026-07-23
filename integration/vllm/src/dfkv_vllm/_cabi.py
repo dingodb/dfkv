@@ -109,6 +109,12 @@ def load_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_transport_mode.restype = c_char_p
     lib.dfkv_transport_mode.argtypes = [c_void_p]
 
+    # u64 = dfkv_stats_snapshot(c, buf, cap): Prometheus-text dump of the C
+    # client's observed counters (ring size, MDS reachability, per-peer health).
+    # Call with buf=NULL/cap=0 to size, then fetch. Off the request path.
+    lib.dfkv_stats_snapshot.restype = c_uint64
+    lib.dfkv_stats_snapshot.argtypes = [c_void_p, c_char_p, c_uint64]
+
     # const char* dfkv_version(void) -> libdfkv.so version (process-global).
     lib.dfkv_version.restype = c_char_p
     lib.dfkv_version.argtypes = []
