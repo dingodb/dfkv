@@ -347,6 +347,29 @@ class FakeLayerFirstMlaDevicePool:
         return bytes(self._np[layer][off:off + npages_slots * self.kv_cache_dim])
 
 
+class FakeDsaDraftDevicePool(FakeLayerFirstMlaDevicePool):
+    """A DSA draft GPU pool (GLM-5.2 MTP draft = DSATokenToKVPool): the main MLA
+    latent (kv_buffer, token-indexed) AND the DSA indexer sidecar
+    (index_k_with_scale_buffer, layer-first page-indexed), sharing the page slots.
+    Exercises the device-direct draft latent + indexer path off-GPU."""
+
+    def __init__(self, layer_num, size, page_size, kv_cache_dim, num_pages, side_bytes):
+        super().__init__(layer_num, size, page_size, kv_cache_dim)
+        self.use_dsa = True
+        self._side_np = []
+        self.index_k_with_scale_buffer = []
+        for L in range(layer_num):
+            arr = np.zeros((num_pages, side_bytes), dtype=np.uint8)
+            for pg in range(num_pages):
+                for b in range(side_bytes):
+                    arr[pg, b] = (L * 77 + pg * 19 + b) % 256
+            self._side_np.append(arr)
+            self.index_k_with_scale_buffer.append(_NpTensor2D(arr))
+
+    def side_layer_page_bytes(self, layer, page_idx):
+        return bytes(self._side_np[layer][page_idx].tobytes())
+
+
 @unittest.skipUnless(
     os.path.exists(SERVER_BIN)
     and hasattr(dfkv_hicache._load_lib(os.environ.get("DFKV_LIB")), "dfkv_batch_put_sg"),
@@ -690,6 +713,91 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         self.assertEqual(mla_draft, ["m/abc123.draft_k"])
         mha_draft = st._draft_keys(h, 2)
         self.assertEqual(mha_draft, ["m/abc123.draft_2_1_k", "m/abc123.draft_2_1_v"])
+
+    # DSA draft (GLM-5.2 MTP): draft main latent + draft indexer sidecar, both device.
+    def test_dsa_draft_device_direct_latent_and_indexer_roundtrip(self):
+        """A GLM-5.2 MTP draft is a DSATokenToKVPool: its main MLA latent AND its DSA
+        indexer sidecar (index_k_with_scale_buffer) both ride the device-direct path
+        under distinct namespaces (`.draft_k` / `draft_indexer`). Without the indexer
+        the draft's sparse attention would select on garbage; this proves BOTH
+        components reassemble byte-exact so the loaded draft page is coherent."""
+        st = self._plugin(self._node("dsadraft"))
+        src = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        st.register_mem_pool_device_draft(src)
+        st.register_mem_pool_device_draft_sidecar(src)
+        page_hash = "dsadr701"
+        dev = list(range(0, self.PAGE_SIZE))
+        self.assertEqual(
+            st.batch_set_v1_device_draft([page_hash], dev), [True],
+            "DSA draft latent+indexer device-direct write failed")
+
+        dst = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        for L in range(self.LAYER_NUM):
+            dst._np[L][:] = 0
+            dst._side_np[L][:] = 0
+        st.register_mem_pool_device_draft(dst)
+        st.register_mem_pool_device_draft_sidecar(dst)
+        self.assertEqual(
+            st.batch_get_v1_device_draft([page_hash], dev), [True],
+            "DSA draft latent+indexer device-direct read failed")
+        for L in range(self.LAYER_NUM):
+            self.assertEqual(
+                dst.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                src.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                f"draft latent layer {L} mismatch after DSA-draft roundtrip")
+            self.assertEqual(
+                dst.side_layer_page_bytes(L, 0),
+                src.side_layer_page_bytes(L, 0),
+                f"draft indexer layer {L} mismatch after DSA-draft roundtrip")
+
+    def test_dsa_draft_indexer_read_miss_is_page_failure(self):
+        """Coherence AND on read: a DSA draft page whose indexer was never stored
+        reads back as a miss (even if the latent existed), so the draft recomputes
+        rather than attending over a stale/garbage indexer."""
+        st = self._plugin(self._node("dsadraftmiss"))
+        dst = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        st.register_mem_pool_device_draft(dst)
+        st.register_mem_pool_device_draft_sidecar(dst)
+        dev = list(range(0, self.PAGE_SIZE))
+        self.assertEqual(st.batch_get_v1_device_draft(["neverdsa"], dev), [False])
+
+    def test_dense_draft_no_sidecar_is_latent_only(self):
+        """A dense (non-DSA) draft never registers a sidecar, so the draft path is
+        latent-only and byte-identical to task 6 — the sidecar hooks return None and
+        do not touch the result."""
+        st = self._plugin(self._node("densedraft"))
+        self.assertIsNone(st._draft_sidecar_device_set(["h"], list(range(self.PAGE_SIZE))))
+        self.assertIsNone(st._draft_sidecar_device_get(["h"], list(range(self.PAGE_SIZE))))
+        src = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        st.register_mem_pool_device_draft(src)
+        page_hash = "dense701"
+        dev = list(range(0, self.PAGE_SIZE))
+        self.assertEqual(st.batch_set_v1_device_draft([page_hash], dev), [True])
+        dst = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        for L in range(self.LAYER_NUM):
+            dst._np[L][:] = 0
+        st.register_mem_pool_device_draft(dst)
+        self.assertEqual(st.batch_get_v1_device_draft([page_hash], dev), [True])
+
+    def test_draft_indexer_keys_distinct_namespace(self):
+        """The DSA draft indexer rides its own `draft_indexer` key namespace, distinct
+        from the draft latent (`.draft_k`) and the target indexer (`_indexer_k`)."""
+        st = _bare(is_mla=True, tp_size=1, tp_rank=0, pp_rank=0, pp_size=1,
+                   enable_pp=False, model="m")
+        h = "abc123"
+        self.assertEqual(st._pool_keys("draft_indexer", h), ["m/abc123_draft_indexer_k"])
+        self.assertNotEqual(st._pool_keys("draft_indexer", h), st._draft_keys(h, 1))
+        self.assertNotEqual(st._pool_keys("draft_indexer", h), st._pool_keys("indexer", h))
 
 
 if __name__ == "__main__":
