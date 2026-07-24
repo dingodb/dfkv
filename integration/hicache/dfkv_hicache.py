@@ -658,6 +658,66 @@ class DfkvHiCache(HiCacheStorage):
             r.result = (f"registered {n} draft device region(s)" if n
                         else "no draft device buffer found")
 
+    def register_mem_pool_device_draft_sidecar(self, mem_pool_device_draft):
+        """DSA-draft extension of task 6: register the draft model's DSA indexer
+        sidecar (index_k_with_scale_buffer) GPU buffers for RDMA so the draft indexer
+        RDMAs device-direct alongside the draft main latent, keeping a DSA draft's KV
+        coherent (latent + indexer) on an L3 hit. The draft pool object IS the
+        DSATokenToKVPool (it carries both kv_buffer and index_k_with_scale_buffer), so
+        we register the same object as a sidecar device pool under a distinct name and
+        drive it through the shared _sidecar_device_set/get machinery (its own
+        `draft_indexer` key namespace, layer-first @sg chunking). Deduped against
+        regions already registered."""
+        if not hasattr(self, "_sidecar_device_pools"):
+            self._sidecar_device_pools = {}
+        self._draft_sidecar_name = "draft_indexer"
+        self._sidecar_device_pools[self._draft_sidecar_name] = mem_pool_device_draft
+        from sglang.srt.mem_cache.device_page_meta import sidecar_device_pool_regions
+
+        with access_log("register_mem_pool_device_draft_sidecar",
+                        lambda: f"{self._alog_tag}") as r:
+            n = 0
+            try:
+                for base, size in sidecar_device_pool_regions(mem_pool_device_draft):
+                    region = (base, size)
+                    if not base or not size or region in self._registered_regions:
+                        continue
+                    if self.register_memory(base, size):
+                        self._registered_regions.add(region)
+                        n += 1
+            except Exception as e:  # never fail setup over an optimization
+                r.result = f"skip ({type(e).__name__})"
+                return
+            r.result = (f"registered {n} draft indexer region(s)" if n
+                        else "no draft indexer buffer found")
+
+    def _draft_sidecar_device_set(self, keys, device_indices):
+        """Best-effort device-direct SG put of the DSA draft's indexer sidecar (the
+        `draft_indexer` namespace), or None when no draft sidecar is registered (a
+        dense/non-DSA draft). Failure returns [False]*n so the caller marks those
+        draft pages unstored — the read gates coherence, so a page never serves a
+        latent without its matching indexer."""
+        name = getattr(self, "_draft_sidecar_name", None)
+        if not name:
+            return None
+        try:
+            res, _nb, _s = self._sidecar_device_set(name, keys, device_indices)
+            return res
+        except Exception:
+            return [False] * len(keys)
+
+    def _draft_sidecar_device_get(self, keys, device_indices):
+        """Read twin of _draft_sidecar_device_set: RDMA the DSA draft indexer straight
+        into its GPU buffer, or None when no draft sidecar is registered."""
+        name = getattr(self, "_draft_sidecar_name", None)
+        if not name:
+            return None
+        try:
+            res, _nb, _s = self._sidecar_device_get(name, keys, device_indices)
+            return res
+        except Exception:
+            return [False] * len(keys)
+
     def set_members(self, members: str):
         """Hot-swap cluster membership, e.g. 'n1=ip:12000,n2=ip:12000'."""
         self._lib.dfkv_set_members(self._h, members.encode())
@@ -1337,6 +1397,12 @@ class DfkvHiCache(HiCacheStorage):
             flat = self._put_sg_flat(sks, sp, ss)
             res = self._fold(flat, n, stride)
             r.result = f"ok {sum(res)}/{n} (draft device-direct)"
+            # DSA-draft: also store the draft indexer sidecar device-direct so the
+            # loaded draft page is coherent (latent + indexer). None => dense draft.
+            side = self._draft_sidecar_device_set(keys, device_indices)
+            if side is not None:
+                res = [res[i] and side[i] for i in range(n)]
+                r.result += f" +indexer {sum(side)}/{n}"
             return res
 
     def batch_get_v1_device_draft(self, keys, device_indices, extra_info=None) -> List[bool]:
@@ -1361,6 +1427,12 @@ class DfkvHiCache(HiCacheStorage):
             flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
             res = self._fold(flat_ok, n, stride)
             r.result = f"hits={sum(res)}/{n} (draft device-direct)"
+            # DSA-draft: a page is a coherent draft hit only if its indexer sidecar
+            # also read back in full. None => dense draft (no sidecar).
+            side = self._draft_sidecar_device_get(keys, device_indices)
+            if side is not None:
+                res = [res[i] and side[i] for i in range(n)]
+                r.result += f" +indexer {sum(side)}/{n}"
             return res
 
     def batch_set_v2_device(
